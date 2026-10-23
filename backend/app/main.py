@@ -1,0 +1,674 @@
+"""Accounts.ai backend: upload spreadsheets, profile them, keep the books, and query them with SQL or AI."""
+
+import asyncio
+import json
+import threading
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from datetime import date
+
+from . import analysis, books, classify, config, database, detect, editing, llm, reports
+from .accounts import api as accounts_api
+from .accounts import db as _accounts_tables  # noqa: F401  (registers the books tables before create_all)
+from .analytics import profile_sheet
+from .calc import CalcError, evaluate_number, format_decimal
+from .duck import Session, sheet_key
+from .excel_loader import UploadError, read_workbook
+from .llm.common import describe_tables, warm_tables
+from .schemas import (
+    AddRowRequest,
+    AnalysisRequest,
+    BookDetail,
+    BookRegistersRequest,
+    BookSummary,
+    CreateBookRequest,
+    CalcRequest,
+    CalcResult,
+    ChatRequest,
+    ChatResponse,
+    ColumnCalcRequest,
+    ColumnCalcResult,
+    DatasetDetail,
+    DocumentsRequest,
+    FilesChatRequest,
+    DatasetSummary,
+    GstNetOut,
+    Health,
+    NotesRequest,
+    QueryOut,
+    Report,
+    RowsPage,
+    SetupOut,
+    SetupRequest,
+    SheetDetail,
+    SqlRequest,
+)
+
+# Older turns beyond this are dropped; the table context is resent every turn anyway.
+MAX_CHAT_MESSAGES = 20
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    database.init_db()
+    if config.openai_configured():
+        threading.Thread(target=llm.gpt.warm_up, daemon=True).start()  # the first question skips the handshake
+    yield
+
+
+app = FastAPI(title="Accounts.ai API", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(accounts_api.router)
+
+
+def _dataset_or_404(dataset_id: int) -> dict:
+    dataset = database.get_dataset(dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Upload not found.")
+    return dataset
+
+
+def _sheet_or_404(dataset_id: int, table_name: str) -> dict:
+    sheet = next((s for s in _dataset_or_404(dataset_id)["sheets"] if s["table_name"] == table_name), None)
+    if sheet is None:
+        raise HTTPException(status_code=404, detail="Sheet not found.")
+    return sheet
+
+
+def _sheet_detail(sheet: dict) -> dict:
+    preview = database.read_preview(sheet["table_name"], config.PREVIEW_ROWS)
+    split = json.loads(preview.to_json(orient="split", index=False, date_format="iso"))
+    return {
+        "sheet_name": sheet["sheet_name"],
+        "table_name": sheet["table_name"],
+        "row_count": sheet["row_count"],
+        "profile": sheet["profile"],
+        "preview": {"columns": split["columns"], "rows": split["data"]},
+    }
+
+
+def _fresh_sheet(dataset_id: int, table_name: str) -> dict:
+    return _sheet_detail(_sheet_or_404(dataset_id, table_name))
+
+
+def _detail(dataset: dict) -> dict:
+    sheets = [_sheet_detail(sheet) for sheet in dataset["sheets"]]
+    return {**{k: dataset[k] for k in ("id", "filename", "size_bytes", "uploaded_at")}, "sheets": sheets}
+
+
+@app.get("/api/health", response_model=Health)
+def health():
+    return {"status": "ok", "providers": llm.provider_status(), "default_provider": llm.default_provider()}
+
+
+@app.post("/api/upload", response_model=DatasetDetail, status_code=201)
+def upload(file: UploadFile = File(...)):
+    filename = Path(file.filename or "upload").name
+    if Path(filename).suffix.lower() not in config.ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(config.ALLOWED_EXTENSIONS))
+        raise HTTPException(status_code=400, detail=f"Unsupported file type. Upload one of: {allowed}.")
+
+    limit = config.MAX_UPLOAD_MB * 1024 * 1024
+    content = file.file.read(limit + 1)
+    if len(content) > limit:
+        raise HTTPException(status_code=413, detail=f"File is larger than {config.MAX_UPLOAD_MB} MB.")
+    if not content:
+        raise HTTPException(status_code=400, detail="The file is empty.")
+
+    try:
+        parsed = read_workbook(content, filename)
+    except UploadError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    sheets = [(s.name, s.frame, profile_sheet(s.frame, s.labels, s.checks)) for s in parsed]
+    dataset_id = database.save_dataset(filename, len(content), sheets)
+    return _detail(_dataset_or_404(dataset_id))
+
+
+@app.get("/api/datasets", response_model=list[DatasetSummary])
+def list_datasets():
+    return database.list_datasets()
+
+
+@app.get("/api/datasets/{dataset_id}", response_model=DatasetDetail)
+def get_dataset(dataset_id: int):
+    return _detail(_dataset_or_404(dataset_id))
+
+
+@app.delete("/api/datasets/{dataset_id}", status_code=204)
+def delete_dataset(dataset_id: int):
+    if not database.delete_dataset(dataset_id):
+        raise HTTPException(status_code=404, detail="Upload not found.")
+
+
+def _sql(sheets: list[dict], sql: str, extra: dict | None = None) -> dict:
+    """Run a person's read-only SELECT on DuckDB over these sheets."""
+    try:
+        with Session(sheets, extra) as session:
+            result = session.query(sql)
+    except database.QueryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"sql": sql, **result.as_dict()}
+
+
+def _analyse(sheets: list[dict], body: AnalysisRequest, extra: dict | None = None) -> dict:
+    try:
+        with Session(sheets, extra) as session:
+            return analysis.run(session, body.model_dump())
+    except analysis.AnalysisError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _fields(sheets: list[dict], extra: dict | None = None, titles: dict[str, str] | None = None) -> list[dict]:
+    """Every table the Analyse screen can use, with its columns (kind and exact decimals)."""
+    with Session(sheets, extra) as session:
+        return [{"table": table, "title": (titles or {}).get(table) or session.titles.get(table, table),
+                 "fields": [f.as_dict() for f in fields]} for table, fields in session.fields.items()]
+
+
+@app.post("/api/datasets/{dataset_id}/sql", response_model=QueryOut)
+def run_sql(dataset_id: int, body: SqlRequest):
+    return _sql(_dataset_or_404(dataset_id)["sheets"], body.sql)
+
+
+@app.post("/api/datasets/{dataset_id}/analyse")
+def analyse_dataset(dataset_id: int, body: AnalysisRequest):
+    return _analyse(_dataset_or_404(dataset_id)["sheets"], body)
+
+
+@app.get("/api/datasets/{dataset_id}/fields")
+def dataset_fields(dataset_id: int):
+    return _fields(_dataset_or_404(dataset_id)["sheets"])
+
+
+@app.post("/api/calc", response_model=CalcResult)
+def calculate_numbers(body: CalcRequest):
+    try:
+        return {"expression": body.expression, "result": format_decimal(evaluate_number(body.expression))}
+    except CalcError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/datasets/{dataset_id}/sheets/{table_name}/calculate", response_model=ColumnCalcResult)
+def calculate_column(dataset_id: int, table_name: str, body: ColumnCalcRequest):
+    sheet = _sheet_or_404(dataset_id, table_name)
+    try:
+        frame, result, stats = editing.calculate(sheet, body.expression)
+        out = {"expression": body.expression, "stats": stats, "preview": editing.preview(sheet, body.expression, frame, result)}
+        if body.compare_to:
+            out["check"] = editing.check_formula(sheet, body.compare_to, body.expression, body.tolerance, frame)
+        if body.save_as:
+            name = editing.save_column(sheet, body.save_as, result, frame)
+            editing.refresh_profile(sheet, {"columns": 1}, {name: body.save_as.strip()})
+            out |= {"saved_column": name, "sheet": _fresh_sheet(dataset_id, table_name)}
+    except (CalcError, editing.EditError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return out
+
+
+@app.get("/api/datasets/{dataset_id}/sheets/{table_name}/rows", response_model=RowsPage)
+def list_rows(
+    dataset_id: int,
+    table_name: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    search: str | None = Query(None, max_length=200),
+):
+    return editing.list_rows(_sheet_or_404(dataset_id, table_name), offset, limit, search)
+
+
+@app.post("/api/datasets/{dataset_id}/sheets/{table_name}/rows", response_model=SheetDetail, status_code=201)
+def add_row(dataset_id: int, table_name: str, body: AddRowRequest):
+    sheet = _sheet_or_404(dataset_id, table_name)
+    try:
+        editing.add_row(sheet, body.values)
+    except editing.EditError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    editing.refresh_profile(sheet, {"added": 1})
+    return _fresh_sheet(dataset_id, table_name)
+
+
+@app.delete("/api/datasets/{dataset_id}/sheets/{table_name}/rows/{rowid}", response_model=SheetDetail)
+def delete_row(dataset_id: int, table_name: str, rowid: int):
+    sheet = _sheet_or_404(dataset_id, table_name)
+    try:
+        editing.delete_row(sheet, rowid)
+    except editing.EditError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    editing.refresh_profile(sheet, {"deleted": 1})
+    return _fresh_sheet(dataset_id, table_name)
+
+
+@app.put("/api/datasets/{dataset_id}/sheets/{table_name}/notes", response_model=SheetDetail)
+def save_notes(dataset_id: int, table_name: str, body: NotesRequest):
+    editing.save_notes(_sheet_or_404(dataset_id, table_name), body.notes)
+    return _fresh_sheet(dataset_id, table_name)
+
+
+def _setup(sheet: dict) -> dict:
+    profile = sheet["profile"]
+    return {
+        "roles": reports.ROLES,
+        "mapping": reports.effective_mapping(profile),
+        "detected": reports.detect_mapping(profile),
+        "classification": profile.get("classification") or {},
+        "groups": list(classify.GROUPS),
+        "reports": reports.KINDS,
+    }
+
+
+@app.get("/api/datasets/{dataset_id}/sheets/{table_name}/setup", response_model=SetupOut)
+def get_setup(dataset_id: int, table_name: str):
+    return _setup(_sheet_or_404(dataset_id, table_name))
+
+
+@app.put("/api/datasets/{dataset_id}/sheets/{table_name}/setup", response_model=SetupOut)
+def save_setup(dataset_id: int, table_name: str, body: SetupRequest):
+    sheet = _sheet_or_404(dataset_id, table_name)
+    if body.mapping is not None and any(role not in reports.ROLES for role in body.mapping):
+        raise HTTPException(status_code=400, detail="Unknown column role.")
+    if body.classification is not None and any(g and g not in classify.GROUPS for g in body.classification.values()):
+        raise HTTPException(status_code=400, detail="Unknown account group.")
+    try:
+        editing.save_setup(sheet, body.mapping, body.classification)
+    except editing.EditError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _setup(_sheet_or_404(dataset_id, table_name))
+
+
+@app.get("/api/datasets/{dataset_id}/sheets/{table_name}/reports/{kind}", response_model=Report)
+def get_report(
+    dataset_id: int,
+    table_name: str,
+    kind: str,
+    account: str | None = None,
+    start: date | None = None,
+    end: date | None = None,
+    as_of: date | None = None,
+    opening_stock: float = 0.0,
+    closing_stock: float = 0.0,
+):
+    sheet = _sheet_or_404(dataset_id, table_name)
+    if kind not in reports.KINDS:
+        raise HTTPException(status_code=404, detail="Unknown report.")
+    try:
+        return reports.build(
+            kind, editing.load_frame(sheet), sheet["profile"], account=account, start=start, end=end, as_of=as_of,
+            opening_stock=opening_stock, closing_stock=closing_stock,
+        )
+    except reports.ReportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/datasets/{dataset_id}/gst-net", response_model=GstNetOut)
+def gst_net(dataset_id: int, sales: str, purchases: str | None = None):
+    """Net GST payable: output tax of the sales register minus input credit of the purchase register."""
+    sales_sheet = _sheet_or_404(dataset_id, sales)
+    output = reports.gst_heads(editing.load_frame(sales_sheet), sales_sheet["profile"])
+    credit = {}
+    if purchases:
+        purchase_sheet = _sheet_or_404(dataset_id, purchases)
+        credit = reports.gst_heads(editing.load_frame(purchase_sheet), purchase_sheet["profile"])
+    if not output:
+        raise HTTPException(status_code=422, detail="The sales sheet has no CGST/SGST/IGST/Cess columns mapped.")
+    result = reports.gst_net_payable(output, credit)
+    rupees = lambda d: {h: v / 100 for h, v in d.items()}  # noqa: E731
+    steps = [
+        f"{source.upper()} credit used for {target.upper()}: {amount / 100:,.2f}"
+        for source, targets in result["used"].items() for target, amount in targets.items()
+    ]
+    return {
+        "output_tax": rupees({h: output.get(h, 0) for h in ("igst", "cgst", "sgst", "cess")}),
+        "input_credit": rupees({h: credit.get(h, 0) for h in ("igst", "cgst", "sgst", "cess")}),
+        "cash_payable": rupees(result["cash"]),
+        "credit_carried_forward": rupees(result["credit_left"]),
+        "total_cash_payable": sum(result["cash"].values()) / 100,
+        "steps": steps,
+    }
+
+
+def _chat_messages(body: ChatRequest) -> list[dict]:
+    messages = [m.model_dump() for m in body.messages][-MAX_CHAT_MESSAGES:]
+    while messages and messages[0]["role"] != "user":
+        messages.pop(0)
+    if not messages or messages[-1]["role"] != "user":
+        raise HTTPException(status_code=422, detail="The conversation must end with a user message.")
+    return messages
+
+
+def _stream_chat(run) -> StreamingResponse:
+    """Server-sent events while the AI works: steps, the answer as it is written, "reset" when a draft is
+    replaced, then "done" with the full checked result (or "error"). ``run(emit, cancel)`` works on its own
+    thread; when the person presses Stop or closes the app, ``cancel`` is set: the model stream is closed,
+    the next emit raises llm.Cancelled and nothing of that answer is kept."""
+    cancel = llm.CancelEvent()
+
+    async def body():
+        loop = asyncio.get_running_loop()
+        events: asyncio.Queue = asyncio.Queue()
+
+        def put(event: dict | None) -> None:
+            try:
+                loop.call_soon_threadsafe(events.put_nowait, event)
+            except RuntimeError:  # the server is shutting down
+                pass
+
+        def emit(event: dict) -> None:
+            if cancel.is_set():
+                raise llm.Cancelled()
+            put(event)
+
+        def work():
+            try:
+                result = run(emit, cancel)
+                put({"type": "done", "result": ChatResponse.model_validate(result).model_dump(mode="json")})
+            except llm.Cancelled:
+                pass
+            except llm.LLMError as exc:
+                put({"type": "error", "status": exc.status_code, "message": exc.message})
+            except Exception as exc:  # noqa: BLE001 - reported to the person instead of a broken stream
+                put({"type": "error", "status": 500, "message": f"The backend hit an error while answering ({type(exc).__name__})."})
+            finally:
+                put(None)
+
+        threading.Thread(target=work, daemon=True).start()
+        try:
+            while (event := await events.get()) is not None:
+                yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+        finally:
+            cancel.set()  # finished, or the client went away (Starlette cancels this generator on disconnect)
+
+    return StreamingResponse(body(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/ai/warm", status_code=204)
+def warm_ai():
+    """Called when someone starts typing a question: opens the connection to OpenAI in the background."""
+    if config.openai_configured():
+        threading.Thread(target=llm.gpt.warm_up, daemon=True).start()
+
+
+# A sheet counts as a register (stacked into "registers" and compared) only when detected with confidence:
+# a low-confidence guess, such as an invoice sheet inside a ledger workbook, would change every total.
+_CONFIDENT = ("high", "medium")
+
+
+def _shared_files(dataset_ids: list[int]) -> tuple[list[dict], list[dict], str, list[dict]]:
+    """Sheets of the files shared in a chat; the sales and purchase registers to compare (empty unless there is
+    one of each); what each file is (with the evidence) and exactly which sheets the comparison uses."""
+    datasets = [_dataset_or_404(i) for i in dict.fromkeys(dataset_ids)]
+    documents, found = detect.describe_documents(datasets)
+    kinds = {(f["dataset_id"], f["table_name"]): f["kind"] for f in found if f["confidence"] in _CONFIDENT}
+    sheets = [{**sheet, "register": kinds.get((d["id"], sheet["table_name"]))} for d in datasets for sheet in d["sheets"]]
+    registers = [s for s in sheets if s["register"] in books.REGISTERS]
+    if {s["register"] for s in registers} != set(books.REGISTERS):
+        registers = []
+    note = _registers_note(found, registers)
+    return sheets, registers, documents + (f"\n{note}" if note else ""), found
+
+
+def _registers_note(found: list[dict], registers: list[dict]) -> str:
+    """For the AI: which sheets (file + sheet) the comparison combines, and which register-like sheets it leaves out."""
+    used = {s["table_name"] for s in registers}
+    where = lambda f: f'file "{f["filename"]}", sheet "{f["sheet_name"]}"'  # noqa: E731
+    lines = []
+    if used:
+        lines.append('Sheets combined for the sales vs purchases comparison (<combined>) and the "registers" table, and only these:')
+        for kind, label in books.REGISTERS.items():
+            parts = [where(f) for f in found if f["table_name"] in used and f["kind"] == kind]
+            lines.append(f"- {label} register: " + "; ".join(parts))
+            if len(parts) > 1:
+                lines.append(f"  These {len(parts)} sheets are added together as one {label.lower()} register. Say so when "
+                             "quoting totals, and ask the person to confirm they are separate entries (not copies of each other).")
+    doubtful = [f for f in found if f["kind"] in books.REGISTERS and f["confidence"] not in _CONFIDENT]
+    if doubtful:
+        lines.append("Not combined, because the detection has low confidence (ask the person to confirm what it is): "
+                     + "; ".join(f'{where(f)} (possibly a {f["label"].lower()})' for f in doubtful) + ".")
+        if not used:
+            lines.append('So no comparison was made and there is no "registers" table.')
+    return "\n".join(lines)
+
+
+# Stacking and comparing two big registers takes seconds, so it starts as soon as /api/documents finds the
+# pair, and a chat waits for that same job instead of starting another. The steps run one after the other:
+# side by side they only compete for the interpreter and each finishes later.
+_JOBS: OrderedDict[tuple, Future] = OrderedDict()
+_JOBS_LOCK = threading.Lock()
+_JOB_POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="prefetch")
+
+
+def _job(key: tuple, build) -> Future:
+    with _JOBS_LOCK:
+        job = _JOBS.get(key)
+        if job is None or (job.done() and job.exception() is not None):
+            job = _JOBS[key] = _JOB_POOL.submit(build)
+        _JOBS.move_to_end(key)
+        while len(_JOBS) > 32:
+            _JOBS.popitem(last=False)
+    return job
+
+
+def _register_jobs(registers: list[dict]) -> tuple[Future, Future]:
+    """(both registers stacked, the comparison text), computed once per version of the registers."""
+    key = tuple(sheet_key(s) + (s["register"],) for s in registers)
+    table = _job(("registers", key), lambda: analysis.register_table(registers))
+    # Submitted after the table, so waiting for it here can never hold up the queue.
+    return table, _job(("combined", key), lambda: (table.result(), books.combined_text(registers))[1])
+
+
+def _prefetch(sheets: list[dict], registers: list[dict]) -> None:
+    """Get everything the first question needs ready while the person types it: the registers comparison, then
+    the data dictionary, then the DuckDB tables (a chat that starts meanwhile waits for these instead of
+    repeating them)."""
+    jobs = _register_jobs(registers) if registers else None
+
+    def warm():
+        stacked = jobs[0].result() if jobs else None
+        if jobs:
+            jobs[1].result()
+        describe_tables(sheets)
+        warm_tables(sheets, {"registers": stacked} if stacked else None)
+
+    _job(("warm", tuple(sheet_key(s) + (s["register"],) for s in sheets)), warm)
+
+
+def _waiter(emit, cancel):
+    """Waits for a register job: says once that the registers are being compared, and stops waiting (the job
+    carries on for the next question) when the answer is cancelled."""
+    told = False
+
+    def wait(job: Future):
+        nonlocal told
+        if not job.done() and not told:
+            told = True
+            emit({"type": "step", "text": "Comparing the sales and purchase registers…"})
+        while True:
+            try:
+                return job.result(timeout=0.2)
+            except TimeoutError:
+                if cancel.is_set():
+                    raise llm.Cancelled() from None
+
+    return wait
+
+
+@app.post("/api/documents")
+def documents(body: DocumentsRequest):
+    """What each shared file is: sales register, purchase register, bank statement or ledger, and why."""
+    sheets, registers, _text, found = _shared_files(body.dataset_ids)
+    _prefetch(sheets, registers)
+    return found
+
+
+@app.post("/api/chat/stream")
+def files_chat_stream(body: FilesChatRequest):
+    sheets, registers, documents_text, _found = _shared_files(body.dataset_ids)
+    messages = _chat_messages(body)
+
+    def answer(emit, cancel):
+        if not registers:
+            return llm.chat(body.provider, messages, sheets, emit=emit, fresh=body.fresh, documents=documents_text,
+                            cancel=cancel)
+        table, comparison = _register_jobs(registers)
+        wait = _waiter(emit, cancel)
+        stacked = wait(table)
+        extra = {"registers": stacked} if stacked else {}
+        # The app's exact comparison of the two registers, read only when the answer is not remembered.
+        text = (lambda: f"{documents_text}\n\n{wait(comparison)}") if stacked else documents_text
+        return llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh, documents=text,
+                        cancel=cancel)
+
+    return _stream_chat(answer)
+
+
+@app.post("/api/datasets/{dataset_id}/chat/stream")
+def chat_stream(dataset_id: int, body: ChatRequest):
+    sheets, messages = _dataset_or_404(dataset_id)["sheets"], _chat_messages(body)
+    return _stream_chat(lambda emit, cancel: llm.chat(body.provider, messages, sheets, emit=emit, fresh=body.fresh,
+                                                      cancel=cancel))
+
+
+@app.post("/api/datasets/{dataset_id}/chat", response_model=ChatResponse)
+def chat(dataset_id: int, body: ChatRequest):
+    dataset = _dataset_or_404(dataset_id)
+    try:
+        return llm.chat(body.provider, _chat_messages(body), dataset["sheets"])
+    except llm.LLMError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
+# --- Books: sales and purchase registers together ----------------------------------------------
+
+
+def _book_or_404(book_id: int) -> dict:
+    book = database.get_book(book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Books not found.")
+    return book
+
+
+def _book_detail(book: dict) -> dict:
+    return {
+        **{k: book[k] for k in ("id", "name", "created_at")},
+        "sheets": [
+            {**{k: s[k] for k in ("dataset_id", "filename", "sheet_name", "table_name", "row_count")},
+             "register_type": s["register"], "mapping": reports.effective_mapping(s["profile"])}
+            for s in book["sheets"]
+        ],
+        "reports": books.KINDS,
+    }
+
+
+@app.get("/api/books", response_model=list[BookSummary])
+def list_books():
+    return database.list_books()
+
+
+@app.post("/api/books", response_model=BookDetail, status_code=201)
+def create_book(body: CreateBookRequest):
+    registers: list[tuple[str, str]] = []
+    for ids, register in ((body.sales, "sales"), (body.purchases, "purchases"), (body.mixed, None)):
+        for dataset_id in ids:
+            dataset = _dataset_or_404(dataset_id)
+            for sheet in dataset["sheets"]:
+                guessed = register or books.guess_register(sheet["sheet_name"], dataset["filename"]) or "unused"
+                registers.append((sheet["table_name"], guessed))
+    if not any(r == "sales" for _, r in registers) or not any(r == "purchases" for _, r in registers):
+        raise HTTPException(status_code=422, detail="Choose at least one sales file and one purchases file.")
+    return _book_detail(_book_or_404(database.create_book(body.name.strip(), registers)))
+
+
+@app.get("/api/books/{book_id}", response_model=BookDetail)
+def get_book(book_id: int):
+    return _book_detail(_book_or_404(book_id))
+
+
+@app.put("/api/books/{book_id}/sheets", response_model=BookDetail)
+def set_book_sheets(book_id: int, body: BookRegistersRequest):
+    _book_or_404(book_id)
+    database.set_book_registers(book_id, body.registers)
+    return _book_detail(_book_or_404(book_id))
+
+
+@app.delete("/api/books/{book_id}", status_code=204)
+def delete_book(book_id: int):
+    if not database.delete_book(book_id):
+        raise HTTPException(status_code=404, detail="Books not found.")
+
+
+@app.get("/api/books/{book_id}/reports/{kind}", response_model=Report)
+def book_report(
+    book_id: int,
+    kind: str,
+    party: str | None = None,
+    as_of: date | None = None,
+    opening_stock: float = 0.0,
+    closing_stock: float | None = None,
+    measure: str | None = None,
+):
+    if kind not in books.KINDS:
+        raise HTTPException(status_code=404, detail="Unknown report.")
+    try:
+        return books.build(kind, _book_or_404(book_id), party=party, as_of=as_of,
+                           opening_stock=opening_stock, closing_stock=closing_stock, measure=measure)
+    except books.BookError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _book_tables(book: dict) -> tuple[list[dict], dict]:
+    """The set's register sheets, plus both registers stacked as one "registers" table when they can be read."""
+    sheets = [s for s in book["sheets"] if s["register"] in books.REGISTERS]
+    combined = analysis.register_table(sheets)
+    return sheets, ({"registers": combined} if combined else {})
+
+
+@app.post("/api/books/{book_id}/sql", response_model=QueryOut)
+def book_sql(book_id: int, body: SqlRequest):
+    sheets, extra = _book_tables(_book_or_404(book_id))
+    return _sql(sheets, body.sql, extra)
+
+
+@app.post("/api/books/{book_id}/analyse")
+def analyse_book(book_id: int, body: AnalysisRequest):
+    sheets, extra = _book_tables(_book_or_404(book_id))
+    return _analyse(sheets, body, extra)
+
+
+@app.get("/api/books/{book_id}/fields")
+def book_fields(book_id: int):
+    sheets, extra = _book_tables(_book_or_404(book_id))
+    return _fields(sheets, extra, {"registers": "Sales and purchases together"})
+
+
+@app.post("/api/books/{book_id}/chat/stream")
+def book_chat_stream(book_id: int, body: ChatRequest):
+    sheets, extra = _book_tables(_book_or_404(book_id))
+    if not sheets:
+        raise HTTPException(status_code=422, detail="This set has no sales or purchase sheets.")
+    messages = _chat_messages(body)
+    return _stream_chat(lambda emit, cancel: llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh,
+                                                      cancel=cancel))
+
+
+@app.post("/api/books/{book_id}/chat", response_model=ChatResponse)
+def book_chat(book_id: int, body: ChatRequest):
+    sheets, extra = _book_tables(_book_or_404(book_id))
+    if not sheets:
+        raise HTTPException(status_code=422, detail="This set has no sales or purchase sheets.")
+    try:
+        return llm.chat(body.provider, _chat_messages(body), sheets, extra)
+    except llm.LLMError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc

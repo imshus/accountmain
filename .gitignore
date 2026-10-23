@@ -1,0 +1,20 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Secrets and local data
+backend/.env
+backend/data/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Built Android app
+apk/
+
+# Local caches
+.vite/
+*.log
