@@ -1,3 +1,4 @@
+# Needs Python 3.11 or newer (pandas 3, numpy 2.3+, openai 3.x).
 fastapi>=0.115
 uvicorn>=0.30
 python-multipart>=0.0.9

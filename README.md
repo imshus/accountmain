@@ -78,7 +78,8 @@ and every number can be traced and checked (see `reports/Accurate AI accounting 
 
 ## Run it locally
 
-You need Python 3.10+ and Node.js 20+. Use two terminals. (For the phone app, see **Android app** below.)
+You need **Python 3.11 or newer** (pandas 3 and the OpenAI SDK do not install on older Python) and Node.js 20+.
+Use two terminals. (For the phone app, see **Android app** below.)
 
 **Backend** (http://127.0.0.1:8000, API docs at `/docs`):
 
@@ -104,6 +105,18 @@ Open http://localhost:5173 and drop `sample-data/sample_sales_register.xlsx` and
 amount that doesn't match its rate, and a mistyped GSTIN, so you can see the checks work). Without an API key
 everything works except the chat. The chat uses `LLM_PROVIDER` (GPT-6 Luna by default); there is no model picker
 on screen.
+
+## On a Linux server (e.g. AWS EC2, Amazon Linux 2023)
+
+Amazon Linux 2023 ships Python 3.9, which is too old; install 3.11 and build the backend's venv with it
+(plain `pip` / `pip3` would still use 3.9 and fail with "Requires-Python >=3.10"):
+
+```bash
+sudo dnf install -y python3.11 python3.11-pip
+cd backend && python3.11 -m venv venv && venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env   # then put your OPENAI_API_KEY in it; .env is not in git
+venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
 
 ## Android app
 

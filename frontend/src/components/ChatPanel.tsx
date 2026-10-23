@@ -499,6 +499,11 @@ function Work({ result, onOpenAnalysis }: { result: ChatResult; onOpenAnalysis?:
   );
 }
 
+/** Only file drags show the drop overlay; dragging selected text does not. */
+function hasFiles(event: DragEvent): boolean {
+  return Array.from(event.dataTransfer?.types ?? []).includes("Files");
+}
+
 async function copyText(text: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
@@ -703,6 +708,8 @@ export default function ChatPanel({ scope, subject, suggestionList, health, stre
   const [sending, setSending] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
+  // Drag events fire on every child the pointer crosses, so count enters and leaves instead of trusting one leave.
+  const dragDepth = useRef(0);
   const [openWork, setOpenWork] = useState<number | null>(null);
   const [copied, setCopied] = useState<number | null>(null);
   const [stuck, setStuck] = useState(true);
@@ -1150,8 +1157,29 @@ export default function ChatPanel({ scope, subject, suggestionList, health, stre
     }
   }
 
+  // A drag that is cancelled, dropped elsewhere or leaves the window must not leave the overlay showing.
+  useEffect(() => {
+    if (!dragging) return;
+    const reset = () => {
+      dragDepth.current = 0;
+      setDragging(false);
+    };
+    const onLeave = (event: globalThis.DragEvent) => {
+      if (!event.relatedTarget) reset();
+    };
+    window.addEventListener("dragend", reset);
+    window.addEventListener("drop", reset);
+    window.addEventListener("dragleave", onLeave);
+    return () => {
+      window.removeEventListener("dragend", reset);
+      window.removeEventListener("drop", reset);
+      window.removeEventListener("dragleave", onLeave);
+    };
+  }, [dragging]);
+
   function onDrop(event: DragEvent) {
     event.preventDefault();
+    dragDepth.current = 0;
     setDragging(false);
     if (attachments && event.dataTransfer.files.length) addFiles(event.dataTransfer.files);
   }
@@ -1366,13 +1394,18 @@ export default function ChatPanel({ scope, subject, suggestionList, health, stre
 
       <div
         className={`chat-main${dragging ? " dragging" : ""}`}
-        onDragOver={(e) => {
-          if (!attachments) return;
+        onDragEnter={(e) => {
+          if (!attachments || !hasFiles(e)) return;
           e.preventDefault();
+          dragDepth.current += 1;
           setDragging(true);
         }}
-        onDragLeave={(e) => {
-          if (e.currentTarget === e.target) setDragging(false);
+        onDragOver={(e) => {
+          if (attachments && hasFiles(e)) e.preventDefault();
+        }}
+        onDragLeave={() => {
+          dragDepth.current = Math.max(0, dragDepth.current - 1);
+          if (dragDepth.current === 0) setDragging(false);
         }}
         onDrop={onDrop}
       >
