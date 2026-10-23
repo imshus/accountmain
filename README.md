@@ -106,7 +106,31 @@ amount that doesn't match its rate, and a mistyped GSTIN, so you can see the che
 everything works except the chat. The chat uses `LLM_PROVIDER` (GPT-6 Luna by default); there is no model picker
 on screen.
 
-## On a Linux server (e.g. AWS EC2, Amazon Linux 2023)
+## Hosting on a server (Hostinger VPS, AWS EC2, any Linux VPS) with Docker
+
+This is the easiest way: Docker builds the backend with the right Python (3.12) and serves the web app
+and its API on one address, so the server's own Python version does not matter. Hostinger **shared**
+web hosting cannot run the Python backend; use a Hostinger **VPS** (the "Ubuntu 24.04 with Docker"
+template already has Docker; on another VPS install it with `curl -fsSL https://get.docker.com | sh`).
+
+```bash
+git clone https://github.com/imshus/accountmain.git && cd accountmain
+cp backend/.env.example backend/.env    # then edit backend/.env and set OPENAI_API_KEY
+docker compose up -d --build            # first build takes a few minutes
+```
+
+Open `http://<server-ip>` in a browser; in the Android app enter `http://<server-ip>` as the server.
+Allow port 80 in the VPS firewall (Hostinger hPanel → VPS → Firewall, or `ufw allow 80`).
+
+- Update after a new push: `git pull && docker compose up -d --build`
+- Logs: `docker compose logs -f backend`
+- The books live in the `accounts-data` Docker volume (kept across updates). Back it up with
+  `docker compose cp backend:/data ./backup`.
+- **The app has no login.** On a public server anyone who knows the address can see your books and use
+  your OpenAI key. Turn on the optional password in `frontend/nginx.conf` (instructions inside), or limit
+  port 80 to your office IP in the firewall. Use a domain with HTTPS before real use.
+
+## On a Linux server without Docker (e.g. AWS EC2, Amazon Linux 2023)
 
 Amazon Linux 2023 ships Python 3.9, which is too old; install 3.11 and build the backend's venv with it
 (plain `pip` / `pip3` would still use 3.9 and fail with "Requires-Python >=3.10"):

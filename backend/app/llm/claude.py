@@ -2,10 +2,6 @@
 
 from typing import Literal, TypedDict
 
-import anthropic
-from anthropic import beta_tool
-from anthropic.lib.tools import ToolError
-
 from .. import config
 from .common import (CUT_OFF_NOTE, DECLINED, EMPTY_ANSWER, MAX_TOOL_ROUNDS, NEEDS_MORE_STEPS, LLMError, Reply, Toolbox,
                      closing_on_cancel, tool_error)
@@ -36,6 +32,12 @@ def chat(messages: list[dict], instructions: str, tools: Toolbox, emit=None, eff
          transcript: list | None = None) -> Reply:
     """``transcript`` (from an earlier Reply) continues that exchange, tool calls and results included, with
     the last of ``messages`` as the new user message."""
+    # Imported here, not at the top: the SDK takes seconds to load and slowed every backend start,
+    # even on installs that never use Claude.
+    import anthropic
+    from anthropic import beta_tool
+    from anthropic.lib.tools import ToolError
+
     # Not streamed token by token: the toolbox reports each step, and the answer arrives whole.
     @beta_tool
     def analyse(table: str, measures: list[MeasureArg], group_by: list[GroupArg], filters: list[FilterArg],

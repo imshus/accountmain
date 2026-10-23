@@ -1,0 +1,20 @@
+# Run Accounts.ai on a server (e.g. a Hostinger VPS): docker compose up -d --build
+# Needs backend/.env with OPENAI_API_KEY (copy backend/.env.example). The site is then on port 80.
+services:
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    volumes:
+      - accounts-data:/data   # the books (SQLite); kept across restarts and rebuilds
+    restart: unless-stopped
+
+  web:
+    build: ./frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  accounts-data:
