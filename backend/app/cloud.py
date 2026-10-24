@@ -309,6 +309,11 @@ def _sweep_forever() -> None:
             pass
 
 
+def _table_missing(exc: OperationalError) -> bool:
+    """The table could not be created at startup (a read-only data folder): there are no copies to report."""
+    return "no such table" in str(exc)
+
+
 def resume() -> int:
     """Send copies still waiting (at startup, and every 15 minutes while any wait); returns how many started."""
     global _sweeper_started
@@ -318,8 +323,13 @@ def resume() -> int:
         if not _sweeper_started:
             _sweeper_started = True
             threading.Thread(target=_sweep_forever, name="cloud-sweeper", daemon=True).start()
-    with database.engine.connect() as conn:
-        ids = conn.execute(select(cloud_files.c.dataset_id).where(cloud_files.c.status == "pending")).scalars().all()
+    try:
+        with database.engine.connect() as conn:
+            ids = conn.execute(select(cloud_files.c.dataset_id).where(cloud_files.c.status == "pending")).scalars().all()
+    except OperationalError as exc:
+        if _table_missing(exc):
+            return 0
+        raise
     return sum(_submit(dataset_id) for dataset_id in ids)
 
 
@@ -342,8 +352,13 @@ def _utc(when: datetime | None) -> datetime | None:
 
 
 def status_of(dataset_id: int) -> dict | None:
-    with database.engine.connect() as conn:
-        row = conn.execute(select(cloud_files).where(cloud_files.c.dataset_id == dataset_id)).mappings().first()
+    try:
+        with database.engine.connect() as conn:
+            row = conn.execute(select(cloud_files).where(cloud_files.c.dataset_id == dataset_id)).mappings().first()
+    except OperationalError as exc:
+        if _table_missing(exc):
+            return None
+        raise
     if row is None:
         return None
     return {"status": row["status"], "bucket": row["bucket"], "path": row["path"], "error": row["error"],
@@ -352,8 +367,12 @@ def status_of(dataset_id: int) -> dict | None:
 
 def summary() -> dict:
     counts = {"pending": 0, "done": 0, "failed": 0}
-    with database.engine.connect() as conn:
-        for status, count in conn.execute(select(cloud_files.c.status, func.count()).group_by(cloud_files.c.status)):
-            counts[status] = count
+    try:
+        with database.engine.connect() as conn:
+            for status, count in conn.execute(select(cloud_files.c.status, func.count()).group_by(cloud_files.c.status)):
+                counts[status] = count
+    except OperationalError as exc:
+        if not _table_missing(exc):
+            raise
     return {"configured": configured(), "provider": "supabase" if configured() else None,
             "bucket": config.SUPABASE_BUCKET if configured() else None, **counts}

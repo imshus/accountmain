@@ -8,8 +8,10 @@ uses SQLite's authorizer so a statement can only SELECT from the tables of one u
 
 from __future__ import annotations
 
+import getpass
 import json
 import math
+import os
 import re
 import sqlite3
 import time
@@ -119,6 +121,21 @@ _TRIGGERS = [
     "CREATE TRIGGER IF NOT EXISTS vouchers_no_delete BEFORE DELETE ON vouchers "
     "BEGIN SELECT RAISE(ABORT, 'Vouchers cannot be deleted; cancel them instead.'); END",
 ]
+
+
+def storage_problem() -> str | None:
+    """Why this process cannot save, or None. A data folder or database file it may not write (typically made by a
+    command run with sudo) makes SQLite fail every save with "attempt to write a readonly database"."""
+    files = [config.DB_PATH.with_name(config.DB_PATH.name + suffix) for suffix in ("", "-wal", "-shm", "-journal")]
+    for path in (config.DATA_DIR, *files):
+        if path.exists() and not os.access(path, os.W_OK):
+            try:
+                user = getpass.getuser()
+            except Exception:  # noqa: BLE001 - no user name in the environment
+                user = "the backend's user"
+            return (f"The server cannot save: {path} is read-only for the user running the backend ({user}). "
+                    f"On the server run: sudo chown -R {user} {config.DATA_DIR}  and restart the backend.")
+    return None
 
 
 def init_db() -> None:

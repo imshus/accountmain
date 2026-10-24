@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy.exc import OperationalError
 
 from datetime import date
 
@@ -62,7 +63,17 @@ MAX_CHAT_MESSAGES = 20
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    database.init_db()
+    problem = database.storage_problem()
+    if problem:
+        print(problem)
+    try:
+        database.init_db()
+    except OperationalError as exc:
+        # A read-only data folder: still start, so the books can be read and every save explains how to fix it.
+        if "readonly database" not in str(exc):
+            raise
+        if not problem:
+            print(f"The database is read-only, so nothing can be saved until that is fixed: {exc}")
     cloud.resume()  # copies to Supabase that were still waiting when the backend stopped
     if config.openai_configured():
         threading.Thread(target=llm.gpt.warm_up, daemon=True).start()  # the first question skips the handshake
@@ -92,8 +103,11 @@ class _ErrorsAsJson:
             logging.getLogger("uvicorn.error").exception("%s %s failed", scope.get("method"), scope.get("path"))
             if started:  # part of the answer is already out (a streamed chat): nothing else can be sent
                 raise
-            reason = f"{type(exc).__name__}: {exc}"[:300]
-            await JSONResponse({"detail": f"The server hit an error: {reason}"}, status_code=500)(scope, receive, send)
+            if "readonly database" in str(exc):
+                detail = database.storage_problem() or "The server cannot save: its database is read-only for the backend's user."
+            else:
+                detail = f"The server hit an error: {type(exc).__name__}: {exc}"[:330]
+            await JSONResponse({"detail": detail}, status_code=500)(scope, receive, send)
 
 
 app = FastAPI(title="Accounts.ai API", version="0.1.0", lifespan=lifespan)
@@ -146,7 +160,7 @@ def _detail(dataset: dict) -> dict:
 @app.get("/api/health", response_model=Health)
 def health():
     return {"status": "ok", "providers": llm.provider_status(), "default_provider": llm.default_provider(),
-            "cloud": cloud.summary()}
+            "cloud": cloud.summary(), "storage_problem": database.storage_problem()}
 
 
 @app.post("/api/upload", response_model=DatasetDetail, status_code=201)

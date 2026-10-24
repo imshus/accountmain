@@ -42,6 +42,7 @@ class Health(BaseModel):
     providers: list[ProviderStatus]
     default_provider: ProviderId
     cloud: CloudSummary | None = None
+    storage_problem: str | None = None  # set when the backend cannot write its data folder
 
 
 class DatasetSummary(BaseModel):
