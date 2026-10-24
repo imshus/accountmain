@@ -144,8 +144,10 @@ venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## Android app
 
-`frontend/android` is the Android project. Build the APK with `npm run build`, `npx cap sync android`,
-then `gradlew.bat assembleDebug` in `frontend/android` (details in `frontend/README.md`).
+`frontend/android` is the Android project. To build the APK, double-click **`build-apk.bat`** in the project
+folder (needs Node.js and Android Studio); it builds the web app, copies it into the Android project, runs
+Gradle and leaves the result in `apk\Accounts.ai-1.0-debug.apk`. The same steps by hand: `npm run build`,
+`npx cap sync android`, then `gradlew.bat assembleDebug` in `frontend/android` (details in `frontend/README.md`).
 
 To use it: on the PC that holds the books, run `backend\start-server.bat` (allow Python on **Private
 networks** when Windows Firewall asks), install the APK on the phone, and enter the address the script
