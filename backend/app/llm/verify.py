@@ -11,6 +11,8 @@ a percentage may be the ratio of an amount stated beside it to such a figure. An
 reported as unverified.
 """
 
+from __future__ import annotations
+
 import bisect
 import math
 import re

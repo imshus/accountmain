@@ -12,6 +12,8 @@ books (same party ledger or GSTIN, same invoice / supplier bill number, same fin
 comes from a new upload of the same file.
 """
 
+from __future__ import annotations
+
 import math
 import re
 

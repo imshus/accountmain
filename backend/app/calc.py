@@ -8,6 +8,8 @@ unary minus, percentages and round/abs/min/max are allowed, so nothing else can 
   as ``taxable_value + cgst + sgst`` or ``credit - debit``.
 """
 
+from __future__ import annotations
+
 import ast
 import operator
 import re

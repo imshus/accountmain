@@ -1,10 +1,13 @@
 """Accounts.ai backend: upload spreadsheets, profile them, keep the books, and query them with SQL or AI."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import threading
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout  # the builtin TimeoutError only from Python 3.11
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -505,7 +508,7 @@ def _waiter(emit, cancel):
         while True:
             try:
                 return job.result(timeout=0.2)
-            except TimeoutError:
+            except FutureTimeout:
                 if cancel.is_set():
                     raise llm.Cancelled() from None
 

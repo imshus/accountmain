@@ -6,6 +6,8 @@ supplier, output vs input GST), invoice-number patterns (S/0071 vs PB-046), and 
 names. The result says how sure it is; when the evidence is thin it says so instead of guessing.
 """
 
+from __future__ import annotations
+
 import re
 
 from . import reports

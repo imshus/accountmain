@@ -6,6 +6,8 @@ Section 170 CGST Act (rounding). The GSTIN check character follows the industry-
 mod-36 algorithm (no official GSTN specification is published).
 """
 
+from __future__ import annotations
+
 import re
 from datetime import date
 

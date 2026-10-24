@@ -1,5 +1,7 @@
 """Pieces every chat model shares: the instructions, the table context and the tools (analyse, SQL, calculate)."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import threading

@@ -7,6 +7,8 @@ that can mean either (rent, interest, commission...), a party-name pattern, or
 "Unclassified" when nothing fits. Unknown accounts are never silently treated as expenses.
 """
 
+from __future__ import annotations
+
 import re
 
 # Group -> (statement, nature). Nature is the normal balance side.

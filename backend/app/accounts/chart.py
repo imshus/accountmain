@@ -4,6 +4,8 @@ Group -> (parent primary group or None, nature). Nature decides the statement an
 balance: assets and expenses normally carry Dr balances, liabilities, capital and income Cr.
 """
 
+from __future__ import annotations
+
 GROUPS: dict[str, tuple[str | None, str]] = {
     # Balance sheet: liabilities
     "Capital Account": (None, "liability"),

@@ -6,6 +6,8 @@ User and LLM queries go through ``run_select``, which opens the database read-on
 uses SQLite's authorizer so a statement can only SELECT from the tables of one upload.
 """
 
+from __future__ import annotations
+
 import json
 import math
 import re

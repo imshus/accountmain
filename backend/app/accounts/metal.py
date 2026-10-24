@@ -15,6 +15,8 @@ Metal entries (fine weight, balanced per voucher like rupees):
     rate cut          Sales Dr     /  Customer Cr       (rupees: Customer Dr / Sales Cr / GST Cr)
 """
 
+from __future__ import annotations
+
 import re
 from datetime import date
 
@@ -23,6 +25,7 @@ import pandas as pd
 from sqlalchemy import and_, select
 
 from .. import reports
+from ..compat import to_datetime
 from ..database import engine
 from ..editing import load_frame
 from ..reports import _col, _report
@@ -37,6 +40,12 @@ def grams(mg) -> float:
 
 def _g(mg) -> str:
     return f"{int(mg) / 1000:,.3f} g"
+
+
+def _whole(column: pd.Series, fill: int) -> pd.Series:
+    """Whole numbers of an integer column with blanks as ``fill``. pandas 2 reads an all-NULL column as objects,
+    and fillna on those warns about downcasting; to_numeric first gives the same numbers on pandas 2 and 3."""
+    return pd.to_numeric(column).fillna(fill).astype("int64")
 
 
 def _g_drcr(mg) -> str:
@@ -503,7 +512,7 @@ def metal_entries(company_id: int, metal: str, until: date | None = None) -> pd.
         query = query.where(v.c.date <= until)
     with engine.connect() as conn:
         frame = pd.read_sql(query, conn)
-    frame["date"] = pd.to_datetime(frame["date"]).dt.date
+    frame["date"] = to_datetime(frame["date"]).dt.date
     for col in ("dr", "cr"):
         frame[col] = frame[col].astype("int64")
     return frame
@@ -609,8 +618,8 @@ def _particulars(group: pd.DataFrame) -> str:
     items = group[group.net_mg.notna() | group.item.notna()]
     if items.empty:
         return ""
-    pieces = int(items.pieces.fillna(1).sum())
-    net = int(items.net_mg.fillna(0).sum())
+    pieces = int(_whole(items.pieces, 1).sum())
+    net = int(_whole(items.net_mg, 0).sum())
     tunches = sorted({t / 100 for t in items.tunch_bp.dropna()})
     text = f"{pieces} pc{'s' if pieces != 1 else ''}" + (f" · net {_g(net)}" if net else "")
     if tunches:
@@ -679,9 +688,9 @@ def stock_grams(company: dict, metal: str, start: date | None, end: date | None)
     opening = int(_openings(company["id"], metal).reindex(stock_ids).fillna(0).sum()) + int((lines.dr - lines.cr)[lines.date < start].sum())
     inside = lines[lines.date >= start].copy()
     inside["karat"] = [karat_of(p) for p in inside.purity]
-    inside["pcs"] = inside.pieces.fillna(1).astype("int64")
+    inside["pcs"] = _whole(inside.pieces, 1)
     for col in ("gross_mg", "net_mg", "dia_mct", "stn_mct"):
-        inside[col] = inside[col].fillna(0).astype("int64")
+        inside[col] = _whole(inside[col], 0)
     inward, outward = inside[inside.dr > 0], inside[inside.cr > 0]
 
     def movement(frame: pd.DataFrame) -> pd.DataFrame:

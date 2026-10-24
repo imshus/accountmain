@@ -5,6 +5,8 @@ Balances follow Tally for every account: balance = opening + debits - credits, s
 because every voucher's debits equal its credits.
 """
 
+from __future__ import annotations
+
 import re
 from datetime import date, timedelta
 
@@ -13,6 +15,7 @@ import pandas as pd
 from sqlalchemy import and_, func, select
 
 from .. import gst
+from ..compat import to_datetime
 from ..database import engine
 from ..formatting import indian
 from ..reports import AGEING_BUCKETS, _col, _report, gst_net_payable
@@ -77,7 +80,7 @@ def entries(company_id: int, until: date | None = None) -> pd.DataFrame:
         query = query.where(v.c.date <= until)
     with engine.connect() as conn:
         frame = pd.read_sql(query, conn)
-    frame["date"] = pd.to_datetime(frame["date"]).dt.date
+    frame["date"] = to_datetime(frame["date"]).dt.date
     for col in ("dr", "cr"):
         frame[col] = frame[col].astype("int64")
     return frame
@@ -467,8 +470,8 @@ def outstanding(company: dict, kind: str, as_of: date | None) -> dict:
             if pending == 0:
                 continue
             new = g[g.kind == "new"]
-            bill_date = pd.to_datetime(new.bill_date).min() if len(new) else pd.to_datetime(g.bill_date).min()
-            due = pd.to_datetime(new.due_date).max() if len(new) and new.due_date.notna().any() else bill_date
+            bill_date = to_datetime(new.bill_date).min() if len(new) else to_datetime(g.bill_date).min()
+            due = to_datetime(new.due_date).max() if len(new) and new.due_date.notna().any() else bill_date
             overdue = (pd.Timestamp(as_of) - due).days if pd.notna(due) else None
             bucket = "Not due" if overdue is not None and overdue < 0 else next(
                 (lab for (lo, hi), lab in zip(AGEING_BUCKETS, labels) if overdue is not None and overdue >= lo and (hi is None or overdue <= hi)), labels[-1])
@@ -546,7 +549,8 @@ def _gst_invoices(company: dict, start: date, end: date) -> pd.DataFrame:
     frame = pd.DataFrame(rows, columns=["voucher_id", "vtype", "number", "date", "party", "gstin", "state", "taxable", "igst", "cgst", "sgst", "cess", "value"])
     frame["tax"] = frame.igst + frame.cgst + frame.sgst
     frame["rate"] = [gst.nearest_rate(t / x * 100, d) if x else None for t, x, d in zip(frame.tax, frame.taxable, frame.date)]
-    frame["registered"] = frame.gstin.map(lambda g: bool(g) and gst.gstin_problem(g) is None)
+    # astype(bool): with no invoices map() gives an object Series, which pandas would take as column labels, not a mask.
+    frame["registered"] = frame.gstin.map(lambda g: bool(g) and gst.gstin_problem(g) is None).astype(bool)
     return frame
 
 
@@ -669,7 +673,7 @@ def bank_reconciliation(company: dict, bank_ledger_id: int | None, as_of: date |
         stmt = pd.read_sql(select(bank_lines).where(and_(bank_lines.c.company_id == company["id"], bank_lines.c.bank_ledger_id == bank_ledger_id)), conn)
     if stmt.empty:
         raise service.AccountsError("No bank statement imported for this ledger yet (Import → Bank statement).")
-    stmt["date"] = pd.to_datetime(stmt.date).dt.date
+    stmt["date"] = to_datetime(stmt.date).dt.date
     as_of = as_of or max(stmt.date)
     stmt = stmt[stmt.date <= as_of].sort_values(["date", "id"])
     first = min(stmt.date)

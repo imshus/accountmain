@@ -10,6 +10,8 @@ Nothing is changed silently: every cell that could not be read, every duplicate 
 the comparison with the file's own Total row are reported as checks shown to the user.
 """
 
+from __future__ import annotations
+
 import csv
 import functools
 import io
@@ -24,6 +26,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .compat import to_datetime
 from .formatting import indian
 
 # Reference-number columns: a Total row under them is usually a count of entries, not a sum.
@@ -1306,7 +1309,7 @@ def _infer_column(series: pd.Series, name: str, numbers: dict | None = None) -> 
                 f"{pd.Timestamp(before):%d %b %Y} became {swapped[before]:%d %b %Y}). Check these dates.",
                 positions,
             ))
-        return _Inferred(pd.to_datetime(series.map(stamps), errors="coerce"), "date", failed, date_notes, row_notes)
+        return _Inferred(to_datetime(series.map(stamps)), "date", failed, date_notes, row_notes)
 
     text = _as_text(series)
     if money_name and numeric_share > 0:

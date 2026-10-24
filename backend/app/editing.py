@@ -4,6 +4,8 @@ After every change the sheet's statistics and summaries are recomputed with pand
 from the stored table, so every total on screen reflects the current data.
 """
 
+from __future__ import annotations
+
 import json
 import math
 
@@ -13,6 +15,7 @@ from sqlalchemy import text, update
 
 from .analytics import profile_sheet
 from .calc import columns_in, evaluate_columns
+from .compat import to_datetime
 from .database import dataset_sheets, engine, quote_ident
 from .excel_loader import clean_name, parse_date_input, to_number
 
@@ -33,7 +36,7 @@ def load_frame(sheet: dict) -> pd.DataFrame:
     for col in frame.columns.drop(ROWID):
         kind = kinds.get(col, "number" if pd.api.types.is_numeric_dtype(frame[col]) else "text")
         if kind == "date":
-            frame[col] = pd.to_datetime(frame[col], errors="coerce")
+            frame[col] = to_datetime(frame[col])
         elif kind == "number":
             frame[col] = pd.to_numeric(frame[col], errors="coerce")
         else:
