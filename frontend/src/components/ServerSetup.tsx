@@ -18,8 +18,9 @@ export default function ServerSetup({ problem, onCancel }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await checkServer(url);
-      saveServer(url);
+      // Saves the form that answered (e.g. https:// when the server redirects http to https).
+      const { base } = await checkServer(url);
+      saveServer(base);
       window.location.reload();
     } catch (e) {
       setError((e as Error).message);
@@ -38,7 +39,7 @@ export default function ServerSetup({ problem, onCancel }: Props) {
       <form className="stack-form" onSubmit={(e) => void connect(e)}>
         <label className="field">
           <span>Server address</span>
-          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="http://192.168.1.10:8000" inputMode="url"
+          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="account.example.in or 192.168.1.10:8000" inputMode="url"
             autoCapitalize="off" autoCorrect="off" spellCheck={false} required />
         </label>
         {error ? <div className="callout warning">{error}</div> : null}

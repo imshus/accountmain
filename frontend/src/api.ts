@@ -55,22 +55,57 @@ export function saveServer(url: string): void {
   localStorage.setItem(SERVER_KEY, normaliseServer(url));
 }
 
-/** "192.168.1.10:8000" -> "http://192.168.1.10:8000" */
+// A computer on the local network (an IP address or localhost) rarely has HTTPS; a server with a domain name nearly always does.
+const LOCAL_HOST = /^(localhost|\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])(:\d+)?$/i;
+
+/** "192.168.1.10:8000" -> "http://192.168.1.10:8000"; "account.example.in" -> "https://account.example.in" */
 export function normaliseServer(url: string): string {
   const text = url.trim().replace(/\/+$/, "");
-  return text && !/^https?:\/\//i.test(text) ? `http://${text}` : text;
+  if (!text || /^https?:\/\//i.test(text)) return text;
+  return `${LOCAL_HOST.test(text) ? "http" : "https"}://${text}`;
 }
 
-/** Check an address before saving it: the backend must answer its health check. */
-export async function checkServer(url: string): Promise<Health> {
+async function healthAt(base: string): Promise<Health> {
+  const response = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(8000) });
+  if (!response.ok) throw new Error(String(response.status));
+  return (await response.json()) as Health;
+}
+
+/** Check an address before saving it: the backend must answer its health check. An http:// address that fails is
+ * tried again over https://, because a server that redirects http to https blocks the app's requests at the redirect.
+ * Returns the address that answered. */
+export async function checkServer(url: string): Promise<{ base: string; health: Health }> {
   const base = normaliseServer(url);
-  try {
-    const response = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(8000) });
-    if (!response.ok) throw new Error();
-    return (await response.json()) as Health;
-  } catch {
-    throw new ApiError(0, `No Accounts.ai backend answered at ${base}. Is start-server.bat running on that computer, and is the phone on the same Wi-Fi?`);
+  const secure = /^http:\/\//i.test(base) ? base.replace(/^http:/i, "https:") : null;
+  for (const candidate of secure ? [base, secure] : [base]) {
+    try {
+      return { base: candidate, health: await healthAt(candidate) };
+    } catch {
+      // Try the next form of the address.
+    }
   }
+  throw new ApiError(
+    0,
+    `No Accounts.ai backend answered at ${base}${secure ? ` or ${secure}` : ""}. Check the address, that the backend is running, and (for a computer on your network) that the phone is on the same Wi-Fi.`,
+  );
+}
+
+let httpsTried = false;
+
+/** A saved http:// address whose server now only works over https (it redirects): switch to https once, if the backend
+ * answers there, so the app keeps working without the user retyping the address. */
+async function switchToHttps(): Promise<boolean> {
+  const base = serverUrl();
+  if (httpsTried || !stored(SERVER_KEY) || !/^http:\/\//i.test(base)) return false;
+  httpsTried = true;
+  const secure = base.replace(/^http:/i, "https:");
+  try {
+    await healthAt(secure);
+  } catch {
+    return false;
+  }
+  saveServer(secure);
+  return true;
 }
 
 export class ApiError extends Error {
@@ -117,6 +152,7 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs: number = 
   try {
     response = await fetch(serverUrl() + path, { ...init, signal });
   } catch {
+    if (!expired() && (await switchToHttps())) return request<T>(path, init, timeoutMs);
     throw new ApiError(0, expired() ? timedOut(init, timeoutMs) : unreachable());
   }
   let body: unknown = null;
@@ -146,6 +182,7 @@ async function streamChat(path: string, payload: object, onEvent: (event: ChatEv
     });
   } catch (error) {
     if ((error as Error).name === "AbortError") throw error;
+    if (await switchToHttps()) return streamChat(path, payload, onEvent, options);
     throw new ApiError(0, unreachable());
   }
   if (!response.ok || !response.body) {
