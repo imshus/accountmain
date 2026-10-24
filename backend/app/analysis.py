@@ -8,6 +8,8 @@ with an "All others" row so the column still adds up, the optional pivot across 
 the total. A second, ungrouped query computes the overall totals, and the groups must add up to them.
 """
 
+from __future__ import annotations
+
 import re
 import time
 from datetime import date
@@ -15,6 +17,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 import pandas as pd
 
+from .compat import to_timestamp
 from .database import QueryError, quote_ident
 from .duck import Field, Session, cached, json_value, sheet_key
 from .excel_loader import to_number
@@ -179,7 +182,7 @@ def parse_date(text: str, what: str) -> date:
     # Month names ("1 Apr 2025", "April 1, 2025") cannot be misread; a bare number like 20250401 is year-first.
     # Anything vaguer ("April 2025", "1/4") is refused: pandas would quietly pick a day or the current year.
     named = _NAMED.fullmatch(text)
-    parsed = pd.to_datetime(text, errors="coerce", dayfirst=bool(named)) if named or re.fullmatch(r"\d{8}", text) else None
+    parsed = to_timestamp(text, dayfirst=bool(named)) if named or re.fullmatch(r"\d{8}", text) else None
     if parsed is None or pd.isna(parsed):
         raise AnalysisError(f'{what}: "{text}" is not a date (use YYYY-MM-DD or DD/MM/YYYY).')
     return parsed.date()
@@ -384,6 +387,10 @@ def run(session: Session, request: dict) -> dict:
                 checks.append({"level": "warning", "message": "Some names differ only in capitals or spaces and are counted separately: "
                                + ", ".join(clashes[:8]) + ("…" if len(clashes) > 8 else "") + "."})
 
+        # DuckDB returns groups in no fixed order (it varies run to run and between versions), so put them in label
+        # order first: groups with equal values then always come out the same way.
+        frame = frame.sort_values([f"g{i}" for i in range(len(groups))], na_position="last", kind="stable",
+                                  key=lambda s: s.map(_sort_key))
         by = "g0" if spec["sort"] == "label" else "m0"
         frame = frame.sort_values(by, ascending=spec["sort"] != "value_desc", na_position="last", kind="stable",
                                   key=lambda s: s.map(_sort_key)).reset_index(drop=True)

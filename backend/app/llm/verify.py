@@ -10,6 +10,8 @@ may also be the sum or difference (for a percentage, the ratio) of two figures t
 confirmed or are overall totals. Anything else is reported as unverified.
 """
 
+from __future__ import annotations
+
 import math
 import re
 

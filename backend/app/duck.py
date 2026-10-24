@@ -15,11 +15,14 @@ kept in memory until the sheet changes, so opening a session only registers read
 answers come back in milliseconds.
 """
 
+from __future__ import annotations
+
 import atexit
 import hashlib
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -33,10 +36,12 @@ import numpy as np
 import pandas as pd
 
 from . import config
+from .compat import to_datetime
 from .database import QueryError, QueryResult, quote_ident
 from .editing import ROWID, load_frame
 
 MAX_SCALE = 4
+_PRAGMA = re.compile(r"(?is)\s*(?:(?:--[^\n]*\n|/\*.*?\*/)\s*)*pragma\b")
 _DECIMAL_LIMIT = 1e13  # DECIMAL(18, 4) holds up to 1e14; stay well inside it
 
 
@@ -147,7 +152,7 @@ def _prepare(frame: pd.DataFrame, kinds: dict[str, str], labels: dict[str, str])
             scale = decimal_scale(frame[col])
             expr = f"CAST({q} AS DECIMAL(18, {scale}))" if scale is not None else f"CAST({q} AS DOUBLE)"
         elif kind == "date":
-            values = pd.to_datetime(frame[col], errors="coerce")
+            values = to_datetime(frame[col])
             frame[col] = values
             date_only = bool(((values.dt.normalize() == values) | values.isna()).all())
             expr = f"CAST({q} AS DATE)" if date_only else f"CAST({q} AS TIMESTAMP)"
@@ -241,7 +246,8 @@ class Session:
             statements = self.conn.extract_statements(statement)
         except duckdb.Error as exc:
             raise QueryError(_clean_error(exc)) from exc
-        if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+        # DuckDB 1.x counts a read-only PRAGMA (PRAGMA version) as a SELECT; 2.x does not. Refuse it on both.
+        if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT or _PRAGMA.match(statement):
             raise QueryError("Only one SELECT query at a time is allowed.")
         started = time.monotonic()
         columns, rows = self.fetch(statement, limit=limit + 1)

@@ -1,4 +1,5 @@
-# Needs Python 3.11 or newer (pandas 3, numpy 2.3+, openai 3.x).
+# Python 3.9 or newer. Python 3.11+ gets the versions the app was developed with (pandas 3, openai 3.x,
+# duckdb 2.x); older Pythons get the last releases that still support them, picked by the markers below.
 fastapi>=0.115
 uvicorn>=0.30
 python-multipart>=0.0.9
@@ -9,5 +10,13 @@ openpyxl>=3.1
 xlrd>=2.0
 SQLAlchemy>=2.0
 anthropic>=0.118
-openai>=3.36
-duckdb>=2.0
+typing_extensions>=4.6  # TypedDicts for the Claude tool schemas (Python < 3.12)
+openai>=3.36; python_version >= "3.10"
+openai>=2.0,<3; python_version < "3.10"
+# duckdb 2.x has wheels for Python 3.11+ only.
+duckdb>=2.0; python_version >= "3.11"
+duckdb>=1.4,<2; python_version < "3.11"
+# Lets pydantic and FastAPI read "str | None" annotations on Python 3.9.
+eval_type_backport>=0.2; python_version < "3.10"
+# SQLAlchemy's greenlet: 3.2.5 has no Windows wheel for Python 3.9 (building it needs a C++ compiler); Linux is unaffected.
+greenlet<3.2.5; python_version < "3.10" and sys_platform == "win32"

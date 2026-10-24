@@ -1,5 +1,7 @@
 """Settings read from environment variables (and backend/.env if present)."""
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 

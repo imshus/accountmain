@@ -9,13 +9,16 @@ Which column plays which part (date, account, debit, credit...) comes from the s
 mapping: detected automatically from the column names and editable by the user.
 """
 
+from __future__ import annotations
+
 import re
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 
 from . import classify, gst
+from .compat import to_datetime
 from .formatting import indian
 
 ROLES = {
@@ -171,7 +174,7 @@ def _signed(frame: pd.DataFrame, mapping: dict) -> tuple[np.ndarray, np.ndarray,
 
 
 def _date_col(frame: pd.DataFrame, mapping: dict, role: str = "date") -> pd.Series:
-    return pd.to_datetime(frame[mapping[role]], errors="coerce")
+    return to_datetime(frame[mapping[role]])
 
 
 def _dates_text(values: pd.Series) -> list[str | None]:
@@ -566,7 +569,8 @@ def ageing(frame: pd.DataFrame, mapping: dict, as_of: date | None) -> dict:
         # (by entry date even when ageing by due date; a bill not yet due on that date is still owed).
         if "date" in mapping:
             entered = _date_col(frame, mapping)
-            after = (entered >= pd.Timestamp(as_of) + pd.Timedelta(days=1)).to_numpy()
+            # timedelta, not pd.Timedelta: pandas 2 makes the latter nanoseconds, which overflow after 2262
+            after = (entered >= pd.Timestamp(as_of) + timedelta(days=1)).to_numpy()
         else:
             entered, after = when, np.zeros(len(frame), dtype=bool)
         later = int(after.sum())
@@ -587,7 +591,7 @@ def ageing(frame: pd.DataFrame, mapping: dict, as_of: date | None) -> dict:
     present = [b for b in order if b in pivot.columns]
     pivot = pivot[present]
     pivot["total"] = pivot.sum(axis=1)
-    pivot = pivot.sort_values("total", ascending=False)
+    pivot = pivot.sort_values("total", ascending=False, kind="stable")  # stable: ties stay A-Z on any CPU
     keys = {b: f"b{i}" for i, b in enumerate(present)}
     rows = [{"account": name, **{keys[b]: _rupees(r[b]) or None for b in present}, "total": _rupees(r["total"])} for name, r in pivot.iterrows()]
     report = _report(

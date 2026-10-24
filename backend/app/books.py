@@ -6,6 +6,8 @@ in whole paise so every total, difference and running balance is exact. Every re
 carries checks that prove its totals add up.
 """
 
+from __future__ import annotations
+
 import re
 from datetime import date
 
@@ -13,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from . import reports
+from .compat import to_datetime
 from .duck import cached, sheet_key
 from .editing import load_frame
 from .formatting import indian
@@ -40,7 +43,9 @@ def _normalise(sheet: dict) -> tuple[pd.DataFrame, list[dict], dict[str, tuple[s
     notes: list[dict] = []
     out = pd.DataFrame({"register": sheet["register"], "source": sheet["sheet_name"], "rowid": frame["_rowid"].to_numpy()})
 
-    out["date"] = pd.to_datetime(frame[mapping["date"]], errors="coerce").to_numpy() if "date" in mapping else pd.NaT
+    # No date: blanks in seconds, the coarsest unit, so stacking with dated sheets keeps their unit; nanosecond
+    # blanks would make pandas 3 convert every date to nanoseconds, which fails for a date after 2262.
+    out["date"] = to_datetime(frame[mapping["date"]]).to_numpy() if "date" in mapping else np.full(len(out), np.datetime64("NaT", "s"))
     if "date" not in mapping:
         notes.append({"level": "warning", "message": f"{name}: no date column chosen, so monthly figures and ageing leave it out."})
     for role, column in (("party", "account"), ("invoice_no", "voucher_no"), ("gstin", "gstin"), ("item", "item")):
@@ -299,7 +304,8 @@ def _item_table(books: Books) -> dict | None:
         table[f"bought_{col}"] = bought_q.reindex(table.index).fillna(0)
         table[f"sold_{col}"] = sold_q.reindex(table.index).fillna(0)
         table[f"bal_{col}"] = table[f"bought_{col}"] - table[f"sold_{col}"]
-    table = table.sort_values("sold_value", ascending=False)
+    # stable: equal values keep the item order; numpy's default sort orders ties differently per CPU
+    table = table.sort_values("sold_value", ascending=False, kind="stable")
     columns = [_col("item", "Item", "text"), _col("bought_value", "Purchased value", "money"), _col("sold_value", "Sold value", "money"),
                _col("difference", "Sold − purchased", "money")]
     for col in quantity_cols:
@@ -420,7 +426,7 @@ def _stock(books: Books, measure: str | None) -> tuple[pd.DataFrame | None, str 
         table["avg_cost"] = np.where(table.bought_q > 0, table.bought_v / table.bought_q, 0)  # paise per unit
     table["closing_v"] = np.where(table.closing_q > 0, np.round(table.closing_q * table.avg_cost), 0).astype("int64")
     table["cogs"] = np.round(np.minimum(table.sold_q, table.bought_q).clip(lower=0) * table.avg_cost).astype("int64")
-    return table.sort_values("closing_v", ascending=False), measure, measures
+    return table.sort_values("closing_v", ascending=False, kind="stable"), measure, measures
 
 
 def _stock_gaps(books: Books, table: pd.DataFrame, measure: str) -> str | None:
@@ -526,7 +532,7 @@ def parties(books: Books) -> dict:
     cards = []
     for register, title, label in (("sales", "Customers (receivable from sales)", "Sold"), ("purchases", "Suppliers (payable for purchases)", "Bought")):
         part = books.all[books.all.register == register]
-        g = part.groupby("party").agg(entries=("invoice_value", "size"), value=("invoice_value", "sum"), last=("date", "max")).sort_values("value", ascending=False)
+        g = part.groupby("party").agg(entries=("invoice_value", "size"), value=("invoice_value", "sum"), last=("date", "max")).sort_values("value", ascending=False, kind="stable")
         rows = [{"party": name, "entries": int(r["entries"]), "value": _rupees(r["value"]),
                  "last": None if pd.isna(r["last"]) else pd.Timestamp(r["last"]).strftime("%Y-%m-%d")} for name, r in g.iterrows()]
         tables.append({
@@ -601,7 +607,7 @@ def ageing(books: Books, as_of: date | None) -> dict:
         frame = pd.DataFrame({"party": part.party, "bucket": bucket, "pending": pending.fillna(0).astype("int64")})
         pivot = frame.pivot_table(index="party", columns="bucket", values="pending", aggfunc="sum", fill_value=0)
         present = [b for b in ["Not yet due", *labels, "No date"] if b in pivot.columns]
-        pivot = pivot[present].assign(total=lambda t: t.sum(axis=1)).sort_values("total", ascending=False)
+        pivot = pivot[present].assign(total=lambda t: t.sum(axis=1)).sort_values("total", ascending=False, kind="stable")
         keys = {b: f"b{i}" for i, b in enumerate(present)}
         tables.append({
             "title": title,

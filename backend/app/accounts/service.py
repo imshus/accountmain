@@ -12,6 +12,8 @@ Rules enforced on every voucher (Tally-style double entry):
 Every create/update/cancel is written to the audit log with before/after snapshots.
 """
 
+from __future__ import annotations
+
 import json
 import math
 import re

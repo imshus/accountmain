@@ -4,6 +4,8 @@
 the sheet's table and sent to the frontend as-is.
 """
 
+from __future__ import annotations
+
 import math
 import re
 
@@ -108,7 +110,8 @@ def _column_profile(series: pd.Series, name: str, label: str) -> dict:
                 "span_days": int((last - first).days),
             }
     else:
-        top = series.value_counts(dropna=True).head(5)
+        # Ties keep first-seen order, as pandas 3 does; pandas 2's default sort could reorder them.
+        top = series.value_counts(dropna=True, sort=False).sort_values(ascending=False, kind="stable").head(5)
         profile["stats"] = {"top": [{"value": str(v), "count": int(c)} for v, c in top.items()]}
     return profile
 
@@ -250,7 +253,7 @@ def _category_table(df: pd.DataFrame, category: str, measures: list[str], label)
 
     weight = np.abs(sums.to_numpy()).sum(axis=1)
     total_weight = weight.sum()
-    order = np.argsort(-weight)[:TOP_CATEGORIES]
+    order = np.argsort(-weight, kind="stable")[:TOP_CATEGORIES]  # stable: ties stay A-Z on any CPU
 
     columns = [{"key": "name", "label": label(category), "format": "text"}]
     columns += [{"key": m, "label": label(m), "format": "money"} for m in measures]

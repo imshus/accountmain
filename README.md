@@ -78,7 +78,9 @@ and every number can be traced and checked (see `reports/Accurate AI accounting 
 
 ## Run it locally
 
-You need **Python 3.11 or newer** (pandas 3 and the OpenAI SDK do not install on older Python) and Node.js 20+.
+You need **Python 3.9 or newer** (3.11+ recommended) and Node.js 20+. On Python 3.9 and 3.10, `pip install -r
+requirements.txt` picks the newest library versions that still support them (pandas 2.3, OpenAI SDK 2.x,
+DuckDB 1.4); every report and figure has been checked to come out identical to Python 3.11+.
 Use two terminals. (For the phone app, see **Android app** below.)
 
 **Backend** (http://127.0.0.1:8000, API docs at `/docs`):
@@ -132,15 +134,17 @@ Allow port 80 in the VPS firewall (Hostinger hPanel → VPS → Firewall, or `uf
 
 ## On a Linux server without Docker (e.g. AWS EC2, Amazon Linux 2023)
 
-Amazon Linux 2023 ships Python 3.9, which is too old; install 3.11 and build the backend's venv with it
-(plain `pip` / `pip3` would still use 3.9 and fail with "Requires-Python >=3.10"):
+Amazon Linux 2023's own Python 3.9 works. Use the venv's Python for pip so it installs into the venv:
 
 ```bash
-sudo dnf install -y python3.11 python3.11-pip
-cd backend && python3.11 -m venv venv && venv/bin/python -m pip install -r requirements.txt
+cd backend && python3 -m venv venv && venv/bin/python -m pip install --upgrade pip
+venv/bin/python -m pip install -r requirements.txt
 cp .env.example .env   # then put your OPENAI_API_KEY in it; .env is not in git
-venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+pm2 start venv/bin/python --name backend-app --interpreter none -- -m uvicorn app.main:app --host 0.0.0.0 --port 2000
 ```
+
+Without pm2: `venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 2000`. Allow the port in the
+EC2 Security Group (inbound TCP). After a `git pull`, run the `pip install` line again and `pm2 restart backend-app`.
 
 ## Android app
 

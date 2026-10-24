@@ -12,6 +12,8 @@ books (same party, same invoice / supplier bill number, same financial year) is 
 comes from a new upload of the same file.
 """
 
+from __future__ import annotations
+
 import math
 import re
 

@@ -1,6 +1,11 @@
 """Anthropic Claude models through the SDK's tool runner."""
 
-from typing import Literal, TypedDict
+from __future__ import annotations
+
+from typing import Literal
+
+# pydantic (which builds the tool schemas) accepts typing.TypedDict only from Python 3.12 on.
+from typing_extensions import TypedDict
 
 from .. import config
 from .common import (CUT_OFF_NOTE, DECLINED, EMPTY_ANSWER, MAX_TOOL_ROUNDS, NEEDS_MORE_STEPS, LLMError, Reply, Toolbox,
@@ -124,7 +129,8 @@ def chat(messages: list[dict], instructions: str, tools: Toolbox, emit=None, eff
             for message in runner:
                 tools.check_cancelled()
                 final = message
-                history.append(message.to_param())
+                # What message.to_param() returns; the SDK line for Python 3.9 does not have it.
+                history.append({"role": message.role, "content": list(message.content)})
                 # Kept for a correction round; the runner reuses these results, so each tool still runs once.
                 results = runner.generate_tool_call_response() if message.stop_reason == "tool_use" else None
                 if results:

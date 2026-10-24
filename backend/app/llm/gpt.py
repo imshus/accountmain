@@ -1,12 +1,20 @@
 """OpenAI models (GPT-6 Luna by default) through the Responses API with function calling."""
 
+from __future__ import annotations
+
 import json
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
-import httpx2
 import openai
+
+try:  # openai 3.x (Python 3.10+) runs on httpx2
+    import httpx2 as httpx
+    _HttpClient = openai.DefaultHttpx2Client
+except ImportError:  # openai 2.x, the last line for Python 3.9, runs on httpx
+    import httpx
+    _HttpClient = openai.DefaultHttpxClient
 
 from .. import analysis, config
 from .common import (
@@ -165,8 +173,8 @@ def _client() -> openai.OpenAI:
     connections are kept for 90 s instead."""
     global _CLIENT
     if _CLIENT is None:
-        limits = httpx2.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=90)
-        _CLIENT = openai.OpenAI(http_client=openai.DefaultHttpx2Client(limits=limits))
+        limits = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=90)
+        _CLIENT = openai.OpenAI(http_client=_HttpClient(limits=limits))
     return _CLIENT
 
 

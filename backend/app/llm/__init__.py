@@ -7,6 +7,8 @@ returned; if any figure does not match, the model is asked once to recompute and
 correct its answer, and whatever is still unverified is reported to the user.
 """
 
+from __future__ import annotations
+
 import copy
 import dataclasses
 import json
