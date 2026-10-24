@@ -18,10 +18,30 @@ class ProviderStatus(BaseModel):
     key_name: str
 
 
+class CloudSummary(BaseModel):
+    """Copies of uploaded documents in Supabase Storage (configured=False when it is not set up)."""
+
+    configured: bool
+    provider: str | None = None
+    bucket: str | None = None
+    pending: int = 0
+    done: int = 0
+    failed: int = 0
+
+
+class CloudCopy(BaseModel):
+    status: Literal["pending", "done", "failed"]
+    bucket: str
+    path: str
+    error: str | None = None
+    updated_at: datetime
+
+
 class Health(BaseModel):
     status: str
     providers: list[ProviderStatus]
     default_provider: ProviderId
+    cloud: CloudSummary | None = None
 
 
 class DatasetSummary(BaseModel):
@@ -52,6 +72,7 @@ class DatasetDetail(BaseModel):
     size_bytes: int
     uploaded_at: datetime
     sheets: list[SheetDetail]
+    cloud: CloudCopy | None = None  # the copy in Supabase Storage, when that is set up
 
 
 class ColumnCalcResult(BaseModel):

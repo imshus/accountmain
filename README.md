@@ -158,12 +158,27 @@ networks** when Windows Firewall asks), install the APK on the phone, and enter 
 prints. There is no password, so use it only on a network you trust. The phone must be on the same Wi-Fi,
 or the backend must be hosted where the phone can reach it (use HTTPS for that).
 
+## Documents in Supabase (optional)
+
+With `SUPABASE_URL` and `SUPABASE_SECRET_KEY` in `backend/.env`, every file uploaded from any client (web, the
+Android app, the Expo app) is also stored unchanged in a **private** Supabase Storage bucket (a public bucket is
+refused, so documents can never be downloaded without the key). The copy is made in the background, so uploads are
+not slower and never fail because of it. Until Supabase confirms a copy, the file waits in `DATA_DIR/cloud_outbox`;
+passing failures (Supabase or the network down) keep it waiting and it is tried again every 15 minutes and at the
+next start; only problems retrying cannot fix (wrong key, public bucket, refused file) mark it failed, and
+`POST /api/cloud/retry` sends those again after you fix them. The key is only ever sent over https and never
+follows a redirect. File names carry a content fingerprint, so two servers sharing one bucket never overwrite each
+other's documents. `GET /api/health` and `GET /api/cloud` show how many copies are sent, waiting or failed, and each
+upload's detail (`GET /api/datasets/{id}`) shows its copy's status and path. Deleting an upload in the app keeps
+its copy in Supabase. The key never leaves the server; the apps do not talk to Supabase directly.
+
 ## API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/api/health` | Backend status and which chat models have API keys |
-| POST | `/api/upload` | Upload a spreadsheet (multipart field `file`) |
+| POST | `/api/upload` | Upload a spreadsheet (multipart field `file`); also copied to Supabase when set up |
+| GET / POST | `/api/cloud` · `/api/cloud/retry` | Supabase copies: counts; send failed copies again |
 | GET / DELETE | `/api/datasets[/{id}]` | List, open or delete uploads |
 | POST | `/api/datasets/{id}/sql` | Run a read-only DuckDB `SELECT` |
 | GET | `/api/datasets/{id}/fields` · `/api/books/{id}/fields` | Tables and columns available to Analyse (kind and exact decimals) |
@@ -214,6 +229,8 @@ or the backend must be hosted where the phone can reach it (use HTTPS for that).
 | `ANTHROPIC_EFFORT` / `ANTHROPIC_REPAIR_EFFORT` | `low` / `medium` | Same, for Claude |
 | `LLM_PROVIDER` | `openai` | Model selected first when both keys are set |
 | `MAX_UPLOAD_MB` | `25` | Upload size limit |
+| `SUPABASE_URL` / `SUPABASE_SECRET_KEY` | — | Optional: also store every uploaded document in Supabase Storage (the https:// Project URL, and a secret key `sb_secret_…` from Supabase → Project Settings → API Keys; a legacy service_role key also works; `SUPABASE_SERVICE_KEY` is accepted as the name too) |
+| `SUPABASE_BUCKET` / `SUPABASE_FOLDER` | `documents` / `uploads` | Private bucket (created if missing; a public one is refused) and folder: `<folder>/<YYYY-MM>/<upload id>-<content fingerprint>-<file name>` |
 | `DATA_DIR` | `backend/data` | Where `accounts.db` is stored |
 
 ## Limits to know

@@ -17,7 +17,7 @@ from fastapi.responses import StreamingResponse
 
 from datetime import date
 
-from . import analysis, books, classify, config, database, detect, editing, llm, reports
+from . import analysis, books, classify, cloud, config, database, detect, editing, llm, reports
 from .accounts import api as accounts_api
 from .accounts import db as _accounts_tables  # noqa: F401  (registers the books tables before create_all)
 from .analytics import profile_sheet
@@ -38,6 +38,7 @@ from .schemas import (
     ChatResponse,
     ColumnCalcRequest,
     ColumnCalcResult,
+    CloudSummary,
     DatasetDetail,
     DocumentsRequest,
     FilesChatRequest,
@@ -61,6 +62,7 @@ MAX_CHAT_MESSAGES = 20
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     database.init_db()
+    cloud.resume()  # copies to Supabase that were still waiting when the backend stopped
     if config.openai_configured():
         threading.Thread(target=llm.gpt.warm_up, daemon=True).start()  # the first question skips the handshake
     yield
@@ -108,12 +110,14 @@ def _fresh_sheet(dataset_id: int, table_name: str) -> dict:
 
 def _detail(dataset: dict) -> dict:
     sheets = [_sheet_detail(sheet) for sheet in dataset["sheets"]]
-    return {**{k: dataset[k] for k in ("id", "filename", "size_bytes", "uploaded_at")}, "sheets": sheets}
+    return {**{k: dataset[k] for k in ("id", "filename", "size_bytes", "uploaded_at")}, "sheets": sheets,
+            "cloud": cloud.status_of(dataset["id"])}
 
 
 @app.get("/api/health", response_model=Health)
 def health():
-    return {"status": "ok", "providers": llm.provider_status(), "default_provider": llm.default_provider()}
+    return {"status": "ok", "providers": llm.provider_status(), "default_provider": llm.default_provider(),
+            "cloud": cloud.summary()}
 
 
 @app.post("/api/upload", response_model=DatasetDetail, status_code=201)
@@ -137,7 +141,25 @@ def upload(file: UploadFile = File(...)):
 
     sheets = [(s.name, s.frame, profile_sheet(s.frame, s.labels, s.checks)) for s in parsed]
     dataset_id = database.save_dataset(filename, len(content), sheets)
+    try:
+        cloud.enqueue(dataset_id, filename, content)  # background copy to Supabase, when set up
+    except Exception as exc:  # noqa: BLE001 - the upload has succeeded; the copy must never turn it into an error
+        print(f"Supabase copy of upload {dataset_id} not queued ({type(exc).__name__}).")
     return _detail(_dataset_or_404(dataset_id))
+
+
+@app.get("/api/cloud", response_model=CloudSummary)
+def cloud_summary():
+    """Copies of uploaded documents in Supabase Storage: how many are sent, waiting or failed."""
+    return cloud.summary()
+
+
+@app.post("/api/cloud/retry")
+def cloud_retry():
+    """Send every failed copy again (e.g. after fixing the Supabase key in backend/.env and restarting)."""
+    if not cloud.configured():
+        raise HTTPException(status_code=409, detail="Supabase is not set up: add SUPABASE_URL and SUPABASE_SERVICE_KEY to backend/.env.")
+    return {"retried": cloud.retry_failed()}
 
 
 @app.get("/api/datasets", response_model=list[DatasetSummary])

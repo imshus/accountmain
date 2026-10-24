@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import urllib.parse
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,6 +32,38 @@ OPENAI_SERVICE_TIER = os.getenv("OPENAI_SERVICE_TIER", "").strip() or None
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5-5")
 ANTHROPIC_EFFORT = os.getenv("ANTHROPIC_EFFORT", "low")
 ANTHROPIC_REPAIR_EFFORT = os.getenv("ANTHROPIC_REPAIR_EFFORT", "medium")
+
+# Optional: also keep every uploaded document in a private Supabase Storage bucket (app/cloud.py).
+# Key: Supabase > Project Settings > API Keys > Secret keys (sb_secret_...); a legacy service_role key (eyJ...) also
+# works until Supabase retires legacy keys. It stays on this server.
+def _supabase_url(raw: str) -> str:
+    url = raw.strip().rstrip("/")
+    if url and "://" not in url:
+        url = "https://" + url
+    url = re.sub(r"/(rest|storage|auth)/v1(/.*)?$", "", url)  # the API URL pasted instead of the Project URL
+    parts = urllib.parse.urlsplit(url)
+    local = parts.hostname in ("localhost", "127.0.0.1", "::1")  # the Supabase CLI runs on http://127.0.0.1:54321
+    if url and parts.scheme != "https" and not local:
+        print("SUPABASE_URL must start with https:// (the key must not travel unencrypted); Supabase copies are off.")
+        return ""
+    return url
+
+
+def _supabase_key() -> str:
+    key = (os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    if any(c.isspace() or ord(c) < 32 for c in key):
+        print("The Supabase key contains spaces or line breaks (copy it again in one line); Supabase copies are off.")
+        return ""
+    if key.startswith("sb_publishable_"):
+        print("The Supabase key is a publishable key, which cannot write files; use a secret key. Supabase copies are off.")
+        return ""
+    return key
+
+
+SUPABASE_URL = _supabase_url(os.getenv("SUPABASE_URL", ""))
+SUPABASE_SERVICE_KEY = _supabase_key()
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "").strip() or "documents"
+SUPABASE_FOLDER = re.sub(r"/+", "/", re.sub(r"[^A-Za-z0-9_/.-]+", "_", os.getenv("SUPABASE_FOLDER", "uploads"))).strip("/")
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 ALLOWED_EXTENSIONS = {".xlsx", ".xlsm", ".xls", ".csv"}
