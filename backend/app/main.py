@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -13,7 +14,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from datetime import date
 
@@ -68,7 +69,35 @@ async def lifespan(_app: FastAPI):
     yield
 
 
+class _ErrorsAsJson:
+    """An unexpected error becomes a JSON 500 inside CORSMiddleware, so the app can read the reason. Starlette's own
+    500 page comes from the outermost layer without CORS headers, and the app would only see "cannot reach the backend"."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def tracked_send(message):
+            nonlocal started
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracked_send)
+        except Exception as exc:
+            logging.getLogger("uvicorn.error").exception("%s %s failed", scope.get("method"), scope.get("path"))
+            if started:  # part of the answer is already out (a streamed chat): nothing else can be sent
+                raise
+            reason = f"{type(exc).__name__}: {exc}"[:300]
+            await JSONResponse({"detail": f"The server hit an error: {reason}"}, status_code=500)(scope, receive, send)
+
+
 app = FastAPI(title="Accounts.ai API", version="0.1.0", lifespan=lifespan)
+app.add_middleware(_ErrorsAsJson)  # added first, so it runs inside CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
