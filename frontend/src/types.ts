@@ -269,7 +269,12 @@ export type Ledger = {
   name: string;
   group_name: string;
   opening_paise: number;
+  /** Balance to date; for income and expense ledgers only the latest financial year (from closing_from). */
   closing_paise: number;
+  /** Start of the year an income or expense ledger's closing covers; null for balance-sheet ledgers. */
+  closing_from?: string | null;
+  /** An income or expense ledger's movement in earlier years, carried to Capital as "Profit & Loss A/c" (+ = Dr). */
+  earlier_years_paise?: number;
   tax_kind: string | null;
   gstin: string | null;
   state_code: string | null;

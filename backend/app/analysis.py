@@ -104,8 +104,15 @@ def normalise(session: Session, spec: dict) -> dict:
         if f.kind == "date" and op not in ("blank", "not_blank"):
             # Dates are kept as the exact day used (YYYY-MM-DD), so the description and the spec show it.
             what = f'Filter on "{f.label}"'
-            entry["value"], entry["value2"] = (parse_date(entry[k], what).isoformat() if entry[k] else "" for k in ("value", "value2"))
-            entry["values"] = [parse_date(v, what).isoformat() for v in entry["values"]]
+            if op == "contains":
+                raise AnalysisError(f"{what}: 'contains' works on text columns; for dates use between, >= or <=.")
+            # Only the fields the operator uses: the tools always send value2 and values, often with filler.
+            if op == "in":
+                entry["values"] = [parse_date(v, what).isoformat() for v in entry["values"]]
+            else:
+                used = ("value", "value2") if op == "between" else ("value",)
+                for k in used:
+                    entry[k] = parse_date(entry[k], what).isoformat() if entry[k] else ""
         filters.append(entry)
     if len(filters) > MAX_FILTERS:
         raise AnalysisError(f"Use at most {MAX_FILTERS} filters.")
@@ -157,32 +164,54 @@ def _measure_sql(f: Field | None, agg: str, i: int) -> list[str]:
     }[agg]
 
 
-_YEAR_FIRST = re.compile(r"(\d{4})[-/.\s](\d{1,2})[-/.\s](\d{1,2})(?:[T\s].*)?")
-_DAY_FIRST = re.compile(r"(\d{1,2})[-/.\s](\d{1,2})[-/.\s](\d{4}|\d{2})(?:[T\s].*)?")
-_NAMED = re.compile(r"(?:[A-Za-z]+,?\s+)?(?:\d{1,2}(?:st|nd|rd|th)?[-/.,\s]*[A-Za-z]{3,}\.?|[A-Za-z]{3,}\.?\s*\d{1,2}(?:st|nd|rd|th)?)[-/.,\s]*\d{4}",
-                    re.IGNORECASE)
+# Only a time of day may follow the date. Any other text ("2025-04-01 to 2025-04-30", "01/04/2025 onwards")
+# is refused, so a range typed into one field cannot quietly become its first day.
+_TIME = r"(?:(?:T|\s+)\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:[AaPp]\.?[Mm]\.?|Z|[+-]\d{2}:?\d{2})?)?"
+_WEEKDAY = r"(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+)?"
+_YEAR_FIRST = re.compile(r"(\d{4})[-/.\s](\d{1,2})[-/.\s](\d{1,2})" + _TIME)
+_DAY_FIRST = re.compile(r"(\d{1,2})[-/.\s](\d{1,2})[-/.\s](\d{4}|\d{2})" + _TIME)
+_COMPACT = re.compile(r"(\d{4})(\d{2})(\d{2})")
+# "1 Apr 2025", "1-Apr-25" (the Tally / Excel default), "1st April, 2025"; month first only with a 4-digit year.
+_DAY_MONTH = re.compile(_WEEKDAY + r"(\d{1,2})(?:st|nd|rd|th)?[-/.\s]*([a-z]+)\.?[-/.,'\s]*(\d{4}|\d{2})" + _TIME, re.IGNORECASE)
+_MONTH_DAY = re.compile(_WEEKDAY + r"([a-z]+)\.?[-/.\s]*(\d{1,2})(?:st|nd|rd|th)?,?[-/.\s]*(\d{4})" + _TIME, re.IGNORECASE)
+_MONTHS = {name: i for i, names in enumerate(
+    [("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"), ("may",), ("jun", "june"),
+     ("jul", "july"), ("aug", "august"), ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"),
+     ("dec", "december")], start=1) for name in names}
+
+
+def _full_year(year: int) -> int:
+    """A two-digit year, read as pandas / dateutil read it: within 50 years of today (99 -> 1999, 25 -> 2025)."""
+    if year >= 100:
+        return year
+    this_year = date.today().year
+    year += this_year // 100 * 100
+    return year - 100 if year >= this_year + 50 else year
 
 
 def parse_date(text: str, what: str) -> date:
     """A filter date: YYYY-MM-DD (also with / or .) is year-first; DD/MM/YYYY (also - or .) is day-first, as in India.
     Never guesses the other order: 04/13/2025 is refused rather than read as 13 April, so a range cannot shift."""
     text = text.strip()
-    digits = _YEAR_FIRST.fullmatch(text) or _DAY_FIRST.fullmatch(text)
-    if digits:
-        a, b, c = (int(g) for g in digits.groups())
-        year, month, day = (a, b, c) if digits.re is _YEAR_FIRST else (c + 2000 if c < 100 else c, b, a)
-        try:
-            return date(year, month, day)
-        except ValueError:
-            order = "YYYY-MM-DD" if digits.re is _YEAR_FIRST else "DD/MM/YYYY"
-            raise AnalysisError(f'{what}: "{text}" is not a valid date as {order}.') from None
-    # Month names ("1 Apr 2025", "April 1, 2025") cannot be misread; a bare number like 20250401 is year-first.
-    # Anything vaguer ("April 2025", "1/4") is refused: pandas would quietly pick a day or the current year.
-    named = _NAMED.fullmatch(text)
-    parsed = pd.to_datetime(text, errors="coerce", dayfirst=bool(named)) if named or re.fullmatch(r"\d{8}", text) else None
-    if parsed is None or pd.isna(parsed):
-        raise AnalysisError(f'{what}: "{text}" is not a date (use YYYY-MM-DD or DD/MM/YYYY).')
-    return parsed.date()
+    order = "YYYY-MM-DD"
+    if m := _YEAR_FIRST.fullmatch(text) or _COMPACT.fullmatch(text):
+        year, month, day = (int(g) for g in m.groups())
+    elif m := _DAY_FIRST.fullmatch(text):
+        order = "DD/MM/YYYY"
+        day, month, year = (int(g) for g in m.groups())
+    elif (m := _DAY_MONTH.fullmatch(text)) and m.group(2).lower() in _MONTHS:
+        order = "a day, month and year"
+        day, month, year = int(m.group(1)), _MONTHS[m.group(2).lower()], int(m.group(3))
+    elif (m := _MONTH_DAY.fullmatch(text)) and m.group(1).lower() in _MONTHS:
+        order = "a month, day and year"
+        day, month, year = int(m.group(2)), _MONTHS[m.group(1).lower()], int(m.group(3))
+    else:
+        # Anything vaguer ("April 2025", "1/4", "2025-04") or with extra words is refused rather than guessed.
+        raise AnalysisError(f'{what}: "{text}" is not one date (use YYYY-MM-DD or DD/MM/YYYY; for a range use "between").')
+    try:
+        return date(_full_year(year), month, day)
+    except ValueError:
+        raise AnalysisError(f'{what}: "{text}" is not a valid date as {order}.') from None
 
 
 def _value(f: Field, text: str, what: str):

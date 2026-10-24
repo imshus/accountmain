@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../api";
 import type { Company, Ledger, Report } from "../../types";
 import ReportBody from "../ReportBody";
+import { isoDate } from "./shared";
 
 type Props = {
   company: Company;
@@ -39,12 +40,21 @@ const LABELS: Record<string, string> = {
   opening_stock: "Opening stock ₹ (blank = from books)",
   closing_stock: "Closing stock ₹",
 };
+// What blank dates mean, as the server applies them (reports.py _period / _fy_period).
+const ONE_YEAR = "Blank dates mean the financial year (April to March) of the latest voucher; a To date alone means from the start of that date's financial year.";
+const BLANK_DATES: Record<string, string> = {
+  trial_balance: ONE_YEAR,
+  profit_and_loss: ONE_YEAR,
+  gstr1: ONE_YEAR,
+  gstr3b: ONE_YEAR,
+  day_book: "Blank dates mean everything from the day the books begin.",
+  cash_bank_book: "Blank dates mean everything from the day the books begin.",
+  ledger: "Blank dates mean everything from the day the books begin; income and expense ledgers show the latest financial year.",
+};
 const BANK_GROUPS = new Set(["Bank Accounts", "Bank OD A/c"]);
 const CASH_BANK_GROUPS = new Set(["Cash-in-Hand", ...BANK_GROUPS]);
 
-function iso(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
+const iso = isoDate;
 
 /** Quick periods: GST returns are monthly, the final accounts yearly. */
 function periods(fyStart: string): [string, string, string][] {
@@ -69,17 +79,22 @@ export default function AccountsReports({ company, ledgers, refreshKey }: Props)
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const wanted = PARAMS[kind] ?? [];
+  // Only the latest request may show its answer: a slow ledger must not replace the trial balance picked after it.
+  const latest = useRef(0);
 
   const run = useCallback(async () => {
+    const id = ++latest.current;
     setLoading(true);
     setError(null);
     try {
-      setReport(await api.companyReport(company.id, kind, Object.fromEntries(wanted.map((p) => [p, params[p] ?? ""]))));
+      const next = await api.companyReport(company.id, kind, Object.fromEntries(wanted.map((p) => [p, params[p] ?? ""])));
+      if (id === latest.current) setReport(next);
     } catch (e) {
+      if (id !== latest.current) return;
       setReport(null);
       setError((e as Error).message);
     } finally {
-      setLoading(false);
+      if (id === latest.current) setLoading(false);
     }
   }, [company.id, kind, params, wanted]);
 
@@ -169,9 +184,7 @@ export default function AccountsReports({ company, ledgers, refreshKey }: Props)
           {loading ? "Working…" : "Show"}
         </button>
       </form>
-      {wanted.includes("start") && !params.start && !params.end ? (
-        <p className="muted small">Blank dates mean everything from the day the books begin.</p>
-      ) : null}
+      {wanted.includes("start") && !params.start && !params.end ? <p className="muted small">{BLANK_DATES[kind] ?? BLANK_DATES.day_book}</p> : null}
       {error ? <div className="callout warning">{error}</div> : null}
       {loading && !report ? <p className="muted small">Working…</p> : null}
       {report ? <ReportBody report={report} /> : null}

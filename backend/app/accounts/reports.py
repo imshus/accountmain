@@ -102,6 +102,7 @@ def balances(company: dict, start: date, end: date, extra_brought_forward: int =
     years is carried into one "Profit & Loss A/c" row (id PL_BROUGHT_FORWARD) under Capital Account, so
     the closing balances still add up to the opening-balance difference (nil when openings tally).
     ``extra_brought_forward`` (+ = Dr) is added to that row: the balance sheet passes earlier years' stock change.
+    Column ``earlier`` holds each P&L ledger's share of that row (0 for balance-sheet ledgers).
     """
     led = ledger_frame(company["id"])
     lines = entries(company["id"], end)
@@ -120,13 +121,15 @@ def balances(company: dict, start: date, end: date, extra_brought_forward: int =
     out["opening"] = np.where(is_pl, moved_this_year + pl_opening, led.opening_paise + moved_before).astype("int64")
     out["dr"] = inside.groupby("ledger_id").dr.sum().reindex(out.index).fillna(0).astype("int64")
     out["cr"] = inside.groupby("ledger_id").cr.sum().reindex(out.index).fillna(0).astype("int64")
-    earlier = (moved_before - moved_this_year)[is_pl].sum() + (0 if opening_this_year else led.opening_paise[is_pl].sum()) + extra_brought_forward
-    if int(earlier):
+    # Per P&L ledger, what it moved in earlier years: the part carried into the brought-forward row.
+    out["earlier"] = np.where(is_pl, moved_before - moved_this_year + (0 if opening_this_year else led.opening_paise), 0).astype("int64")
+    earlier = int(out.earlier.sum()) + extra_brought_forward
+    if earlier:
         carried = pd.DataFrame([{"name": "Profit & Loss A/c (brought forward)", "group_name": "Capital Account", "primary": "Capital Account",
                                  "nature": "liability", "statement": "bs", "tax_kind": None, "gstin": None, "state_code": None,
-                                 "opening": int(earlier), "dr": 0, "cr": 0}], index=pd.Index([PL_BROUGHT_FORWARD], name=out.index.name))
+                                 "opening": earlier, "dr": 0, "cr": 0, "earlier": 0}], index=pd.Index([PL_BROUGHT_FORWARD], name=out.index.name))
         out = pd.concat([out, carried])
-        for col in ("opening", "dr", "cr"):
+        for col in ("opening", "dr", "cr", "earlier"):
             out[col] = out[col].astype("int64")
     out["closing"] = out.opening + out.dr - out.cr
     return out

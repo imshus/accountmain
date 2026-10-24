@@ -97,7 +97,10 @@ class LedgerIn(BaseModel):
 @router.get("/companies/{company_id}/ledgers")
 def list_ledgers(company_id: int):
     company = _company(company_id)
-    bal = reports.balances(company, company["fy_start"], date(2100, 12, 31))
+    # Balance-sheet ledgers close with everything to date; income and expense ledgers with the latest financial
+    # year only (as the trial balance shows them), their earlier years being in Capital as "Profit & Loss A/c".
+    year_start = reports._fy_period(company, None, None)[0]
+    bal = reports.balances(company, year_start, date(2100, 12, 31))
     with engine.connect() as conn:
         openings = service.metal_opening_map(conn, company_id)
     closings = {name: metal.metal_closing(company, name) for name in metal.metals_in_use(company_id)}
@@ -105,7 +108,10 @@ def list_ledgers(company_id: int):
     for r in service.list_ledgers(company_id):
         metals = {name: {"opening_mg": openings.get((r["id"], name), 0), "closing_mg": int(closing.get(r["id"], 0))}
                   for name, closing in closings.items() if openings.get((r["id"], name)) or closing.get(r["id"])}
-        out.append(r | {"closing_paise": int(bal.closing.get(r["id"], 0)), "metal": metals})
+        pl = chart.statement(r["group_name"]) == "pl"
+        out.append(r | {"closing_paise": int(bal.closing.get(r["id"], 0)), "metal": metals,
+                        "closing_from": year_start.isoformat() if pl else None,
+                        "earlier_years_paise": int(bal.earlier.get(r["id"], 0))})
     return out
 
 

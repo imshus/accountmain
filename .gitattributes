@@ -1,0 +1,2 @@
+# Shell scripts keep Linux line endings; with Windows ones bash on the server fails with "\r: command not found".
+*.sh text eol=lf

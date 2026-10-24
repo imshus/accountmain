@@ -6,10 +6,12 @@ numbers in the conversation). A figure counts as verified when it equals one of 
 values as shown at the answer's precision. Thousand / lakh / million / crore scaling applies
 only when that unit is written after the number; a figure written with a minus sign or in
 brackets must match a negative value; a percentage may also be a fraction times 100. A figure
-may also be the sum or difference (for a percentage, the ratio) of two figures that are already
-confirmed or are overall totals. Anything else is reported as unverified.
+may also be the sum or difference of two figures that are already confirmed or are overall totals;
+a percentage may be the ratio of an amount stated beside it to such a figure. Anything else is
+reported as unverified.
 """
 
+import bisect
 import math
 import re
 
@@ -22,30 +24,31 @@ _SCALE = {
     "crore": 1e7, "crores": 1e7, "cr": 1e7, "cr.": 1e7,
     "billion": 1e9, "bn": 1e9,
 }
-# These abbreviations also mean karat (22K), litre or a credit balance (1,23,456.00 Cr), so the
-# number may stand at face value too.
-_AMBIGUOUS = {"k", "l", "cr", "cr."}
 _CURRENCY_MARK = "\x00"  # stands in for ₹ / Rs / INR, so "(₹1,234)" is not mistaken for a negative "(1,234)"
 _UNIT = r"(?:(?i:thousand|lakhs?|lacs?|lakh|million|mn|crores?|cr\.?|billion|bn)|[kK]|L)"
 # Numbers as people write them: -1,23,456.78  1,234,567  12.5%  35.37 lakh  2.5Cr  500/-.
-# Digits glued to letters, hyphens or slashes (GSTR-3B, 26AS, 194C, S/0071, INV-2025-001) are identifiers.
+# Digits glued to letters, hyphens or slashes (GSTR-3B, 26AS, 194C, S/0071) are identifiers; the second
+# number of a range such as 1,000-2,000 is still read.
 _NUMBER = re.compile(
-    r"(?<![\w.,/−-])(?P<sign>[-−]\x00?)?"
+    r"(?:(?<![\w.,/−–-])|(?<=\d[-–]))(?P<sign>[-−–]\x00?)?"
     r"(?P<number>\d{1,2}(?:,\d{2})*,\d{3}(?:\.\d+)?|\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
     r"(?!\d|\.\d|,\d)"
     rf"(?:\s?(?P<percent>%)|\s?(?P<unit>{_UNIT})(?!\w)|(?!\w|/(?!-)))"
 )
+# Codes such as INV-2025-0016, GSTR-3B, S/0071 or FY24-25, removed whole so no part of them reads as an amount.
+_IDENTIFIER = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:[-/][A-Za-z0-9]+)+")
 _MONTH = (
     r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
     r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?(?![a-z])"
 )
+# A date never starts inside a number: in "12,345.67 Jan 2025" the 67 is paise, not a day.
 _DATES = re.compile(
-    r"\b\d{4}-\d{1,2}(?:-\d{1,2})?\b"  # 2025-04-01, 2025-04
-    r"|\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b"  # 01/04/2025
-    rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH}(?:,?\s+\d{{4}}\b|['’]\d{{2}}\b)?"  # 1 April 2025
+    r"(?<![\d.,])\b\d{4}[-–]\d{1,2}(?:-\d{1,2})?\b"  # 2025-04-01, 2025-04, 2024-25
+    r"|(?<![\d.,])\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b"  # 01/04/2025
+    rf"|(?<![\d.,])\b\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH}(?:,?\s+\d{{4}}\b|['’]\d{{2}}\b)?"  # 1 April 2025
     rf"|\b{_MONTH}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,\s*\d{{4}})?\b(?![.,]?\d)"  # April 1, 2025
     rf"|\b{_MONTH}['’,]?\s*\d{{2,4}}\b(?![.,]?\d)"  # May 2025, Apr'25
-    r"|\bFY\s?\d{2,4}(?:-\d{2,4})?\b"
+    r"|\bFY\s?\d{2,4}(?:[-–]\d{2,4})?\b"
     r"|\bQ[1-4]\b",
     re.IGNORECASE,
 )
@@ -57,18 +60,48 @@ _REFERENCES = re.compile(
     r"|annexures?|notifications?|circulars?)\s+"
     r"|\bu/s\.?\s*"
     r"|\b(?:invoice|inv|bill|voucher|challan|sr|s|serial|ref|entry|order|receipt)\.?\s*(?:no\.?|number|#)\s*[-#:]?\s*)"
-    rf"{_REF}(?:\s*(?:,|&|and|or|to)\s*{_REF})*(?!\s?%)",
+    rf"{_REF}(?:\s*(?:,|&|and|or|to|-|–)\s*{_REF})*(?!\s?%)",
     re.IGNORECASE,
 )
-_CURRENCY = re.compile(r"₹\s*|\b(?:Rs|INR)\b\.?\s*(?=[-−]?\d)", re.IGNORECASE)
+_CURRENCY = re.compile(r"₹\s*|\b(?:Rs|INR)\b\.?\s*(?=[-−–]?\d)", re.IGNORECASE)
 _LIST_MARKER = re.compile(r"^\s*\d+[.)]\s", re.MULTILINE)
 _TOTAL_ROWS = 25  # a tool result this short holds totals, not a listing, so its values may be combined
 
 
+def _face_too(unit: str, face: float, grouped: bool, currency: bool, decimals: int) -> bool:
+    """Whether a number with this unit may also be meant at face value. "22K gold" is karat, "1,23,456.00 Cr"
+    a credit balance and "1,200 L" litres; but "₹18k", "₹2.5 Cr" or "14L" can only be thousand, crore or lakh."""
+    if unit == "k":
+        return not currency and not decimals and face <= 24
+    if unit == "l":
+        return not currency and (grouped or face >= 1000)
+    if unit in ("cr", "cr."):
+        return grouped or face >= 1000
+    return False
+
+
+def _line_blocks(text: str) -> tuple[list[int], list[int]]:
+    """Start offset and paragraph of every line. A table row is a paragraph of its own;
+    other lines run together until a blank line or a table."""
+    starts, paragraphs = [], []
+    paragraph, offset, last_table = 0, 0, False
+    for line in text.split("\n"):
+        stripped = line.strip()
+        table = stripped.startswith("|")
+        if not stripped or table or last_table:
+            paragraph += 1
+        starts.append(offset)
+        paragraphs.append(paragraph)
+        offset += len(line) + 1
+        last_table = table
+    return starts, paragraphs
+
+
 def _figures(text: str) -> list[dict]:
-    """Every number worth checking, with its sign, unit scale and the precision it is written at."""
+    """Every number worth checking, with its sign, unit scale, the precision it is written at and where it stands."""
     cleaned = _CURRENCY.sub(_CURRENCY_MARK, text)
-    cleaned = _LIST_MARKER.sub(" ", _REFERENCES.sub(" ", _DATES.sub(" ", cleaned)))
+    cleaned = _LIST_MARKER.sub(" ", _IDENTIFIER.sub(" ", _REFERENCES.sub(" ", _DATES.sub(" ", cleaned))))
+    starts, paragraphs = _line_blocks(cleaned)
     out = []
     for match in _NUMBER.finditer(cleaned):
         number = match.group("number")
@@ -76,21 +109,30 @@ def _figures(text: str) -> list[dict]:
         decimals = len(number.split(".")[1]) if "." in number else 0
         percent = bool(match.group("percent"))
         unit = (match.group("unit") or "").lower()
-        # (1,234.00) in accounts is a negative amount; "(about 11.93 lakh)", "(45.99%)" or "(39 entries)" is an aside.
+        before, after = cleaned[:match.start()].rstrip(), cleaned[match.end():].lstrip()
+        sign = (match.group("sign") or "").replace(_CURRENCY_MARK, "")
+        currency = _CURRENCY_MARK in match.group(0) or before.endswith(_CURRENCY_MARK)
+        if not sign and match.start() and cleaned[match.start() - 1] in "-–" and not (decimals or "," in number):
+            continue  # "7-10 days", "pages 10-12": only a range of amounts is worth checking
+        # (1,234.00) in accounts is a negative amount, and so is a whole table cell "| (₹1,234.00) |";
+        # "(about 11.93 lakh)", "(₹35.37 lakh)", "(45.99%)" or "(39 entries)" is an aside.
+        opened = before.endswith("(") or (
+            before.endswith("(" + _CURRENCY_MARK) and before[:-2].rstrip().endswith("|") and after[1:].lstrip().startswith("|"))
         bracketed = (
-            not unit and not percent and not match.group("sign") and (decimals or "," in number)
-            and cleaned[:match.start()].rstrip().endswith("(") and cleaned[match.end():].lstrip().startswith(")")
+            not unit and not percent and not sign and bool(decimals or "," in number)
+            and opened and after.startswith(")")
         )
-        negative = bool(match.group("sign")) or bracketed
+        negative = bool(sign) or bracketed
         if not percent and not unit and decimals == 0 and "," not in number:
             # Small counts ("top 5") and bare years are too ambiguous to check.
             if face < 10 or 1900 <= face <= 2100:
                 continue
-        sign = -1.0 if negative else 1.0
+        scale = -1.0 if negative else 1.0
         half_unit = 0.5 * 10 ** (-decimals)
-        readings = [(sign * face * _SCALE[unit], half_unit * _SCALE[unit])] if unit else []
-        if not unit or unit in _AMBIGUOUS:
-            readings.append((sign * face, half_unit))
+        readings = [(scale * face * _SCALE[unit], half_unit * _SCALE[unit])] if unit else []
+        if not unit or _face_too(unit, face, "," in number, currency, decimals):
+            readings.append((scale * face, half_unit))
+        line = bisect.bisect_right(starts, match.start()) - 1
         token = match.group(0).replace(_CURRENCY_MARK, "").strip()
         out.append({
             "token": f"({token})" if bracketed else token,
@@ -99,6 +141,8 @@ def _figures(text: str) -> list[dict]:
             "decimals": decimals,
             "percent": percent,
             "signed": negative,
+            "line": line,
+            "paragraph": paragraphs[line],
         })
     return out
 
@@ -266,20 +310,26 @@ def _sums(figures: list[dict], operands: np.ndarray) -> np.ndarray:
     return found
 
 
-def _ratios(figures: list[dict], stated: np.ndarray, operands: np.ndarray) -> np.ndarray:
-    """For each percentage, whether it is a / b x 100 where a or b is a figure the answer itself states."""
+def _ratios(figures: list[dict], local: list[tuple], operands: np.ndarray, amounts: dict[tuple, list[float]]) -> np.ndarray:
+    """For each percentage, whether it is a / b x 100 where a or b is an amount the answer states next to it
+    (``local`` names the line, or the paragraph when the line has none). A share "| Kaveri | 10,61,507.97 |
+    30.01% |" must use its own row's amount; any two of the answer's figures would fit too many percentages."""
     found = np.zeros(len(figures), dtype=bool)
-    if not figures or not len(stated) or not len(operands):
+    if not len(operands):
         return found
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratios = np.concatenate([(stated[:, None] / operands[None, :]).ravel(),
-                                 (operands[:, None] / stated[None, :]).ravel()]) * 100
-        same = np.concatenate([(stated[:, None] == operands[None, :]).ravel(),
-                               (operands[:, None] == stated[None, :]).ravel()])
-    ratios = np.sort(ratios[~same & np.isfinite(ratios)])
-    owner, targets, tolerances = _cases(figures)
-    low, high = _within(ratios, targets, tolerances)
-    np.logical_or.at(found, owner, high > low)
+    groups: dict[tuple, list[int]] = {}
+    for index, key in enumerate(local):
+        if key is not None:
+            groups.setdefault(key, []).append(index)
+    for key, members in groups.items():
+        near = _sorted(amounts[key])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            # a / a is allowed: a total row's 100% is its own amount over itself.
+            ratios = np.concatenate([(near[:, None] / operands[None, :]).ravel(), (operands[:, None] / near[None, :]).ravel()]) * 100
+        ratios = np.sort(ratios[np.isfinite(ratios)])
+        owner, targets, tolerances = _cases([figures[i] for i in members])
+        low, high = _within(ratios, targets, tolerances)
+        np.logical_or.at(found, np.array(members)[owner], high > low)
     return found
 
 
@@ -303,11 +353,17 @@ def verify(answer: str, known: list[float]) -> dict:
         amounts = [v for f, v in zip(figures, direct) if v is not None and not f["percent"]]
         percents = _sorted([v for f, v in zip(figures, direct) if v is not None and f["percent"]])
         operands = _sorted(list(totals) + amounts)
-        stated = _sorted(amounts)
         open_amounts = [f for f, v in zip(figures, direct) if v is None and not f["percent"] and _precise(f)]
         open_percents = [f for f, v in zip(figures, direct) if v is None and f["percent"]]
+        near: dict[tuple, list[float]] = {}
+        for f, v in zip(figures, direct):
+            if v is not None and not f["percent"]:
+                near.setdefault(("line", f["line"]), []).append(v)
+                near.setdefault(("paragraph", f["paragraph"]), []).append(v)
+        local = [next((k for k in (("line", f["line"]), ("paragraph", f["paragraph"])) if k in near), None) for f in open_percents]
         derived = {id(f) for f, ok in zip(open_amounts, _sums(open_amounts, operands)) if ok}
-        derived |= {id(f) for f, ok in zip(open_percents, _sums(open_percents, percents) | _ratios(open_percents, stated, operands)) if ok}
+        ratios = _ratios(open_percents, local, operands, near)
+        derived |= {id(f) for f, ok in zip(open_percents, _sums(open_percents, percents) | ratios) if ok}
         unverified = [f["token"] for f, v in zip(figures, direct) if v is None and id(f) not in derived]
     unique = list(dict.fromkeys(unverified))
     if not figures:

@@ -97,14 +97,37 @@ function unreachable(): string {
   return base ? `Cannot reach the backend at ${base}. Is it running, and is this device on the same network?` : "Cannot reach the backend. Is it running on port 8000?";
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// Without a limit, a phone whose saved server is off (or out of Wi-Fi range) waits minutes for the OS to give up.
+const TIMEOUT_MS = 20_000;
+/** For requests that can rightly take longer (a whole register imported, a non-streamed AI answer). */
+const NO_TIMEOUT = 0;
+
+function timedOut(init: RequestInit | undefined, ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  const method = (init?.method ?? "GET").toUpperCase();
+  return method === "GET"
+    ? `The server did not answer within ${seconds} seconds. Check that the backend is running and this device can reach it, then try again.`
+    : `The server did not answer within ${seconds} seconds, so this change may or may not have been saved. Check (for an entry, look in the Entries list) before trying again.`;
+}
+
+async function request<T>(path: string, init?: RequestInit, timeoutMs: number = TIMEOUT_MS): Promise<T> {
+  const signal = init?.signal ?? (timeoutMs && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(timeoutMs) : undefined);
+  const expired = () => Boolean(timeoutMs && !init?.signal && signal?.aborted);
   let response: Response;
   try {
-    response = await fetch(serverUrl() + path, init);
+    response = await fetch(serverUrl() + path, { ...init, signal });
   } catch {
-    throw new ApiError(0, unreachable());
+    throw new ApiError(0, expired() ? timedOut(init, timeoutMs) : unreachable());
   }
-  const body = response.status === 204 ? null : await response.json().catch(() => null);
+  let body: unknown = null;
+  if (response.status !== 204) {
+    try {
+      body = await response.json();
+    } catch {
+      // The time can also run out while the answer is still arriving: never hand back an empty answer then.
+      if (expired()) throw new ApiError(0, timedOut(init, timeoutMs));
+    }
+  }
   if (!response.ok) throw new ApiError(response.status, errorMessage(response.status, body));
   return body as T;
 }
@@ -150,12 +173,16 @@ async function streamChat(path: string, payload: object, onEvent: (event: ChatEv
   throw new ApiError(0, "The answer stopped before it finished. Try again.");
 }
 
-function postJson<T>(path: string, payload: unknown): Promise<T> {
-  return request<T>(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+function postJson<T>(path: string, payload: unknown, timeoutMs: number = TIMEOUT_MS): Promise<T> {
+  return request<T>(
+    path,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+    timeoutMs,
+  );
 }
 
 function putJson<T>(path: string, payload: unknown): Promise<T> {
@@ -175,7 +202,7 @@ export const api = {
   chatStream: (id: number, messages: ChatMessage[], provider: ProviderId, onEvent: (event: ChatEvent) => void, options?: StreamOptions) =>
     streamChat(`/api/datasets/${id}/chat/stream`, { messages, provider }, onEvent, options),
   chat: (id: number, messages: ChatMessage[], provider: ProviderId) =>
-    postJson<ChatResult>(`/api/datasets/${id}/chat`, { messages, provider }),
+    postJson<ChatResult>(`/api/datasets/${id}/chat`, { messages, provider }, NO_TIMEOUT),
   calc: (expression: string) => postJson<{ expression: string; result: string }>("/api/calc", { expression }),
   columnCalc: (
     id: number,
@@ -229,7 +256,7 @@ export const api = {
   bookChatStream: (id: number, messages: ChatMessage[], provider: ProviderId, onEvent: (event: ChatEvent) => void, options?: StreamOptions) =>
     streamChat(`/api/books/${id}/chat/stream`, { messages, provider }, onEvent, options),
   bookChat: (id: number, messages: ChatMessage[], provider: ProviderId) =>
-    postJson<ChatResult>(`/api/books/${id}/chat`, { messages, provider }),
+    postJson<ChatResult>(`/api/books/${id}/chat`, { messages, provider }, NO_TIMEOUT),
   bookSql: (id: number, sql: string) => postJson<QueryResult>(`/api/books/${id}/sql`, { sql }),
   /** Open the backend's connection to the AI while the question is being typed (free, no tokens). */
   warmAi: () => request<null>("/api/ai/warm", { method: "POST" }).catch(() => null),
@@ -272,11 +299,11 @@ export const api = {
   cancelVoucher: (id: number, voucherId: number) => request<null>(`/api/companies/${id}/vouchers/${voucherId}`, { method: "DELETE" }),
   pendingBills: (id: number, partyId: number) =>
     request<{ bill_ref: string; pending: number; bill_date: string | null }[]>(`/api/companies/${id}/bills/${partyId}`),
-  importBook: (id: number, bookId: number) => postJson<ImportResult>(`/api/companies/${id}/import/book`, { book_id: bookId }),
+  importBook: (id: number, bookId: number) => postJson<ImportResult>(`/api/companies/${id}/import/book`, { book_id: bookId }, NO_TIMEOUT),
   importRegister: (id: number, datasetId: number, table: string, register: "sales" | "purchases") =>
-    postJson<ImportResult>(`/api/companies/${id}/import/register`, { dataset_id: datasetId, table_name: table, register_type: register }),
+    postJson<ImportResult>(`/api/companies/${id}/import/register`, { dataset_id: datasetId, table_name: table, register_type: register }, NO_TIMEOUT),
   importBank: (id: number, datasetId: number, table: string, bankLedgerId: number) =>
-    postJson<ImportResult>(`/api/companies/${id}/import/bank`, { dataset_id: datasetId, table_name: table, bank_ledger_id: bankLedgerId }),
+    postJson<ImportResult>(`/api/companies/${id}/import/bank`, { dataset_id: datasetId, table_name: table, bank_ledger_id: bankLedgerId }, NO_TIMEOUT),
   companyReport: (id: number, kind: string, params: Record<string, string>) =>
     request<Report>(`/api/companies/${id}/reports/${kind}?${new URLSearchParams(Object.entries(params).filter(([, v]) => v !== ""))}`),
   audit: (id: number) =>

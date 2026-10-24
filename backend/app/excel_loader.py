@@ -15,6 +15,7 @@ import functools
 import io
 import math
 import re
+import zipfile
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from html.parser import HTMLParser
@@ -69,11 +70,14 @@ _MONEY_NAME = re.compile(
 )
 # Debit/credit style columns: a "Dr"/"Cr" in their number format is a label, not a sign.
 _DRCR_COLUMN = re.compile(r"(^|_)(debit|debits|credit|credits|dr|cr|withdrawal|withdrawals|deposit|deposits)(_|$)")
+# ...but "Balance Dr/Cr" or "Closing Dr Cr" is a signed balance column.
+_SIGNED_COLUMN = re.compile(r"(^|_)(balance|bal|closing|opening|net)(_|$)|(^|_)dr_cr(_|$)|(^|_)cr_dr(_|$)")
 _MAX_ROWS_LISTED = 8
 
 _CURRENCY = re.compile(r"(?i)(₹|rs\.?|inr|usd|eur|gbp|\$|€|£)")
 _DR_CR = re.compile(r"(?i)^(?P<amount>.*\d\)?)\s*(?P<marker>dr|cr)\.?$")
 _DR_CR_PREFIX = re.compile(r"(?i)^(?P<marker>dr|cr)\.?\s*(?P<amount>[\d(].*)$")
+_PLAIN_NUMBER = re.compile(r"-?[0-9]+(?:\.[0-9]+)?")
 _DATE_LIKE = re.compile(
     r"^(\d{1,4}[-/.\s][A-Za-z0-9]{1,9}[-/.\s]\d{1,4}|[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{2,4})(\s+\d{1,2}:\d{2}(:\d{2})?)?$"
 )
@@ -86,6 +90,12 @@ _ID_TOKENS = {
     "pan", "utr", "cheque", "chq", "ref", "reference", "ifsc", "id",
 }  # fmt: skip
 _MEASURE_TOKENS = {"rate", "qty", "quantity", "amount", "amt", "value", "price", "per", "date", "dt", "dated", "total"}
+# Quantities, weights and rates: a stray "8.5O" or "02" there is a typing slip, not a sign the column holds codes.
+_QUANTITY_TOKENS = _MEASURE_TOKENS | {
+    "wt", "weight", "wgt", "gross", "net", "fine", "tunch", "touch", "purity", "pcs", "pc", "pieces", "carat",
+    "carats", "ct", "cts", "gm", "gms", "gram", "grams", "kg", "kgs", "mg", "ltr", "mtr", "percent", "pct",
+    "wastage", "making", "labour", "hours", "days",
+}  # fmt: skip
 _LEADING_ZERO = re.compile(r"^0\d+$")
 _LONG_DIGITS = re.compile(r"^\+?\d{16,}$")
 _MIXED_CODE = re.compile(r"^(?=[^\s]*\d)(?=[^\s]*[A-Za-z])[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)*$")
@@ -234,7 +244,8 @@ def _read_xlsx(content: bytes) -> tuple[dict[str, pd.DataFrame], dict[str, dict]
     from openpyxl import load_workbook
 
     values_wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
-    formulas_wb = load_workbook(io.BytesIO(content), data_only=False, read_only=True)
+    formulas_wb = None  # a second full read, done only for sheets that hold formulas
+    archive = zipfile.ZipFile(io.BytesIO(content))
     raw_sheets, marks, checks = {}, {}, {}
     for ws in values_wb.worksheets:
         # The <dimension> tag written by some exporters is wrong; trusting it silently drops rows and columns.
@@ -256,15 +267,18 @@ def _read_xlsx(content: bytes) -> tuple[dict[str, pd.DataFrame], dict[str, dict]
         if ws.sheet_state != "visible":
             sheet_checks.append({"level": "info", "message": "This sheet is hidden in Excel; it was imported anyway."})
         missing = 0
-        formulas_ws = formulas_wb[ws.title]
-        if hasattr(formulas_ws, "reset_dimensions"):
-            formulas_ws.reset_dimensions()
-        for r, formula_row in enumerate(formulas_ws.iter_rows(values_only=True)):
-            for c, formula in enumerate(formula_row):
-                if isinstance(formula, str) and formula.startswith("=") and (
-                    r >= len(rows) or c >= len(rows[r]) or rows[r][c] is None
-                ):
-                    missing += 1
+        if _has_formulas(archive, getattr(ws, "_worksheet_path", None)):
+            if formulas_wb is None:
+                formulas_wb = load_workbook(io.BytesIO(content), data_only=False, read_only=True)
+            formulas_ws = formulas_wb[ws.title]
+            if hasattr(formulas_ws, "reset_dimensions"):
+                formulas_ws.reset_dimensions()
+            for r, formula_row in enumerate(formulas_ws.iter_rows(values_only=True)):
+                for c, formula in enumerate(formula_row):
+                    if isinstance(formula, str) and formula.startswith("=") and (
+                        r >= len(rows) or c >= len(rows[r]) or rows[r][c] is None
+                    ):
+                        missing += 1
         if missing:
             sheet_checks.append({
                 "level": "warning",
@@ -277,8 +291,28 @@ def _read_xlsx(content: bytes) -> tuple[dict[str, pd.DataFrame], dict[str, dict]
         marks[ws.title] = sheet_marks
         checks[ws.title] = sheet_checks
     values_wb.close()
-    formulas_wb.close()
+    if formulas_wb is not None:
+        formulas_wb.close()
+    archive.close()
     return raw_sheets, marks, checks
+
+
+# A formula cell's <f> element, with or without a namespace prefix.
+_FORMULA_TAG = re.compile(rb"<(?:[A-Za-z_][\w.-]*:)?f[\s/>]")
+
+
+def _has_formulas(archive: zipfile.ZipFile, path) -> bool:
+    """Whether a worksheet's XML holds any formula; True when that cannot be checked."""
+    try:
+        with archive.open(path) as part:
+            tail = b""
+            while chunk := part.read(1 << 20):
+                if _FORMULA_TAG.search(tail + chunk):
+                    return True
+                tail = chunk[-64:]
+    except (KeyError, OSError, TypeError, ValueError, zipfile.BadZipFile):
+        return True
+    return False
 
 
 def _read_xls(content: bytes, filename: str) -> tuple[dict[str, pd.DataFrame], dict[str, dict], dict[str, list[dict]]]:
@@ -296,7 +330,8 @@ def _read_xls(content: bytes, filename: str) -> tuple[dict[str, pd.DataFrame], d
                 "level": "info", "message": "This .xls file is really an .xlsx workbook; it was read as one.",
             })
         return raw_sheets, marks, checks
-    if head.startswith(b"\xd0\xcf\x11\xe0") or head[:1] == b"\x09":
+    # OLE2 (Excel 97-2003) or the BOF record of an Excel 2.x-4.x file; a text file can also start with a tab.
+    if head.startswith(b"\xd0\xcf\x11\xe0") or head[:2] in (b"\x09\x00", b"\x09\x02", b"\x09\x04"):
         return _read_biff(content)
 
     text = _decode_text(content)
@@ -528,9 +563,11 @@ def _parse_sheet(name: str, raw: pd.DataFrame, marks: dict | None = None) -> Par
 
     # Sheet row numbers (1-based) of the data rows, for pointing the user at problem cells.
     sheet_rows = [int(i) + 1 for i in body.index]
-    section = None
-    if summary.reference is not None and summary.section_start is not None:
-        section = (body.index > summary.section_start) & (body.index < summary.reference)
+    section = above = None
+    if summary.reference is not None:
+        above = body.index < summary.reference  # entries a mid-sheet last total can cover
+        if summary.section_start is not None:
+            section = (body.index > summary.section_start) & above
     body = body.reset_index(drop=True)
 
     columns: dict[str, pd.Series] = {}
@@ -554,7 +591,7 @@ def _parse_sheet(name: str, raw: pd.DataFrame, marks: dict | None = None) -> Par
     frame = pd.DataFrame(columns)
 
     reference = total_rows.loc[summary.reference] if summary.reference is not None else None
-    checks += _reconcile_totals(frame, reference, labels, section)
+    checks += _reconcile_totals(frame, reference, labels, section, above)
 
     duplicated = frame.duplicated(keep="first").to_numpy()
     if duplicated.any():
@@ -597,9 +634,10 @@ def _apply_format_marks(body: pd.DataFrame, marks: dict, source_columns: list, n
         if not drcr:
             continue
         sides = sorted({mark for _, mark in drcr})
-        if _DRCR_COLUMN.search(col) or len(sides) == 1:
+        side_column = bool(_DRCR_COLUMN.search(col)) and not _SIGNED_COLUMN.search(col)
+        if side_column or len(sides) == 1:
             reason = ("in a debit, credit, withdrawal or deposit column that is a label, not a sign"
-                      if _DRCR_COLUMN.search(col) else f'every amount shows "{sides[0]}", which labels the column')
+                      if side_column else f'every amount shows "{sides[0]}", which labels the column')
             checks.append({
                 "level": "info",
                 "message": f'"{labels[col]}": the Excel number format shows {" / ".join(sides)} after the amounts; '
@@ -685,6 +723,10 @@ def _find_summary_rows(body: pd.DataFrame, names: list[str], caches: dict[str, d
         has_number |= is_number
         bad |= present if (_identifier_name(col) or _DATE_NAME.search(col)) else (present & ~is_number)
     candidate = (kind == 0) & ~bad & has_number
+    # A numbers-only row stands out as a total only where entries normally carry a name, date or reference;
+    # in a sheet of plain figures (Qty / Rate / Amount, weights) a row that happens to equal others' sum is an entry.
+    if candidate.sum() * 2 > int((kind == 0).sum()):
+        candidate[:] = False
     events = np.flatnonzero((kind > 0) | candidate)
     if events.size == 0:
         return _Summary(dropped, [])
@@ -785,7 +827,8 @@ def _find_summary_rows(body: pd.DataFrame, names: list[str], caches: dict[str, d
     return _Summary(dropped, checks, reference, section_start)
 
 
-def _reconcile_totals(frame: pd.DataFrame, grand: pd.Series | None, labels: dict[str, str], section=None) -> list[dict]:
+def _reconcile_totals(frame: pd.DataFrame, grand: pd.Series | None, labels: dict[str, str], section=None,
+                      above=None) -> list[dict]:
     """Compare the file's own (last) Total row with what the rows add up to."""
     if grand is None:
         return []
@@ -810,6 +853,18 @@ def _reconcile_totals(frame: pd.DataFrame, grand: pd.Series | None, labels: dict
                 "message": f'"{labels[col]}" adds up to {_fmt(computed)}, matching the file\'s Total row.',
             })
             continue
+        if above is not None and 0 < int(above.sum()) < len(frame):
+            part = values[above]
+            covered = math.fsum(part[~np.isnan(part)])
+            if abs(covered - stated) < 0.005:
+                after = len(frame) - int(above.sum())
+                checks.append({
+                    "level": "ok",
+                    "message": f'"{labels[col]}": the file\'s last total row ({_fmt(stated)}) matches the rows above it; '
+                    f"the {after} row{'s' if after > 1 else ''} after it {'are' if after > 1 else 'is'} not under any "
+                    "total row.",
+                })
+                continue
         if section is not None and 0 < int(section.sum()) < len(frame):
             part = values[section]
             subtotal = math.fsum(part[~np.isnan(part)])
@@ -927,6 +982,9 @@ def to_number(value) -> float:
         return number if math.isfinite(number) else math.nan
     if not isinstance(value, str):
         return math.nan
+    if _PLAIN_NUMBER.fullmatch(value):  # most CSV cells ("1250.50"); the full parse below gives the same number
+        number = float(value)
+        return number if math.isfinite(number) else math.nan
 
     text = _CURRENCY.sub("", value).replace(",", "").replace(" ", "").replace("−", "-").strip()
     if text.endswith("/-"):  # "Rs 1000/-"
@@ -1036,6 +1094,20 @@ _DATE_FORMATS = [
 ]
 _MONTH_FIRST_FORMATS = ["%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"]
 _AMBIGUOUS_DAY_MONTH = re.compile(r"^(\d{1,2})[/.-](\d{1,2})[/.-]\d{2,4}")
+# strptime is slow (~25 µs a call, failures included), so each format gets a quick pattern that
+# every string it accepts must match (a looser version of strptime's own); only matches are parsed.
+_DIRECTIVE_SHAPES = {"d": r"\s?\d{1,2}", "m": r"\s?\d{1,2}", "H": r"\s?\d{1,2}", "M": r"\s?\d{1,2}",
+                     "S": r"\s?\d{1,2}", "Y": r"\d{4}", "y": r"\d{2}", "b": r".*?", "B": r".*?"}
+
+
+def _format_shape(fmt: str) -> str:
+    parts = re.split(r"(%.)", fmt)
+    return "".join(_DIRECTIVE_SHAPES[p[1]] if p.startswith("%") else r"\s+".join(map(re.escape, re.split(r"\s+", p)))
+                   for p in parts)
+
+
+_FORMAT_SHAPES = {fmt: re.compile(_format_shape(fmt), re.IGNORECASE) for fmt in _DATE_FORMATS + _MONTH_FIRST_FORMATS}
+_ANY_DATE_SHAPE = re.compile("|".join(f"(?:{p.pattern})" for p in _FORMAT_SHAPES.values()), re.IGNORECASE)
 
 
 def _strptime(text: str, fmt: str):
@@ -1045,29 +1117,40 @@ def _strptime(text: str, fmt: str):
         return None
 
 
+def _may_be_date(value) -> bool:
+    """False when no date format can read the cell (a quick test; True does not mean it is a date)."""
+    if isinstance(value, (datetime, date)):
+        return True
+    return isinstance(value, str) and bool(_ANY_DATE_SHAPE.fullmatch(value.strip().replace("Sept", "Sep")))
+
+
 def _parse_dates(uniques) -> tuple[dict, list[tuple[str, str]]]:
     """Map each distinct cell to a Timestamp (or NaT) using the format that fits the column best."""
     texts = [v.strip() for v in uniques if isinstance(v, str) and v.strip()]
+    # Readings by strptime of each text in each format whose shape it has; any other format fails.
+    readings: dict[str, dict[str, object]] = {}
+    for text in texts:
+        if text not in readings:
+            shaped = text.replace("Sept", "Sep")
+            readings[text] = {fmt: _strptime(text, fmt)
+                              for fmt, shape in _FORMAT_SHAPES.items() if shape.fullmatch(shaped)}
     best_fmt, best_hits = None, 0
     if texts:
         for fmt in _DATE_FORMATS + _MONTH_FIRST_FORMATS:
-            hits = sum(_strptime(t, fmt) is not None for t in texts)
+            hits = sum(readings[t].get(fmt) is not None for t in texts)
             if hits > best_hits:  # strictly greater: earlier (day-first) formats win ties
                 best_fmt, best_hits = fmt, hits
     fallbacks = [f for f in _DATE_FORMATS if f != best_fmt]
     if best_fmt in _MONTH_FIRST_FORMATS:
         fallbacks = [f for f in _MONTH_FIRST_FORMATS if f != best_fmt] + fallbacks
+    order = ([best_fmt] if best_fmt else []) + fallbacks
     mapping = {}
     for value in uniques:
         if isinstance(value, (datetime, date)):
             mapping[value] = pd.Timestamp(value)
         elif isinstance(value, str) and value.strip():
-            text = value.strip()
-            parsed = _strptime(text, best_fmt) if best_fmt else None
-            for fmt in fallbacks:
-                if parsed is not None:
-                    break
-                parsed = _strptime(text, fmt)
+            found = readings[value.strip()]
+            parsed = next((found[fmt] for fmt in order if found.get(fmt) is not None), None)
             mapping[value] = parsed if parsed is not None else pd.NaT
         else:
             mapping[value] = pd.NaT
@@ -1171,7 +1254,8 @@ def _infer_column(series: pd.Series, name: str, numbers: dict | None = None) -> 
     parsed = values.map(numbers)
     numeric_share = parsed.notna().mean()
     if numeric_share >= (_NUMERIC_SHARE_MONEY_NAME if money_name else _NUMERIC_SHARE):
-        code = None if (money_name or _DATE_NAME.search(name)) else _code_value(uniques, numbers)
+        measure = money_name or _DATE_NAME.search(name) or _QUANTITY_TOKENS.intersection(name.split("_"))
+        code = None if measure else _code_value(uniques, numbers)
         if code is not None:
             example, reason = code
             position = next(i for i, v in enumerate(series) if v is example or (isinstance(v, type(example)) and v == example))
@@ -1200,9 +1284,13 @@ def _infer_column(series: pd.Series, name: str, numbers: dict | None = None) -> 
             return _Inferred(result.astype("Int64"), "number", failed, notes)
         return _Inferred(result, "number", failed, notes)
 
-    stamps, date_notes = _parse_dates(uniques)
-    parsed = values.map(stamps)
-    if parsed.notna().mean() >= _DATE_SHARE:
+    # Names, narrations and other text: when too few cells could even be dates, skip the full date parse.
+    if values.map({v: _may_be_date(v) for v in uniques}).mean() >= _DATE_SHARE:
+        stamps, date_notes = _parse_dates(uniques)
+        parsed = values.map(stamps)
+    else:
+        parsed = None
+    if parsed is not None and parsed.notna().mean() >= _DATE_SHARE:
         failed = _failed_positions(values, parsed, series)
         row_notes = []
         swapped = _swapped_day_month(uniques, stamps)

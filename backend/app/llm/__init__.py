@@ -64,13 +64,13 @@ _ANSWERS_MAX = 200
 _ANSWERS_LOCK = threading.Lock()
 
 
-def _answer_key(provider: Provider, messages: list[dict], sheets: list[dict], extra: dict | None, documents) -> tuple:
+def _answer_key(provider: Provider, messages: list[dict], sheets: list[dict], extra: dict | None,
+                documents: str | None, combined: bool) -> tuple:
     extra_keys = tuple(sorted((name, str(frame.attrs.get("cache_key"))) for name, (frame, *_rest) in (extra or {}).items()))
     # A chat about shared files (told what each file is) must not reuse an answer given without that context.
-    # A lazy documents text is derived from the same sheets, which the key already covers.
-    context = documents if isinstance(documents, str) or documents is None else "documents"
-    return (provider.id, provider.model, provider.effort(), tuple(sheet_key(s) for s in sheets), extra_keys, context,
-            json.dumps(messages, ensure_ascii=False))
+    # The comparison text is derived from the registers in ``extra``, which the key already covers.
+    return (provider.id, provider.model, provider.effort(), tuple(sheet_key(s) for s in sheets), extra_keys, documents,
+            combined, json.dumps(messages, ensure_ascii=False))
 
 
 def default_provider() -> str:
@@ -89,11 +89,12 @@ def provider_status() -> list[dict]:
 
 
 def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extra: dict | None = None, emit=None,
-         fresh: bool = False, documents: str | Callable[[], str] | None = None,
+         fresh: bool = False, documents: str | None = None, combined: Callable[[], str] | None = None,
          cancel: threading.Event | None = None) -> dict:
     """Answer the conversation. ``emit`` receives live progress: steps, answer text as it is written,
-    and "reset" when a draft is replaced (a correction round). ``documents`` may be a function, called only
-    when the answer is not remembered. Once ``cancel`` is set the answer stops with Cancelled and is not kept."""
+    and "reset" when a draft is replaced (a correction round). ``combined`` returns the registers comparison
+    added to ``documents``; it is called only when the answer is not remembered (it can take seconds).
+    Once ``cancel`` is set the answer stops with Cancelled and is not kept."""
     send = emit or (lambda _event: None)
 
     def emit(event: dict) -> None:
@@ -106,7 +107,7 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         raise LLMError(
             503, f"{provider.label} is not set up. Add {provider.key_name} to backend/.env and restart the backend."
         )
-    key = _answer_key(provider, messages, sheets, extra, documents)
+    key = _answer_key(provider, messages, sheets, extra, documents, combined is not None)
     with _ANSWERS_LOCK:
         remembered = copy.deepcopy(_ANSWERS[key]) if key in _ANSWERS and not fresh else None
         if remembered:
@@ -127,8 +128,8 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         return dataclasses.replace(reply, text=answer, complete=reply.complete and not is_fallback(answer))
 
     try:
-        if callable(documents):
-            documents = documents()
+        if combined is not None:
+            documents = f"{documents}\n\n{combined()}" if documents else combined()
         # Data ready by the time the model asks for it; started after the documents so it does not slow them down.
         threading.Thread(target=tools.prepare, daemon=True).start()
         emit({"type": "step", "text": "Reading the question…"})
@@ -169,6 +170,8 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         "provider": provider.id,
         "cached": False,
     }
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()  # stopped as it finished: nobody saw this answer, so it is not kept either
     if check["status"] != "unverified" and reply.complete:
         with _ANSWERS_LOCK:
             _ANSWERS[key] = copy.deepcopy(result)

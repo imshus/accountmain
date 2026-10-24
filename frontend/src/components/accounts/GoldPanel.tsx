@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../api";
 import type { Company, Metal, Report } from "../../types";
 import ReportBody from "../ReportBody";
@@ -24,17 +24,26 @@ export default function GoldPanel({ company, metals, refreshKey }: Props) {
   const [rate, setRate] = useState("");
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  // Only the latest request may show its answer, so party A's slower account never appears under party B.
+  const latest = useRef(0);
 
   const run = useCallback(async (nextView: View, nextLedger: string) => {
+    const id = ++latest.current;
     setError(null);
+    setLoading(true);
     try {
       const params: Record<string, string> = { metal };
       if (nextView === "metal_ledger") params.ledger_id = nextLedger;
       if (nextView === "metal_balances") params.rate = rate;
-      setReport(await api.companyReport(company.id, nextView, params));
+      const next = await api.companyReport(company.id, nextView, params);
+      if (id === latest.current) setReport(next);
     } catch (e) {
+      if (id !== latest.current) return;
       setReport(null);
       setError((e as Error).message);
+    } finally {
+      if (id === latest.current) setLoading(false);
     }
   }, [company.id, metal, rate]);
 
@@ -91,6 +100,7 @@ export default function GoldPanel({ company, metals, refreshKey }: Props) {
         </div>
       ) : null}
       {error ? <div className="callout warning">{error}</div> : null}
+      {report && loading ? <p className="muted small" role="status">Working…</p> : null}
       {report ? <ReportBody report={report} /> : !error ? <p className="muted small">Working…</p> : null}
     </section>
   );

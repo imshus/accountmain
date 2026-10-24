@@ -19,7 +19,7 @@ from .accounts import api as accounts_api
 from .accounts import db as _accounts_tables  # noqa: F401  (registers the books tables before create_all)
 from .analytics import profile_sheet
 from .calc import CalcError, evaluate_number, format_decimal
-from .duck import Session, sheet_key
+from .duck import Session, cached, sheet_key
 from .excel_loader import UploadError, read_workbook
 from .llm.common import describe_tables, warm_tables
 from .schemas import (
@@ -288,6 +288,13 @@ def save_setup(dataset_id: int, table_name: str, body: SetupRequest):
     return _setup(_sheet_or_404(dataset_id, table_name))
 
 
+def _report_frame(sheet: dict):
+    """The sheet's table for a report, loaded once per version of the sheet: every edit rewrites the profile, so
+    sheet_key changes and an older frame is never used. Each report gets a shallow copy (copy-on-write), so
+    nothing it does can change the remembered frame."""
+    return cached(("frame", sheet_key(sheet)), lambda: editing.load_frame(sheet)).copy(deep=False)
+
+
 @app.get("/api/datasets/{dataset_id}/sheets/{table_name}/reports/{kind}", response_model=Report)
 def get_report(
     dataset_id: int,
@@ -305,7 +312,7 @@ def get_report(
         raise HTTPException(status_code=404, detail="Unknown report.")
     try:
         return reports.build(
-            kind, editing.load_frame(sheet), sheet["profile"], account=account, start=start, end=end, as_of=as_of,
+            kind, _report_frame(sheet), sheet["profile"], account=account, start=start, end=end, as_of=as_of,
             opening_stock=opening_stock, closing_stock=closing_stock,
         )
     except reports.ReportError as exc:
@@ -316,11 +323,11 @@ def get_report(
 def gst_net(dataset_id: int, sales: str, purchases: str | None = None):
     """Net GST payable: output tax of the sales register minus input credit of the purchase register."""
     sales_sheet = _sheet_or_404(dataset_id, sales)
-    output = reports.gst_heads(editing.load_frame(sales_sheet), sales_sheet["profile"])
+    output = reports.gst_heads(_report_frame(sales_sheet), sales_sheet["profile"])
     credit = {}
     if purchases:
         purchase_sheet = _sheet_or_404(dataset_id, purchases)
-        credit = reports.gst_heads(editing.load_frame(purchase_sheet), purchase_sheet["profile"])
+        credit = reports.gst_heads(_report_frame(purchase_sheet), purchase_sheet["profile"])
     if not output:
         raise HTTPException(status_code=422, detail="The sales sheet has no CGST/SGST/IGST/Cess columns mapped.")
     result = reports.gst_net_payable(output, credit)
@@ -443,8 +450,8 @@ def _registers_note(found: list[dict], registers: list[dict]) -> str:
 
 
 # Stacking and comparing two big registers takes seconds, so it starts as soon as /api/documents finds the
-# pair, and a chat waits for that same job instead of starting another. The steps run one after the other:
-# side by side they only compete for the interpreter and each finishes later.
+# pair, and a chat waits for that same job instead of starting another. The pandas-heavy steps run one after
+# the other: side by side they only compete for the interpreter and each finishes later.
 _JOBS: OrderedDict[tuple, Future] = OrderedDict()
 _JOBS_LOCK = threading.Lock()
 _JOB_POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="prefetch")
@@ -470,16 +477,16 @@ def _register_jobs(registers: list[dict]) -> tuple[Future, Future]:
 
 
 def _prefetch(sheets: list[dict], registers: list[dict]) -> None:
-    """Get everything the first question needs ready while the person types it: the registers comparison, then
-    the data dictionary, then the DuckDB tables (a chat that starts meanwhile waits for these instead of
-    repeating them)."""
+    """Get everything the first question needs ready while the person types it: the registers comparison and,
+    alongside it, the data dictionary, then the DuckDB tables (a chat that starts meanwhile waits for these
+    instead of repeating them)."""
     jobs = _register_jobs(registers) if registers else None
 
     def warm():
+        describe_tables(sheets)  # mostly SQLite queries, which overlap well with the comparison
         stacked = jobs[0].result() if jobs else None
         if jobs:
             jobs[1].result()
-        describe_tables(sheets)
         warm_tables(sheets, {"registers": stacked} if stacked else None)
 
     _job(("warm", tuple(sheet_key(s) + (s["register"],) for s in sheets)), warm)
@@ -527,9 +534,8 @@ def files_chat_stream(body: FilesChatRequest):
         stacked = wait(table)
         extra = {"registers": stacked} if stacked else {}
         # The app's exact comparison of the two registers, read only when the answer is not remembered.
-        text = (lambda: f"{documents_text}\n\n{wait(comparison)}") if stacked else documents_text
-        return llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh, documents=text,
-                        cancel=cancel)
+        return llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh, documents=documents_text,
+                        combined=(lambda: wait(comparison)) if stacked else None, cancel=cancel)
 
     return _stream_chat(answer)
 
@@ -579,16 +585,33 @@ def list_books():
 
 @app.post("/api/books", response_model=BookDetail, status_code=201)
 def create_book(body: CreateBookRequest):
-    registers: list[tuple[str, str]] = []
+    registers: dict[str, str] = {}  # table name -> register; a sheet is linked once even if its upload is listed twice
     for ids, register in ((body.sales, "sales"), (body.purchases, "purchases"), (body.mixed, None)):
         for dataset_id in ids:
             dataset = _dataset_or_404(dataset_id)
             for sheet in dataset["sheets"]:
                 guessed = register or books.guess_register(sheet["sheet_name"], dataset["filename"]) or "unused"
-                registers.append((sheet["table_name"], guessed))
-    if not any(r == "sales" for _, r in registers) or not any(r == "purchases" for _, r in registers):
-        raise HTTPException(status_code=422, detail="Choose at least one sales file and one purchases file.")
-    return _book_detail(_book_or_404(database.create_book(body.name.strip(), registers)))
+                registers.setdefault(sheet["table_name"], guessed)
+    for table_name, register in body.registers.items():
+        if table_name not in registers:
+            _sheet_by_table_or_422(table_name)
+        registers[table_name] = register
+    if "sales" not in registers.values() or "purchases" not in registers.values():
+        raise HTTPException(status_code=422, detail=(
+            "A set needs at least one sales register and one purchase register. Choose a sales file and a purchases "
+            "file, or mark which sheet is sales and which is purchases."))
+    return _book_detail(_book_or_404(database.create_book(body.name.strip(), list(registers.items()))))
+
+
+def _sheet_by_table_or_422(table_name: str) -> dict:
+    """A sheet named in a request by its table name alone (table names are ds<upload id>_<sheet>)."""
+    head, _, _rest = table_name.partition("_")
+    dataset = database.get_dataset(int(head[2:])) if head.startswith("ds") and head[2:].isdigit() else None
+    sheet = next((s for s in (dataset or {}).get("sheets", []) if s["table_name"] == table_name), None)
+    if sheet is None:
+        raise HTTPException(status_code=422, detail=f'Sheet "{table_name}" was not found. Its upload may have been '
+                                                    "deleted; upload the file again and choose its sheets.")
+    return sheet
 
 
 @app.get("/api/books/{book_id}", response_model=BookDetail)

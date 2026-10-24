@@ -289,7 +289,8 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
     billed value and metal lines for every item's fine weight. Each item's net and fine weight are
     re-computed and any difference from the register is reported (the register's figure is posted)."""
     from ..books import _normalise  # rupee columns: taxable value, GST, invoice value, party, GSTIN
-    from .imports import (_imported_sources, already_in_books, document_number, duplicates_note, existing_documents,
+    from .imports import (_imported_sources, already_in_books, check_reported_state, document_number, duplicates_note,
+                          existing_documents, gstin_warnings, ledger_facts, note_bad_gstin, number_clash, party_state,
                           place_of_supply, posting_lines, split_unsplit_gst)
 
     cols = detect_jewellery(sheet)
@@ -308,11 +309,11 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
                   "so only fine metal was posted and no rupees. Bill the rupees by a rate cut or a separate invoice."])
     has_rupees = bool(any(money[c].abs().sum() for c in ("taxable", "invoice_value")))
     money = money.set_index("rowid")
-    states = place_of_supply(sheet)
+    states, problems = place_of_supply(sheet, register == "sales")
     raw = load_frame(sheet).set_index("_rowid")
     company = service.get_company(company_id)
     default_vtype = "Sales" if register == "sales" else "Purchase"
-    created, skipped, problems, duplicates, moved = 0, 0, [], [], {"gold": 0, "silver": 0}
+    created, skipped, duplicates, bad_gstins, moved = 0, 0, [], {}, {"gold": 0, "silver": 0}
     checked = {"net": 0, "fine": 0, "total": 0}
 
     # Invoices: consecutive rows sharing date, voucher number, party and type.
@@ -330,7 +331,7 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
 
     with engine.begin() as conn:
         done = _imported_sources(conn, company_id, f"import:{sheet['table_name']}:")
-        in_books = existing_documents(conn, company, f"import:{sheet['table_name']}:")
+        in_books = existing_documents(conn, company_id, f"import:{sheet['table_name']}:")
         for (day, number, party, doc), rowids in groups:
             source = f"import:{sheet['table_name']}:{rowids[0]}"
             label = f"rows {rowids[0]}–{rowids[-1]}" if len(rowids) > 1 else f"row {rowids[0]}"
@@ -349,9 +350,18 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
                 problems.append(f"{label}: type {doc!r} not understood; posted as {default_vtype}.")
             sales_side = vtype in ("Sales", "Credit Note")
             first = money.loc[rowids[0]]
+            numbered = not str(number).startswith("row")
+            on_day = pd.Timestamp(day).date()
+            # By GSTIN first, so a renamed or differently spelt party does not get a new, empty ledger.
+            if numbered and already_in_books(in_books, vtype, str(number), on_day, None, [first.gstin]):
+                skipped += 1
+                duplicates.append(label)
+                continue
             party_id = service.ensure_ledger(conn, company_id, party, "Sundry Debtors" if sales_side else "Sundry Creditors",
                                              gstin=first.gstin or None)
-            if not str(number).startswith("row") and already_in_books(in_books, company, vtype, str(number), pd.Timestamp(day).date(), party_id):
+            is_party, saved_gstin = ledger_facts(conn, party_id)
+            value = abs(sum(int(money.loc[rowid].invoice_value) for rowid in rowids))
+            if numbered and already_in_books(in_books, vtype, str(number), on_day, party_id, [saved_gstin], is_party, value):
                 skipped += 1
                 duplicates.append(label)
                 continue
@@ -359,11 +369,14 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
                                          "Sales Accounts" if sales_side else "Purchase Accounts")
             out = vtype in SALE_LIKE
             returning = vtype in ("Credit Note", "Debit Note")
+            place = next((states[int(rowid)] for rowid in rowids if int(rowid) in states), None)
+            state, reported, used = party_state(conn, company, party_id, first.gstin, place, label, problems)
 
             metal: list[MetalLine] = []
             other_side: dict[tuple[int, str], int] = {}
             total = taxable = 0
             heads = {"cgst": 0, "sgst": 0, "igst": 0, "cess": 0}
+            signs: dict[str, set[int]] = {"weights": set(), "rupees": set()}  # each the same way on every line of a return
             for rowid in rowids:
                 r, m = raw.loc[rowid], money.loc[rowid]
                 where = f"row {rowid}"
@@ -378,6 +391,10 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
                     problems.append(f"{where}: {exc} Not posted.")
                     continue
                 if returning:  # a return may be entered with minus signs; its weights are still weights
+                    figures = {"weights": [gross, dia, stn, net, *fines.values()],
+                               "rupees": [int(m.invoice_value), int(m.taxable), *(int(getattr(m, h)) for h in ("cgst", "sgst", "igst", "cess", "gst_unsplit"))]}
+                    for kind, values in figures.items():
+                        signs[kind].update(1 if x > 0 else -1 for x in values if x)
                     gross, dia, stn, net = abs(gross), abs(dia), abs(stn), abs(net)
                     fines = {name: abs(fine) for name, fine in fines.items()}
                 if gross and net:
@@ -420,14 +437,22 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
                 taxable += int(m.taxable)
                 for h in heads:
                     heads[h] += int(getattr(m, h))
-                split_unsplit_gst(company, m.gstin, heads, int(m.gst_unsplit), states.get(int(rowid)))
+                split_unsplit_gst(company, m.gstin, heads, int(m.gst_unsplit), state)
             for (ledger_id, name), fine in other_side.items():
                 metal.append(MetalLine(ledger_id, name, dr=fine if out else 0, cr=0 if out else fine))
             if not metal and not total:
                 problems.append(f"{label}: no weight or value, not posted.")
                 continue
+            mixed = [kind for kind, found in signs.items() if len(found) > 1]
+            if mixed:
+                # Turning only the minus lines round would return all the metal but net the rupees against each other.
+                problems.append(f"{label}: this {'sales' if vtype == 'Credit Note' else 'purchase'} return has some {' and '.join(mixed)} "
+                                "with minus signs and some without. Enter every line of a return the same way (all with minus "
+                                "signs or all without) and import again. Not posted.")
+                continue
             if returning and (total < 0 or taxable < 0):  # a return entered with minus signs
                 total, taxable, heads = -total, -taxable, {h: -amount for h, amount in heads.items()}
+            check_reported_state(company, vtype, party, heads, state, reported, label, problems)
             if total < 0 or taxable < 0:
                 problems.append(f"{label}: negative value on a {vtype}. Give a return the type SR (sales return) or "
                                 "PR (purchase return) in the Type column, or correct the figures. Not posted.")
@@ -440,21 +465,25 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
                                          narration=f"Imported from {sheet['sheet_name']} ({len(rowids)} item{'s' if len(rowids) != 1 else ''})",
                                          source=source, conn=conn, metal=metal)
                 created += 1
+                note_bad_gstin(bad_gstins, first.gstin, label, used)
                 for line in metal:
                     if line.details:
                         moved[line.metal] += line.dr + line.cr
             except AccountsError as exc:
-                problems.append(f"{label}: {exc}")
+                problems.append(number_clash(conn, in_books, vtype, num, on_day, label, str(exc)) or f"{label}: {exc}")
 
     already = duplicates_note(duplicates, register == "purchases")
+    problems += gstin_warnings(bad_gstins)
     if not created:
+        every = groups and skipped == len(groups)  # not when some invoice was refused: that one is not in the books
         return {"created": 0, "skipped": skipped, "problems": problems,
-                "notes": (["Every invoice in this sheet is already in the books; nothing new was posted."] if skipped else []) + already}
+                "notes": (["Every invoice in this sheet is already in the books; nothing new was posted."] if every else []) + already}
     summary = [f"Read as a jewellery register: one voucher per invoice, metal posted by fine weight "
                f"({', '.join(f'{_g(mg)} fine {name}' for name, mg in moved.items() if mg) or 'no metal'})."]
     summary.append(f"Checked every row: net = gross − (diamond + stone ct) × 0.2 on {checked['net']} rows, "
                    f"fine = net × tunch ÷ 100 on {checked['fine']}, value = metal + diamonds + stones + labour on {checked['total']}.")
-    if has_rupees and not any(money[h].sum() for h in ("cgst", "sgst", "igst", "gst_unsplit")):
+    # abs(): returns entered with minus signs would otherwise cancel the sales' GST in the sum.
+    if has_rupees and not any(money[h].abs().sum() for h in ("cgst", "sgst", "igst", "gst_unsplit")):
         summary.append("The register has no GST amounts, so the invoices were posted without tax. If GST applies (3% on jewellery), "
                        "it is not in the books yet.")
     return {"created": created, "skipped": skipped, "problems": problems, "notes": already + summary + notes}

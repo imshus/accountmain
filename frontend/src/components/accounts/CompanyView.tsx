@@ -96,7 +96,7 @@ export default function CompanyView({ company, books, datasets, onCompanyChange 
       ) : null}
       {tab === "reports" ? <AccountsReports company={company} ledgers={ledgers} refreshKey={version} /> : null}
       {tab === "gold" ? <GoldPanel company={company} metals={metals.length ? metals : ["gold"]} refreshKey={version} /> : null}
-      {tab === "ledgers" ? <LedgersPanel company={company} ledgers={ledgers} groups={meta?.groups ?? []} onChanged={changed} /> : null}
+      {tab === "ledgers" ? <LedgersPanel company={company} ledgers={ledgers} groups={meta?.groups ?? []} onChanged={changed} onCompanyChange={onCompanyChange} /> : null}
       {tab === "import" ? <AccountsImport company={company} books={books} datasets={datasets} ledgers={ledgers} onImported={changed} /> : null}
       {tab === "audit" ? <AuditPanel company={company} refreshKey={version} /> : null}
       {tab === "settings" ? <Settings company={company} onCompanyChange={onCompanyChange} /> : null}

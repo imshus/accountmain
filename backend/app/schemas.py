@@ -134,6 +134,9 @@ class CreateBookRequest(BaseModel):
     sales: list[int] = []  # upload ids whose sheets are sales registers
     purchases: list[int] = []  # upload ids whose sheets are purchase registers
     mixed: list[int] = []  # uploads holding both; each sheet is classified from its name
+    # Table name -> register, for sheets whose names do not say (one workbook with Sheet1 / Sheet2). It wins over
+    # the lists above; an upload reached only through it adds just the sheets named here.
+    registers: dict[str, RegisterName] = {}
 
 
 class BookRegistersRequest(BaseModel):

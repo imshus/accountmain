@@ -411,10 +411,13 @@ class Toolbox:
 
     @contextmanager
     def _connection(self):
-        """The session, for one tool call at a time. Once the chat has closed, the last user closes it."""
+        """The session, for one tool call at a time; a query still running when the answer is stopped is
+        interrupted. Once the chat has closed, the last user closes it."""
         try:
             with self._lock:
-                yield self.session()
+                session = self.session()
+                with closing_on_cancel(self.cancel, session.conn.interrupt):
+                    yield session
         finally:
             self._close_if_finished()
 
@@ -433,7 +436,7 @@ class Toolbox:
         try:
             with self._connection():
                 pass
-        except Exception:  # noqa: BLE001 - the first real tool call reports any problem
+        except (Exception, Cancelled):  # noqa: BLE001 - the first real tool call reports any problem
             pass
 
     def close(self) -> None:

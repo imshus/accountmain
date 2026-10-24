@@ -6,6 +6,7 @@ in whole paise so every total, difference and running balance is exact. Every re
 carries checks that prove its totals add up.
 """
 
+import math
 import re
 from datetime import date
 
@@ -16,7 +17,7 @@ from . import reports
 from .duck import cached, sheet_key
 from .editing import load_frame
 from .formatting import indian
-from .reports import AGEING_BUCKETS, ROLES, _col, _fmt, _paise, _report, _rupees
+from .reports import AGEING_BUCKETS, ROLES, _col, _fmt, _half_up, _paise, _paise_of, _report, _rupees, _sub_paisa
 
 REGISTERS = {"sales": "Sales", "purchases": "Purchases"}
 HEADS = ("cgst", "sgst", "igst", "cess")
@@ -31,11 +32,25 @@ class BookError(ValueError):
     """The books report cannot be produced. The message is shown to the user."""
 
 
-def _normalise(sheet: dict) -> tuple[pd.DataFrame, list[dict], dict[str, tuple[str, pd.Series]]]:
-    """(standard frame, notes, other number columns) for one register sheet."""
+def _text(values: pd.Series, blank: str) -> np.ndarray:
+    """Each entry's text, stripped, with `blank` for empty cells; each distinct value is stripped once."""
+    codes, uniques = pd.factorize(values.astype("string"))
+    lookup = np.append(np.asarray(pd.Series(uniques, dtype="string").str.strip(), dtype=object), blank)
+    return lookup[codes]  # code -1 (an empty cell) picks the appended blank
+
+
+def _raw_total(values: pd.Series) -> str:
+    """A money column's plain sum, with as many decimals as it needs (up to 4): 92,984.265."""
+    total = math.fsum(pd.to_numeric(values, errors="coerce").dropna().tolist())
+    decimals = next((d for d in (2, 3) if abs(round(total, d) - total) < 1e-7), 4)
+    return indian(total, decimals)
+
+
+def _normalise(sheet: dict, frame: pd.DataFrame | None = None) -> tuple[pd.DataFrame, list[dict], dict[str, tuple[str, pd.Series]]]:
+    """(standard frame, notes, other number columns) for one register sheet; `frame` is its loaded table, if at hand."""
     profile = sheet["profile"]
     mapping = reports.effective_mapping(profile)
-    frame = load_frame(sheet)
+    frame = load_frame(sheet) if frame is None else frame
     name = f'{REGISTERS[sheet["register"]]} · {sheet["sheet_name"]}'
     notes: list[dict] = []
     out = pd.DataFrame({"register": sheet["register"], "source": sheet["sheet_name"], "rowid": frame["_rowid"].to_numpy()})
@@ -45,8 +60,7 @@ def _normalise(sheet: dict) -> tuple[pd.DataFrame, list[dict], dict[str, tuple[s
         notes.append({"level": "warning", "message": f"{name}: no date column chosen, so monthly figures and ageing leave it out."})
     for role, column in (("party", "account"), ("invoice_no", "voucher_no"), ("gstin", "gstin"), ("item", "item")):
         if column in mapping:
-            values = frame[mapping[column]].astype("string").str.strip()
-            out[role] = values.fillna("(blank)" if role in ("party", "item") else "").to_numpy()
+            out[role] = _text(frame[mapping[column]], "(blank)" if role in ("party", "item") else "")
         else:
             out[role] = "(not given)" if role in ("party", "item") else ""
     if "account" not in mapping:
@@ -74,7 +88,19 @@ def _normalise(sheet: dict) -> tuple[pd.DataFrame, list[dict], dict[str, tuple[s
     if "outstanding" in mapping:
         out["pending"] = _paise(frame[mapping["outstanding"]])
 
-    labels = {c["name"]: c["label"] for c in profile["columns"]}
+    labels ={c["name"]: c["label"] for c in profile["columns"]}
+    money = [mapping[r] for r in (*HEADS, "taxable", "outstanding") if r in mapping] + ([value_col] if value_col else [])
+    money += [mapping["tax"]] if "tax" in mapping and not split else []
+    fractions = {col: mask for col in dict.fromkeys(money) if (mask := _sub_paisa(frame[col])).any()}
+    if fractions:
+        # Say both totals, so a sum of the raw cells (e.g. from analyse on the sheet) can be matched to these figures.
+        rows = int(np.logical_or.reduce(list(fractions.values())).sum())
+        totals = "; ".join(f'"{labels.get(col, col)}" adds up to {_fmt(int(_paise(frame[col]).sum()))} '
+                           f"({_raw_total(frame[col])} as entered)" for col in fractions)
+        notes.append({"level": "info", "message": (
+            f"{name}: {rows} {'entry has an amount' if rows == 1 else 'entries have amounts'} in fractions of a paisa. Each amount "
+            f"is rounded to the paisa (half a paisa up, as Excel's ROUND does) before adding: {totals}.")})
+
     used = {mapping[r] for r in mapping if r in _MONEY_ROLES}
     identifiers = {c["name"] for c in profile["columns"] if c.get("role") == "identifier"}
     others = {
@@ -93,11 +119,15 @@ class Books:
         self.book = book
         frames, self.notes = [], []
         self.sheets = {"sales": [], "purchases": []}
+        self.loaded: list[tuple[dict, pd.DataFrame]] = []  # (sheet, its table): read once, reused by the GST checks
+        self._gst_checks: list[dict] | None = None
         parts: dict[str, list[tuple[str, int, dict]]] = {"sales": [], "purchases": []}  # (sheet name, rows, other columns)
         for sheet in book["sheets"]:
             if sheet["register"] not in REGISTERS:
                 continue
-            frame, notes, others = _normalise(sheet)
+            table = load_frame(sheet)
+            self.loaded.append((sheet, table))
+            frame, notes, others = _normalise(sheet, table)
             frames.append(frame)
             self.notes += notes
             self.sheets[sheet["register"]].append(sheet)
@@ -136,18 +166,24 @@ class Books:
         return stacked
 
     def gst_checks(self) -> list[dict]:
+        """Each register sheet's GST data checks (as on its GST summary), worked out once."""
+        if self._gst_checks is not None:
+            return self._gst_checks
         checks = []
-        for register, sheets in self.sheets.items():
-            for sheet in sheets:
+        for register in REGISTERS:
+            for sheet, table in self.loaded:
+                if sheet["register"] != register:
+                    continue
                 mapping = reports.effective_mapping(sheet["profile"])
                 if not any(r in mapping for r in ("cgst", "sgst", "igst", "tax")):
                     continue
                 try:
-                    summary = reports.gst_summary(load_frame(sheet), mapping)
+                    found = reports.gst_checks(table, mapping)
                 except reports.ReportError:
                     continue
-                for check in summary["checks"]:
+                for check in found:
                     checks.append({**check, "message": f'{REGISTERS[register]} · {sheet["sheet_name"]}: {check["message"]}'})
+        self._gst_checks = checks
         return checks
 
 
@@ -164,7 +200,8 @@ def _pct(part: int, whole: int) -> float | None:
 
 
 def _months(frame: pd.DataFrame) -> pd.Series:
-    return pd.to_datetime(frame["date"]).dt.to_period("M")
+    """First day of each entry's month (a timestamp, not a Period: grouping Periods boxes every row)."""
+    return pd.to_datetime(frame["date"]).dt.to_period("M").dt.to_timestamp()
 
 
 # --- Reports ---------------------------------------------------------------------------------
@@ -239,12 +276,12 @@ def compare(books: Books) -> dict:
     if items:
         tables.append(items)
 
-    parties_both = sorted(set(s.party) & set(p.party) - {"(blank)", "(not given)"})
+    parties_both = sorted(set(s.party.unique()) & set(p.party.unique()) - {"(blank)", "(not given)"})
     if parties_both:
         rows = []
+        sold_by, bought_by = s.groupby("party")["invoice_value"].sum(), p.groupby("party")["invoice_value"].sum()
         for party in parties_both:
-            sold = int(s.loc[s.party == party, "invoice_value"].sum())
-            bought = int(p.loc[p.party == party, "invoice_value"].sum())
+            sold, bought = int(sold_by[party]), int(bought_by[party])
             rows.append({"party": party, "sold": _rupees(sold), "bought": _rupees(bought), "net": _rupees(sold - bought)})
         tables.append({
             "title": "Parties who are both customer and supplier",
@@ -418,8 +455,8 @@ def _stock(books: Books, measure: str | None) -> tuple[pd.DataFrame | None, str 
     table["closing_q"] = table.bought_q - table.sold_q
     with np.errstate(divide="ignore", invalid="ignore"):
         table["avg_cost"] = np.where(table.bought_q > 0, table.bought_v / table.bought_q, 0)  # paise per unit
-    table["closing_v"] = np.where(table.closing_q > 0, np.round(table.closing_q * table.avg_cost), 0).astype("int64")
-    table["cogs"] = np.round(np.minimum(table.sold_q, table.bought_q).clip(lower=0) * table.avg_cost).astype("int64")
+    table["closing_v"] = np.where(table.closing_q > 0, _half_up(table.closing_q * table.avg_cost), 0).astype("int64")
+    table["cogs"] = _half_up(np.minimum(table.sold_q, table.bought_q).clip(lower=0) * table.avg_cost)
     return table.sort_values("closing_v", ascending=False), measure, measures
 
 
@@ -485,7 +522,7 @@ def profit_and_loss(books: Books, opening_stock: float, closing_stock: float | N
             computed_note = (f"Closing stock {_fmt(int(table.closing_v.sum()))} is from the Stock summary (weighted-average cost by "
                              f"{books.others['sales'][measure][0]}). Enter a figure above to override it.")
             gaps = _stock_gaps(books, table, measure)
-    open_p, close_p = int(round(opening_stock * 100)), int(round(closing_stock * 100))
+    open_p, close_p = _paise_of(opening_stock), _paise_of(closing_stock)
     gross = sales + close_p - open_p - purchases
     rows = [
         {"item": "Sales (taxable value, excluding GST)", "amount": _rupees(sales), "_kind": "group"},

@@ -11,6 +11,7 @@ mapping: detected automatically from the column names and editable by the user.
 
 import re
 from datetime import date
+from decimal import ROUND_HALF_UP, Decimal
 
 import numpy as np
 import pandas as pd
@@ -76,12 +77,13 @@ _ROLE_PATTERNS: dict[str, tuple[list[str], str | None]] = {
 # Number columns that are never a rupee amount (weights, purity, carats, counts, rates); the upload
 # summary's "net" pattern also catches "Net Wt", so its pick is checked against this. Weights are often
 # run together ("NetWt", "GrossWt" → "netwt", "grosswt"), hence any word ending in wt/weight.
-_METAL_NAME = (r"(^|_)[a-z0-9]*(wt|wts|weight|weights)(_|$)"
-               r"|(^|_)(fine|tunch|touch|purity|karat|karats|kt|carat|carats|ct|cts|tola|tolas|gm|gms|gram|grams|mg)(_|$)")
-_METAL_COLUMN = re.compile(_METAL_NAME)
-_NOT_AMOUNT = re.compile(_METAL_NAME + r"|(^|_)(qty|quantity|pcs|pieces|nos|units|kg|rate|percent|pct|wastage)(_|$)")
-# "Gross", "Less" and "Net" alone are the weights of a jewellery register (one that also has weight, purity
-# or tunch columns); elsewhere they can be rupee amounts.
+_PURITY = r"(^|_)(fine|tunch|touch|purity|karat|karats|kt|carat|carats|ct|cts|tola|tolas)(_|$)"
+_NOT_AMOUNT = re.compile(r"(^|_)[a-z0-9]*(wt|wts|weight|weights)(_|$)|" + _PURITY +
+                         r"|(^|_)(gm|gms|gram|grams|mg|qty|quantity|pcs|pieces|nos|units|kg|rate|percent|pct|wastage)(_|$)")
+# "Gross", "Less" and "Net" alone are the weights of a jewellery register (one with tunch/purity/carat
+# columns or a gross/less weight column). Elsewhere they are often rupees (gross amount, less discount,
+# net amount; or weight × rate = net), so a plain "Weight" column is not enough to refuse them.
+_JEWELLERY_COLUMN = re.compile(_PURITY + r"|(^|_)(gross|grs|gr|less)_?(wt|wts|weight|weights)(_|$)")
 _BARE_WEIGHT = re.compile(r"^(gross|grs|less|net)$")
 
 
@@ -123,9 +125,9 @@ def detect_mapping(profile: dict) -> dict[str, str]:
     if "debit" not in mapping and "amount" not in mapping:
         # A register has no debit/credit: its invoice value (or the summary's main amount) is the amount,
         # but never a weight, purity, quantity or rate column (a weights-only register has no amount).
-        metal = any(_METAL_COLUMN.search(c["name"]) for c in profile["columns"])
+        jewellery = any(_JEWELLERY_COLUMN.search(c["name"]) for c in profile["columns"])
         fallback = next((c for c in (mapping.get("invoice_value"), detected.get("amount"))
-                         if c and not _NOT_AMOUNT.search(c) and not (metal and _BARE_WEIGHT.match(c))), None)
+                         if c and not _NOT_AMOUNT.search(c) and not (jewellery and _BARE_WEIGHT.match(c))), None)
         if fallback:
             mapping["amount"] = fallback
     return mapping
@@ -140,9 +142,62 @@ def effective_mapping(profile: dict) -> dict[str, str]:
 # --- Helpers ---------------------------------------------------------------------------------
 
 
+def _half_up(values, scale: int = 1) -> np.ndarray:
+    """values × scale to whole units, half away from zero like Excel's ROUND (111.105 → 111.11, never half-to-even).
+
+    A value is read at Excel's 15 significant digits, so float noise cannot move a half: 1.005 is stored as
+    1.00499999999999989... and still rounds up. Only values within a hair of a half take the exact Decimal path."""
+    values = np.asarray(values, dtype="float64")
+    scaled = values * scale
+    finite = np.isfinite(scaled)
+    scaled = np.where(finite, scaled, 0.0)
+    out = np.rint(scaled)
+    near_half = finite & (np.abs(scaled - np.floor(scaled) - 0.5) < 1e-6)
+    if near_half.any():
+        out[near_half] = _exact_half_up(values[near_half], scale)
+    return out.astype(np.int64)
+
+
+_UNIT = Decimal(1)
+
+
+def _exact_half_up(values: np.ndarray, scale: int) -> np.ndarray:
+    """values × scale (a power of ten), half up, with each value read as its 15 significant digits, in integers."""
+    size = np.abs(values)
+    power = np.floor(np.log10(size)).astype(np.int64)  # values here are at least half a unit, never 0
+    shifted = size * 10.0 ** (14 - power)
+    digits = np.rint(shifted)  # the 15 significant digits, as a whole number below 2**53
+    k = power - 14 + round(np.log10(scale))  # value × scale = digits × 10**k
+    # A 16th digit near 5 (shifted carries up to 1/16 of float error) or an odd size is left to a Decimal.
+    plain = (k > -16) & (k < 4) & (np.abs(shifted - digits) < 0.4)
+    out = np.empty(len(values), dtype="float64")
+    d = digits[plain].astype(np.int64)
+    kp = k[plain]
+    up = 10 ** np.clip(kp, 0, None)
+    down = 10 ** np.clip(-kp, 0, None)
+    quotient, rest = np.divmod(d, down)
+    out[plain] = (quotient + (2 * rest >= down)) * up * np.sign(values[plain])
+    for i in np.flatnonzero(~plain):
+        out[i] = float((Decimal(f"{values[i]:.15g}") * scale).quantize(_UNIT, rounding=ROUND_HALF_UP))
+    return out
+
+
 def _paise(series: pd.Series) -> np.ndarray:
+    """Rupees to whole paise per entry, half a paisa up (see _half_up); blanks and text count as 0."""
     values = pd.to_numeric(series, errors="coerce").astype("float64").fillna(0.0).to_numpy()
-    return np.round(values * 100).astype(np.int64)
+    return _half_up(values, 100)
+
+
+def _paise_of(rupees) -> int:
+    """One rupee figure (e.g. a stock value typed by the user) to whole paise, half a paisa up."""
+    return int(_half_up([float(rupees or 0)], 100)[0])
+
+
+def _sub_paisa(series: pd.Series) -> np.ndarray:
+    """Per entry: the amount holds a fraction of a paisa (111.105), which _paise rounds; float noise does not count."""
+    scaled = pd.to_numeric(series, errors="coerce").astype("float64").to_numpy() * 100
+    with np.errstate(invalid="ignore"):
+        return np.abs(scaled - np.rint(scaled)) > np.maximum(1e-6, np.abs(scaled) * 1e-14)
 
 
 def _rupees(paise) -> float:
@@ -418,7 +473,7 @@ def profit_and_loss(frame: pd.DataFrame, mapping: dict, overrides: dict[str, str
     balances = _balances(frame, mapping, overrides)
     by_group = balances.groupby("group")["net"].sum()
     get = lambda g: int(by_group.get(g, 0))  # noqa: E731
-    open_p, close_p = int(round(opening_stock * 100)), int(round(closing_stock * 100))
+    open_p, close_p = _paise_of(opening_stock), _paise_of(closing_stock)
     sales, direct_inc = -get("Sales Accounts"), -get("Direct Incomes")
     purchases, direct_exp = get("Purchase Accounts"), get("Direct Expenses")
     indirect_inc, indirect_exp = -get("Indirect Incomes"), get("Indirect Expenses")
@@ -473,9 +528,9 @@ _BS_SIDES = {"asset": "Assets", "liability": "Liabilities & capital"}
 def balance_sheet(frame: pd.DataFrame, mapping: dict, overrides: dict[str, str], opening_stock: float, closing_stock: float) -> dict:
     balances = _balances(frame, mapping, overrides)
     pl = profit_and_loss(frame, mapping, overrides, opening_stock, closing_stock)
-    net_profit = int(round(pl["cards"][2]["value"] * 100))
+    net_profit = _paise_of(pl["cards"][2]["value"])
     bs = balances[balances.group.map(classify.statement_of) == "bs"]
-    close_p = int(round(closing_stock * 100))
+    close_p = _paise_of(closing_stock)
 
     rows: list[dict] = []
     totals = {}
@@ -603,8 +658,10 @@ def ageing(frame: pd.DataFrame, mapping: dict, as_of: date | None) -> dict:
     )
     report["checks"].append({"level": "info", "message": f"Aged as on {as_of:%d %b %Y} by {'due date' if basis == 'due_date' else 'entry date'}, using {source}."})
     if later:
-        report["checks"].append({"level": "info", "message": f"{later} entries dated after {as_of:%d %b %Y} are left out: they had not "
-                                 "happened on the as-on date. Choose a later as-on date to include them."})
+        one = later == 1
+        report["checks"].append({"level": "info", "message": f"{later} {'entry' if one else 'entries'} dated after {as_of:%d %b %Y} "
+                                 f"{'is' if one else 'are'} left out: {'it' if one else 'they'} had not happened on the as-on date. "
+                                 f"Choose a later as-on date to include {'it' if one else 'them'}."})
     if pivot.empty:
         report["checks"].append({"level": "ok", "message": f"Nothing was outstanding on {as_of:%d %b %Y}: every party's bills "
                                  "up to that date were paid or set off."})
@@ -614,7 +671,8 @@ def ageing(frame: pd.DataFrame, mapping: dict, as_of: date | None) -> dict:
 # --- GST -------------------------------------------------------------------------------------------
 
 
-def gst_summary(frame: pd.DataFrame, mapping: dict) -> dict:
+def _gst_inputs(frame: pd.DataFrame, mapping: dict) -> tuple:
+    """(heads, tax per head in paise, total tax, taxable, dates, rate %, note) for the GST summary and its checks."""
     heads = [r for r in ("cgst", "sgst", "igst", "cess") if r in mapping]
     if not heads and "tax" in mapping:
         heads = ["tax"]  # one GST column, not split into CGST/SGST/IGST
@@ -626,6 +684,29 @@ def gst_summary(frame: pd.DataFrame, mapping: dict) -> dict:
     tax = data["cgst"] + data["sgst"] + data["igst"] + data["tax"]
     taxable = _paise(frame[mapping["taxable"]]) if "taxable" in mapping else None
     dates = _date_col(frame, mapping) if "date" in mapping else None
+    rate = None
+    fraction_note = None
+    if "rate" in mapping:
+        rate = pd.to_numeric(frame[mapping["rate"]], errors="coerce").to_numpy(dtype="float64")
+        if taxable is not None and _rates_are_fractions(rate, taxable, tax):
+            rate = np.round(rate * 100, 4)
+            fraction_note = (f'The "{mapping["rate"]}" column holds rates as fractions (0.18 = 18%, Excel\'s percent format), '
+                             "so they were read as percentages; the tax amounts confirm it.")
+    elif taxable is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rate = np.where(taxable != 0, np.round(tax / taxable * 100, 2), np.nan)
+    return heads, data, tax, taxable, dates, rate, fraction_note
+
+
+def gst_checks(frame: pd.DataFrame, mapping: dict) -> list[dict]:
+    """The checks of gst_summary, without building its tables (enough to count the problems)."""
+    _, data, _, taxable, dates, rate, fraction_note = _gst_inputs(frame, mapping)
+    checks = _gst_checks(frame, mapping, data, taxable, rate, dates)
+    return checks + ([{"level": "info", "message": fraction_note}] if fraction_note else [])
+
+
+def gst_summary(frame: pd.DataFrame, mapping: dict) -> dict:
+    heads, data, tax, taxable, dates, rate, fraction_note = _gst_inputs(frame, mapping)
     labels = {"cgst": "CGST", "sgst": "SGST", "igst": "IGST", "cess": "Cess", "tax": "GST"}
     shown = [h for h in ("cgst", "sgst", "igst", "tax") if h in heads]
 
@@ -647,17 +728,6 @@ def gst_summary(frame: pd.DataFrame, mapping: dict) -> dict:
     columns = [_col("entries", "Entries", "count"), _col("taxable", "Taxable value", "money"),
                *(_col(h, labels[h], "money") for h in shown if h != "tax"), _col("total", "Total GST", "money")]
     tables = []
-    rate = None
-    fraction_note = None
-    if "rate" in mapping:
-        rate = pd.to_numeric(frame[mapping["rate"]], errors="coerce").to_numpy(dtype="float64")
-        if taxable is not None and _rates_are_fractions(rate, taxable, tax):
-            rate = np.round(rate * 100, 4)
-            fraction_note = (f'The "{mapping["rate"]}" column holds rates as fractions (0.18 = 18%, Excel\'s percent format), '
-                             "so they were read as percentages; the tax amounts confirm it.")
-    elif taxable is not None:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rate = np.where(taxable != 0, np.round(tax / taxable * 100, 2), np.nan)
     if rate is not None:
         by_rate = base.assign(rate=rate).groupby("rate", dropna=False).sum()
         tables.append({
@@ -692,9 +762,21 @@ def _rates_are_fractions(rate: np.ndarray, taxable: np.ndarray, tax: np.ndarray)
     if not rows.any():
         return False
     tolerance = np.maximum(100, np.abs(taxable[rows]) * 0.0005)  # same tolerance as the tax ≠ taxable × rate check
-    as_fraction = np.abs(tax[rows] - np.round(taxable[rows] * rate[rows])) <= tolerance
-    as_percent = np.abs(tax[rows] - np.round(taxable[rows] * rate[rows] / 100)) <= tolerance
+    as_fraction = np.abs(tax[rows] - _half_up(taxable[rows] * rate[rows])) <= tolerance
+    as_percent = np.abs(tax[rows] - _half_up(taxable[rows] * rate[rows] / 100)) <= tolerance
     return int(as_fraction.sum()) * 2 >= int(rows.sum()) and as_fraction.sum() > as_percent.sum()
+
+
+def _invalid_rates(rate: np.ndarray, dates: pd.Series) -> np.ndarray:
+    """Per entry: its rate was not a GST slab on its date. Each distinct (rate, day) is looked up once."""
+    pairs = pd.DataFrame({"rate": rate, "day": pd.to_datetime(dates).dt.normalize().to_numpy()})
+    if pairs.empty:
+        return np.zeros(0, dtype=bool)
+    groups = pairs.groupby(["rate", "day"], dropna=False, sort=False).ngroup().to_numpy()
+    firsts = pairs.drop_duplicates()
+    invalid = np.array([not np.isnan(r) and r not in gst.valid_rates(None if pd.isna(d) else d.date())
+                        for r, d in zip(firsts["rate"], firsts["day"])], dtype=bool)
+    return invalid[groups]
 
 
 def _rows_of(frame: pd.DataFrame, mask: np.ndarray, mapping: dict) -> str:
@@ -720,32 +802,29 @@ def _gst_checks(frame, mapping, data, taxable, rate, dates) -> list[dict]:
         flag(np.abs(data["cgst"] - data["sgst"]) > 5, "entries have CGST different from SGST (they must be equal halves)")
     tax = data["cgst"] + data["sgst"] + data["igst"] + data["tax"]
     if taxable is not None and "rate" in mapping and rate is not None:
-        expected = np.round(taxable * np.nan_to_num(rate) / 100)
+        expected = _half_up(taxable * np.nan_to_num(rate) / 100)
         tolerance = np.maximum(100, np.abs(taxable) * 0.0005)  # Rs 1 or 0.05%, a design tolerance (no statutory one)
         wrong = (np.abs(tax - expected) > tolerance) & ~np.isnan(rate)
-        inclusive = np.round(taxable * np.nan_to_num(rate) / (100 + np.nan_to_num(rate)))
+        inclusive = _half_up(taxable * np.nan_to_num(rate) / (100 + np.nan_to_num(rate)))
         looks_inclusive = wrong & (np.abs(tax - inclusive) <= tolerance)
         flag(wrong & ~looks_inclusive, "entries where tax ≠ taxable value × rate (beyond ₹1)")
         flag(looks_inclusive, "entries where the 'taxable value' looks tax-inclusive (tax = value × rate ÷ (100 + rate))")
         flag((np.nan_to_num(rate) == 0) & (tax != 0), "entries at 0% rate that still carry tax")
         if dates is not None:
-            on = [None if pd.isna(d) else d.date() for d in dates]
-            invalid = np.array([not np.isnan(r) and r not in gst.valid_rates(d) for r, d in zip(rate, on)])
-            flag(invalid, "entries use a GST rate that was not valid on their date (12% and 28% ended on 22 Sept 2025)")
+            flag(_invalid_rates(rate, dates),"entries use a GST rate that was not valid on their date (12% and 28% ended on 22 Sept 2025)")
     if "gstin" in mapping:
         values = frame[mapping["gstin"]].astype("string")
         problems = {v: gst.gstin_problem(v) for v in values.dropna().unique() if str(v).strip()}
-        bad = values.map(lambda v: bool(problems.get(v)) if v is not None and not pd.isna(v) else False).to_numpy(dtype=bool)
+        bad = values.isin([v for v, p in problems.items() if p]).fillna(False).to_numpy(dtype=bool)
         if bad.any():
             examples = "; ".join(f"{v} ({p})" for v, p in list((k, p) for k, p in problems.items() if p)[:4])
             checks.append({"level": "warning", "message": f"{int(bad.sum())} entries have an invalid GSTIN: {examples}."})
         elif problems:
             checks.append({"level": "ok", "message": f"All {len(problems)} GSTINs pass the format, state-code and check-character test."})
-    if "voucher_no" in mapping:
+    if "voucher_no" in mapping and "rate" not in mapping:  # a multi-rate invoice legitimately has several lines
         numbers = frame[mapping["voucher_no"]].astype("string").str.strip()
         dup = numbers.duplicated(keep=False) & numbers.notna()
-        if "rate" not in mapping:  # a multi-rate invoice legitimately has several lines
-            flag(dup.to_numpy(), "entries share an invoice number with another entry", level="info")
+        flag(dup.to_numpy(), "entries share an invoice number with another entry", level="info")
     if not checks:
         checks.append({"level": "ok", "message": "No GST data problems found by the automatic checks."})
     return checks

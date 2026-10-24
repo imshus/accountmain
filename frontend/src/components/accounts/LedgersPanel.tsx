@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api";
 import { formatDate, formatValue } from "../../format";
 import type { AccountsMeta, Company, Ledger } from "../../types";
+import { signedOpening } from "./shared";
 
 type Props = {
   company: Company;
@@ -54,7 +55,16 @@ export default function LedgersPanel({ company, ledgers, groups, onChanged, onCo
   }, [ledgers, filter]);
 
   const totals = useMemo(
-    () => ledgers.reduce((t, l) => ({ opening: t.opening + l.opening_paise, closing: t.closing + l.closing_paise }), { opening: 0, closing: 0 }),
+    () =>
+      ledgers.reduce(
+        (t, l) => ({
+          opening: t.opening + l.opening_paise,
+          closing: t.closing + l.closing_paise,
+          earlier: t.earlier + (l.earlier_years_paise ?? 0),
+          from: t.from || (l.closing_from ?? ""),
+        }),
+        { opening: 0, closing: 0, earlier: 0, from: "" },
+      ),
     [ledgers],
   );
 
@@ -78,15 +88,14 @@ export default function LedgersPanel({ company, ledgers, groups, onChanged, onCo
     event.preventDefault();
     setError(null);
     try {
-      const amount = form.opening.replace(/[₹,\s]/g, "");
       const saved = await api.saveLedger(company.id, editing, {
         name: form.name,
         group: form.group,
-        opening: amount ? `${form.side === "Cr" ? "-" : ""}${amount}` : "0",
+        opening: signedOpening(form.opening, form.side, "Opening balance"),
         gstin: form.gstin || undefined,
         state_code: isParty ? gstinState || form.state || null : null,
         credit_days: form.credit_days ? Number(form.credit_days) : null,
-        ...(holdsMetal ? { opening_gold: form.gold.trim() ? `${form.goldSide === "Cr" ? "-" : ""}${form.gold.replace(/[,\s]/g, "")}` : "0" } : {}),
+        ...(holdsMetal ? { opening_gold: signedOpening(form.gold, form.goldSide, "Opening gold") } : {}),
       });
       setMessage(`${editing ? "Updated" : "Created"} ${saved.name} under ${saved.group_name}.`);
       setForm({ ...EMPTY, group: form.group });
@@ -257,16 +266,30 @@ export default function LedgersPanel({ company, ledgers, groups, onChanged, onCo
             ))}
           </tbody>
           <tfoot>
+            {totals.earlier ? (
+              <tr>
+                <td colSpan={4}>Profit &amp; Loss A/c (earlier years' income and expenses, carried to Capital)</td>
+                <td className="num">{formatValue(totals.earlier / 100, "drcr")}</td>
+                {showGold ? <td /> : null}
+                <td />
+              </tr>
+            ) : null}
             <tr className="row-total">
               <td colSpan={3}>Total (should be nil)</td>
               <td className="num">{formatValue(totals.opening / 100, "drcr")}</td>
-              <td className="num">{formatValue(totals.closing / 100, "drcr")}</td>
+              <td className="num">{formatValue((totals.closing + totals.earlier) / 100, "drcr")}</td>
               {showGold ? <td /> : null}
               <td />
             </tr>
           </tfoot>
         </table>
       </div>
+      {totals.from > company.fy_start ? (
+        <p className="muted small">
+          Closing balances are to date. Income and expense ledgers show only the financial year from {formatDate(totals.from)}; their
+          earlier years are in the Profit &amp; Loss A/c line.
+        </p>
+      ) : null}
     </section>
   );
 }

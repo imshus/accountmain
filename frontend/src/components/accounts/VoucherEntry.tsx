@@ -3,7 +3,7 @@ import { api } from "../../api";
 import { formatValue } from "../../format";
 import type { Company, Ledger, VoucherDetail, VoucherType } from "../../types";
 import { JewelleryForm, MetalMoveForm, RateCutForm } from "./MetalEntry";
-import { CASH_BANK, LedgerSelect, PARTIES, SavedVoucher as Saved, parseAmount, today } from "./shared";
+import { CASH_BANK, LedgerSelect, NumberInput, PARTIES, SavedVoucher as Saved, badNumber, parseAmount, today, useSaving } from "./shared";
 
 type Props = {
   company: Company;
@@ -56,6 +56,7 @@ function InvoiceForm({ company, ledgers, onSaved }: Props) {
   const [roundOff, setRoundOff] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<VoucherDetail | null>(null);
+  const [saving, guard] = useSaving();
   const sales = vtype === "Sales" || vtype === "Credit Note";
   const partyGroup = sales ? "Sundry Debtors" : "Sundry Creditors";
   const itemGroup = sales ? "Sales Accounts" : "Purchase Accounts";
@@ -63,8 +64,21 @@ function InvoiceForm({ company, ledgers, onSaved }: Props) {
   const inter = Boolean(partyLedger?.state_code && company.state_code && partyLedger.state_code !== company.state_code);
   const taxable = items.reduce((s, i) => s + parseAmount(i.taxable), 0);
   const tax = items.reduce((s, i) => s + (parseAmount(i.taxable) * Number(i.rate || 0)) / 100, 0);
+  const problem = badNumber(items.map((i, n) => [items.length > 1 ? `Taxable value on line ${n + 1}` : "Taxable value", i.taxable]));
+  // A customer or Sales ledger left from another Type is hidden by the filters, so it must never be posted.
+  const wrongSide =
+    (Boolean(party) && partyLedger?.group_name !== partyGroup) ||
+    items.some((i) => i.ledger && ledgers.find((l) => String(l.id) === i.ledger)?.group_name !== itemGroup);
 
-  async function save() {
+  function changeType(next: VoucherType) {
+    if ((next === "Sales" || next === "Credit Note") !== sales) {
+      setParty("");
+      setItems((all) => all.map((x) => ({ ...x, ledger: "" })));
+    }
+    setVtype(next);
+  }
+
+  const save = () => guard(async () => {
     setError(null);
     try {
       const voucher = await api.createInvoice(company.id, {
@@ -78,14 +92,14 @@ function InvoiceForm({ company, ledgers, onSaved }: Props) {
     } catch (e) {
       setError((e as Error).message);
     }
-  }
+  });
 
   return (
     <div className="entry-grid">
       <div className="report-params">
         <label className="field">
           <span>Type</span>
-          <select value={vtype} onChange={(e) => setVtype(e.target.value as VoucherType)}>
+          <select value={vtype} onChange={(e) => changeType(e.target.value as VoucherType)}>
             {["Sales", "Purchase", "Credit Note", "Debit Note"].map((t) => (
               <option key={t}>{t}</option>
             ))}
@@ -127,7 +141,7 @@ function InvoiceForm({ company, ledgers, onSaved }: Props) {
                   onChange={(v) => setItems((all) => all.map((x, j) => (j === i ? { ...x, ledger: v } : x)))} filter={(l) => l.group_name === itemGroup} />
               </td>
               <td className="num">
-                <input inputMode="decimal" value={item.taxable} placeholder="0.00"
+                <NumberInput value={item.taxable} placeholder="0.00" aria-label="Taxable value"
                   onChange={(e) => setItems((all) => all.map((x, j) => (j === i ? { ...x, taxable: e.target.value } : x)))} />
               </td>
               <td className="num">
@@ -162,8 +176,9 @@ function InvoiceForm({ company, ledgers, onSaved }: Props) {
         Taxable {formatValue(taxable, "money")} + {inter ? "IGST" : "CGST + SGST"} {formatValue(tax, "money")} ≈ {formatValue(taxable + tax, "money")}
         {party ? (inter ? " (inter-state: party's state differs from yours)" : " (intra-state)") : ""}
       </p>
-      <button className="button primary" onClick={() => void save()} disabled={!party || !taxable}>
-        Save {vtype}
+      {problem ? <div className="callout warning">{problem}</div> : null}
+      <button className="button primary" onClick={() => void save()} disabled={saving || !party || !taxable || Boolean(problem) || wrongSide}>
+        {saving ? "Saving…" : `Save ${vtype}`}
       </button>
       {error ? <div className="callout warning">{error}</div> : null}
       <Saved voucher={saved} />
@@ -180,23 +195,47 @@ function SettlementForm({ company, ledgers, onSaved }: Props) {
   const [tds, setTds] = useState("");
   const [reference, setReference] = useState("");
   const [narration, setNarration] = useState("");
-  const [bills, setBills] = useState<{ bill_ref: string; pending: number; bill_date: string | null }[]>([]);
+  // Pending bills with the party they belong to, so a slow answer for an earlier party is never shown for this one.
+  const [loaded, setLoaded] = useState<{ key: string; bills: { bill_ref: string; pending: number; bill_date: string | null }[] }>({ key: "", bills: [] });
+  const [refresh, setRefresh] = useState(0);
   const [allocate, setAllocate] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<VoucherDetail | null>(null);
+  const [saving, guard] = useSaving();
   const group = vtype === "Receipt" ? "Sundry Debtors" : "Sundry Creditors";
+  const key = party ? `${company.id}/${party}/${vtype}` : "";
+  const bills = loaded.key === key ? loaded.bills : [];
 
   useEffect(() => {
     setAllocate({});
-    if (!party) return setBills([]);
+    if (!key) return;
+    let live = true;
     api.pendingBills(company.id, Number(party)).then(
-      (list) => setBills(list.filter((b) => (vtype === "Receipt" ? b.pending > 0 : b.pending < 0))),
-      () => setBills([]),
+      (list) => live && setLoaded({ key, bills: list.filter((b) => (vtype === "Receipt" ? b.pending > 0 : b.pending < 0)) }),
+      () => live && setLoaded({ key, bills: [] }),
     );
-  }, [company.id, party, vtype]);
+    return () => {
+      live = false;
+    };
+    // key covers company, party and type
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, refresh]);
 
   const allocated = Object.values(allocate).reduce((s, v) => s + parseAmount(v), 0);
   const total = parseAmount(amount) + parseAmount(tds);
+  const problem = badNumber([
+    ["Amount", amount],
+    ["TDS", tds],
+    ...bills.map((b): [string, string] => [`Settle now for ${b.bill_ref}`, allocate[b.bill_ref] ?? ""]),
+  ]);
+
+  function changeType(next: "Receipt" | "Payment") {
+    // TDS on a receipt goes to TDS Receivable, on a payment to TDS Payable: a figure typed for one is not meant for the other.
+    setVtype(next);
+    setParty("");
+    setTds("");
+    setAllocate({});
+  }
 
   function autoAllocate() {
     let left = total;
@@ -210,31 +249,32 @@ function SettlementForm({ company, ledgers, onSaved }: Props) {
     setAllocate(next);
   }
 
-  async function save() {
+  const save = () => guard(async () => {
     setError(null);
     try {
       const voucher = await api.createSettlement(company.id, {
         vtype, date, party_id: Number(party), cash_bank_id: Number(cash), amount, tds: tds || null, reference, narration,
-        against: Object.entries(allocate).filter(([, v]) => parseAmount(v) > 0).map(([bill_ref, v]) => ({ bill_ref, amount: v })),
+        against: Object.entries(allocate)
+          .filter(([ref, v]) => parseAmount(v) > 0 && bills.some((b) => b.bill_ref === ref))
+          .map(([bill_ref, v]) => ({ bill_ref, amount: v })),
       });
       setSaved(voucher);
       setAmount("");
       setTds("");
       setAllocate({});
       onSaved(voucher);
-      setParty((p) => p); // reload pending bills
-      api.pendingBills(company.id, Number(party)).then((list) => setBills(list.filter((b) => (vtype === "Receipt" ? b.pending > 0 : b.pending < 0))));
+      setRefresh((r) => r + 1); // reload pending bills
     } catch (e) {
       setError((e as Error).message);
     }
-  }
+  });
 
   return (
     <div className="entry-grid">
       <div className="report-params">
         <label className="field">
           <span>Type</span>
-          <select value={vtype} onChange={(e) => { setVtype(e.target.value as "Receipt" | "Payment"); setParty(""); }}>
+          <select value={vtype} onChange={(e) => changeType(e.target.value as "Receipt" | "Payment")}>
             <option>Receipt</option>
             <option>Payment</option>
           </select>
@@ -253,11 +293,11 @@ function SettlementForm({ company, ledgers, onSaved }: Props) {
         </label>
         <label className="field">
           <span>Amount ₹</span>
-          <input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} />
+          <NumberInput value={amount} onChange={(e) => setAmount(e.target.value)} />
         </label>
         <label className="field" title={vtype === "Receipt" ? "Goes to TDS Receivable; the customer is credited with amount + TDS" : "Goes to TDS Payable"}>
           <span>{vtype === "Receipt" ? "TDS deducted by customer ₹" : "TDS deducted ₹"}</span>
-          <input inputMode="decimal" value={tds} onChange={(e) => setTds(e.target.value)} placeholder="0" />
+          <NumberInput value={tds} onChange={(e) => setTds(e.target.value)} placeholder="0" />
         </label>
         <label className="field">
           <span>Cheque / UTR no.</span>
@@ -288,7 +328,8 @@ function SettlementForm({ company, ledgers, onSaved }: Props) {
                   <td>{b.bill_date ? formatValue(b.bill_date, "date") : "—"}</td>
                   <td className="num">{formatValue(Math.abs(b.pending), "money")}</td>
                   <td className="num">
-                    <input inputMode="decimal" value={allocate[b.bill_ref] ?? ""} onChange={(e) => setAllocate((a) => ({ ...a, [b.bill_ref]: e.target.value }))} />
+                    <NumberInput value={allocate[b.bill_ref] ?? ""} aria-label={`Settle now for ${b.bill_ref}`}
+                      onChange={(e) => setAllocate((a) => ({ ...a, [b.bill_ref]: e.target.value }))} />
                   </td>
                 </tr>
               ))}
@@ -306,8 +347,9 @@ function SettlementForm({ company, ledgers, onSaved }: Props) {
         <span>Narration</span>
         <input value={narration} onChange={(e) => setNarration(e.target.value)} />
       </label>
-      <button className="button primary" onClick={() => void save()} disabled={!party || !cash || !parseAmount(amount)}>
-        Save {vtype}
+      {problem ? <div className="callout warning">{problem}</div> : null}
+      <button className="button primary" onClick={() => void save()} disabled={saving || !party || !cash || !parseAmount(amount) || Boolean(problem)}>
+        {saving ? "Saving…" : `Save ${vtype}`}
       </button>
       {error ? <div className="callout warning">{error}</div> : null}
       <Saved voucher={saved} />
@@ -329,8 +371,19 @@ function LinesForm({ company, ledgers, onSaved }: Props) {
   );
   const diff = Math.round((totals.dr - totals.cr) * 100) / 100;
   const filter = vtype === "Contra" ? (l: Ledger) => CASH_BANK.has(l.group_name) : undefined;
+  const [saving, guard] = useSaving();
+  const problem = badNumber(lines.flatMap((l, n): [string, string][] => [[`Debit on line ${n + 1}`, l.dr], [`Credit on line ${n + 1}`, l.cr]]));
 
-  async function save() {
+  function changeType(next: VoucherType) {
+    // A contra uses only cash and bank ledgers: drop others, which its list would hide but still post.
+    if (next === "Contra") {
+      const cashBank = new Set(ledgers.filter((l) => CASH_BANK.has(l.group_name)).map((l) => String(l.id)));
+      setLines((all) => all.map((x) => (x.ledger && !cashBank.has(x.ledger) ? { ...x, ledger: "" } : x)));
+    }
+    setVtype(next);
+  }
+
+  const save = () => guard(async () => {
     setError(null);
     try {
       const voucher = await api.createVoucher(company.id, {
@@ -344,14 +397,14 @@ function LinesForm({ company, ledgers, onSaved }: Props) {
     } catch (e) {
       setError((e as Error).message);
     }
-  }
+  });
 
   return (
     <div className="entry-grid">
       <div className="report-params">
         <label className="field">
           <span>Type</span>
-          <select value={vtype} onChange={(e) => setVtype(e.target.value as VoucherType)}>
+          <select value={vtype} onChange={(e) => changeType(e.target.value as VoucherType)}>
             {["Journal", "Contra", "Payment", "Receipt", "Sales", "Purchase", "Credit Note", "Debit Note"].map((t) => (
               <option key={t}>{t}</option>
             ))}
@@ -383,11 +436,11 @@ function LinesForm({ company, ledgers, onSaved }: Props) {
                   onChange={(v) => setLines((all) => all.map((x, j) => (j === i ? { ...x, ledger: v } : x)))} />
               </td>
               <td className="num">
-                <input inputMode="decimal" value={line.dr} disabled={Boolean(line.cr)}
+                <NumberInput value={line.dr} disabled={Boolean(line.cr)} aria-label={`Debit on line ${i + 1}`}
                   onChange={(e) => setLines((all) => all.map((x, j) => (j === i ? { ...x, dr: e.target.value } : x)))} />
               </td>
               <td className="num">
-                <input inputMode="decimal" value={line.cr} disabled={Boolean(line.dr)}
+                <NumberInput value={line.cr} disabled={Boolean(line.dr)} aria-label={`Credit on line ${i + 1}`}
                   onChange={(e) => setLines((all) => all.map((x, j) => (j === i ? { ...x, cr: e.target.value } : x)))} />
               </td>
               <td>
@@ -427,8 +480,9 @@ function LinesForm({ company, ledgers, onSaved }: Props) {
         Party lines (customers, suppliers) are tracked bill-wise automatically: invoices open a bill, receipts and payments go on account.
         {ledgers.some((l) => PARTIES.has(l.group_name)) ? "" : " Create customers and suppliers under Ledgers first."}
       </p>
-      <button className="button primary" onClick={() => void save()} disabled={diff !== 0 || totals.dr === 0}>
-        Save {vtype}
+      {problem ? <div className="callout warning">{problem}</div> : null}
+      <button className="button primary" onClick={() => void save()} disabled={saving || diff !== 0 || totals.dr === 0 || Boolean(problem)}>
+        {saving ? "Saving…" : `Save ${vtype}`}
       </button>
       {error ? <div className="callout warning">{error}</div> : null}
       <Saved voucher={saved} />

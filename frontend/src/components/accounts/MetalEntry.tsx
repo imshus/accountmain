@@ -2,7 +2,10 @@ import { useEffect, useState } from "react";
 import { api } from "../../api";
 import { formatGrams, formatValue } from "../../format";
 import type { Company, Ledger, Metal, VoucherDetail } from "../../types";
-import { LedgerSelect, PARTIES, SavedVoucher, metalBalanceText, parseAmount, roundTo, today } from "./shared";
+import {
+  LedgerSelect, NumberInput, PARTIES, SavedVoucher, badNumber, fineOf, gstOn, halfUp, metalBalanceText, parseAmount, toBp, toMg, toPaise, today,
+  useSaving, weights,
+} from "./shared";
 
 type Props = {
   company: Company;
@@ -29,12 +32,6 @@ const EMPTY_ITEM: Item = {
   labour_rate: "", settle: "Wt",
 };
 
-/** Net = gross − (diamond + stone ct) × 0.2; fine = net × tunch ÷ 100 (3 decimals, as the backend computes). */
-function weights(item: Item) {
-  const net = item.net ? parseAmount(item.net) : roundTo(parseAmount(item.gross) - (parseAmount(item.diamond_ct) + parseAmount(item.stone_ct)) * 0.2, 3);
-  const fine = item.tunch ? roundTo((net * parseAmount(item.tunch)) / 100, 3) : 0;
-  return { net, fine };
-}
 
 function MetalPicker({ value, onChange }: { value: Metal; onChange: (m: Metal) => void }) {
   return (
@@ -48,13 +45,25 @@ function MetalPicker({ value, onChange }: { value: Metal; onChange: (m: Metal) =
   );
 }
 
+/** The party's metal balance in grams. Each answer is kept with the party it is for, so after a quick
+ * change from party A to B, A's slower answer is never shown as B's balance. */
 function usePartyMetal(companyId: number, party: string, refresh: number) {
-  const [balance, setBalance] = useState<Partial<Record<Metal, number>>>({});
+  const key = party ? `${companyId}/${party}` : "";
+  const [loaded, setLoaded] = useState<{ key: string; balance: Partial<Record<Metal, number>> }>({ key: "", balance: {} });
   useEffect(() => {
-    if (!party) return setBalance({});
-    api.metalBalance(companyId, Number(party)).then(setBalance, () => setBalance({}));
-  }, [companyId, party, refresh]);
-  return balance;
+    if (!key) return;
+    let live = true;
+    api.metalBalance(companyId, Number(party)).then(
+      (balance) => live && setLoaded({ key, balance }),
+      () => live && setLoaded({ key, balance: {} }),
+    );
+    return () => {
+      live = false;
+    };
+    // key covers the company and party
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, refresh]);
+  return loaded.key === key ? loaded.balance : {};
 }
 
 /** A sale or purchase of jewellery: each item's fine weight, settled by weight (Wt) or in rupees (Rs). */
@@ -73,28 +82,41 @@ export function JewelleryForm({ company, ledgers, onSaved }: Props) {
   const balance = usePartyMetal(company.id, party, refresh);
   const sales = vtype === "Sales";
   const anyRs = items.some((i) => i.settle === "Rs");
+  const [saving, guard] = useSaving();
 
+  // In mg and paise with the backend's half-up steps (metal.jewellery_invoice), so the summary matches the saved bill.
   const totals = items.reduce(
     (t, item) => {
-      const { net, fine } = weights(item);
-      const metalValue = item.settle === "Rs" ? roundTo(fine * parseAmount(rate), 2) : 0;
-      const value = metalValue + parseAmount(item.diamond_value) + parseAmount(item.stone_value) + roundTo(net * parseAmount(item.labour_rate), 2);
-      return { fineWt: t.fineWt + (item.settle === "Wt" ? fine : 0), fineRs: t.fineRs + (item.settle === "Rs" ? fine : 0), value: t.value + value };
+      const { netMg, fineMg } = weights(item);
+      const metalValue = item.settle === "Rs" ? halfUp(fineMg * toPaise(rate), 1000) : 0;
+      const value = metalValue + toPaise(item.diamond_value) + toPaise(item.stone_value) + halfUp(netMg * toPaise(item.labour_rate), 1000);
+      return { fineWt: t.fineWt + (item.settle === "Wt" ? fineMg : 0), fineRs: t.fineRs + (item.settle === "Rs" ? fineMg : 0), value: t.value + value };
     },
     { fineWt: 0, fineRs: 0, value: 0 },
   );
-  const tax = roundTo((totals.value * parseAmount(gst)) / 100, 2);
+  const tax = gstOn(totals.value, gst);
+  const problem = badNumber([
+    ...items.flatMap((i, n): [string, string][] => {
+      const at = items.length > 1 ? ` (item ${n + 1})` : "";
+      return [
+        [`Gross g${at}`, i.gross], [`Diamond ct${at}`, i.diamond_ct], [`Stone ct${at}`, i.stone_ct], [`Net g${at}`, i.net],
+        [`Tunch %${at}`, i.tunch], [`Diamond ₹${at}`, i.diamond_value], [`Stone ₹${at}`, i.stone_value], [`Labour ₹ per g${at}`, i.labour_rate],
+      ];
+    }),
+    ["GST %", gst],
+    ["Metal rate", anyRs ? rate : ""],
+  ]);
 
   function set(index: number, patch: Partial<Item>) {
     setItems((all) => all.map((x, j) => (j === index ? { ...x, ...patch } : x)));
   }
 
-  async function save() {
+  const save = () => guard(async () => {
     setError(null);
     try {
       const voucher = await api.createJewellery(company.id, {
         vtype, date, number: number || null, party_id: Number(party), metal, gst_rate: parseAmount(gst), metal_rate: rate || null,
-        items: items.map((i) => ({ ...i, tunch: i.tunch ? parseAmount(i.tunch) : null, net: i.net || null })),
+        items: items.map((i) => ({ ...i, tunch: i.tunch.trim() ? parseAmount(i.tunch) : null, net: i.net.trim() || null })),
       });
       setSaved(voucher);
       setNumber("");
@@ -104,7 +126,7 @@ export function JewelleryForm({ company, ledgers, onSaved }: Props) {
     } catch (e) {
       setError((e as Error).message);
     }
-  }
+  });
 
   return (
     <div className="entry-grid">
@@ -133,7 +155,7 @@ export function JewelleryForm({ company, ledgers, onSaved }: Props) {
       {party ? <p className="muted small">Metal account now: {metalBalanceText(balance[metal])}.</p> : null}
 
       {items.map((item, i) => {
-        const { net, fine } = weights(item);
+        const { netMg, tunchBp, fineMg } = weights(item);
         return (
           <fieldset key={i} className="item-card">
             <legend>
@@ -155,35 +177,35 @@ export function JewelleryForm({ company, ledgers, onSaved }: Props) {
               </label>
               <label className="field">
                 <span>Gross g</span>
-                <input inputMode="decimal" value={item.gross} onChange={(e) => set(i, { gross: e.target.value })} />
+                <NumberInput value={item.gross} onChange={(e) => set(i, { gross: e.target.value })} />
               </label>
               <label className="field">
                 <span>Diamond ct</span>
-                <input inputMode="decimal" value={item.diamond_ct} onChange={(e) => set(i, { diamond_ct: e.target.value })} />
+                <NumberInput value={item.diamond_ct} onChange={(e) => set(i, { diamond_ct: e.target.value })} />
               </label>
               <label className="field">
                 <span>Stone ct</span>
-                <input inputMode="decimal" value={item.stone_ct} onChange={(e) => set(i, { stone_ct: e.target.value })} />
+                <NumberInput value={item.stone_ct} onChange={(e) => set(i, { stone_ct: e.target.value })} />
               </label>
               <label className="field">
                 <span>Net g</span>
-                <input inputMode="decimal" value={item.net} placeholder={net ? net.toFixed(3) : "auto"} onChange={(e) => set(i, { net: e.target.value })} />
+                <NumberInput value={item.net} placeholder={netMg ? (netMg / 1000).toFixed(3) : "auto"} onChange={(e) => set(i, { net: e.target.value })} />
               </label>
               <label className="field">
                 <span>Tunch %</span>
-                <input inputMode="decimal" value={item.tunch} onChange={(e) => set(i, { tunch: e.target.value })} placeholder="76" />
+                <NumberInput value={item.tunch} onChange={(e) => set(i, { tunch: e.target.value })} placeholder="76" />
               </label>
               <label className="field">
                 <span>Diamond ₹</span>
-                <input inputMode="decimal" value={item.diamond_value} onChange={(e) => set(i, { diamond_value: e.target.value })} />
+                <NumberInput value={item.diamond_value} onChange={(e) => set(i, { diamond_value: e.target.value })} />
               </label>
               <label className="field">
                 <span>Stone ₹</span>
-                <input inputMode="decimal" value={item.stone_value} onChange={(e) => set(i, { stone_value: e.target.value })} />
+                <NumberInput value={item.stone_value} onChange={(e) => set(i, { stone_value: e.target.value })} />
               </label>
               <label className="field">
                 <span>Labour ₹ per g</span>
-                <input inputMode="decimal" value={item.labour_rate} onChange={(e) => set(i, { labour_rate: e.target.value })} />
+                <NumberInput value={item.labour_rate} onChange={(e) => set(i, { labour_rate: e.target.value })} />
               </label>
               <label className="field">
                 <span>Metal settled</span>
@@ -194,7 +216,8 @@ export function JewelleryForm({ company, ledgers, onSaved }: Props) {
               </label>
             </div>
             <p className="item-result">
-              Net {formatGrams(net)} × tunch {item.tunch || "?"} ÷ 100 = <strong>{formatGrams(fine)} fine</strong>
+              Net {formatGrams(netMg / 1000)} × tunch {tunchBp ? tunchBp / 100 : "?"} ÷ 100 = <strong>{formatGrams(fineMg / 1000)} fine</strong>
+              {tunchBp && toBp(item.tunch) / 100 !== parseAmount(item.tunch) ? " (tunch is kept to 2 decimals)" : ""}
             </p>
           </fieldset>
         );
@@ -207,24 +230,26 @@ export function JewelleryForm({ company, ledgers, onSaved }: Props) {
       <div className="report-params">
         <label className="field">
           <span>GST %</span>
-          <input inputMode="decimal" value={gst} onChange={(e) => setGst(e.target.value)} />
+          <NumberInput value={gst} onChange={(e) => setGst(e.target.value)} />
         </label>
         {anyRs ? (
           <label className="field">
             <span>Metal rate ₹ per g fine</span>
-            <input inputMode="decimal" value={rate} onChange={(e) => setRate(e.target.value)} />
+            <NumberInput value={rate} onChange={(e) => setRate(e.target.value)} />
           </label>
         ) : null}
       </div>
       <div className="entry-summary">
-        {totals.fineWt ? <span>{sales ? "Customer owes" : "You owe supplier"} <strong>{formatGrams(totals.fineWt)} fine</strong> {metal}</span> : null}
-        {totals.fineRs ? <span>Metal billed in rupees: {formatGrams(totals.fineRs)} fine</span> : null}
+        {totals.fineWt ? <span>{sales ? "Customer owes" : "You owe supplier"} <strong>{formatGrams(totals.fineWt / 1000)} fine</strong> {metal}</span> : null}
+        {totals.fineRs ? <span>Metal billed in rupees: {formatGrams(totals.fineRs / 1000)} fine</span> : null}
         <span>
-          Value {formatValue(totals.value, "money")} + GST {formatValue(tax, "money")} ≈ <strong>{formatValue(totals.value + tax, "money")}</strong>
+          Value {formatValue(totals.value / 100, "money")} + GST {formatValue(tax / 100, "money")} ≈ <strong>{formatValue((totals.value + tax) / 100, "money")}</strong>
         </span>
       </div>
-      <button className="button primary" onClick={() => void save()} disabled={!party || !items.some((i) => i.tunch && (i.gross || i.net))}>
-        Save {sales ? "sale" : "purchase"}
+      {problem ? <div className="callout warning">{problem}</div> : null}
+      <button className="button primary" onClick={() => void save()}
+        disabled={saving || !party || Boolean(problem) || !items.some((i) => i.tunch && (i.gross || i.net))}>
+        {saving ? "Saving…" : `Save ${sales ? "sale" : "purchase"}`}
       </button>
       {error ? <div className="callout warning">{error}</div> : null}
       <SavedVoucher voucher={saved} />
@@ -245,17 +270,23 @@ export function MetalMoveForm({ company, ledgers, onSaved }: Props) {
   const [refresh, setRefresh] = useState(0);
   const balance = usePartyMetal(company.id, party, refresh);
   const inward = vtype === "Metal Receipt";
-  const fineOf = (l: { net: string; tunch: string }) => roundTo((parseAmount(l.net) * parseAmount(l.tunch)) / 100, 3);
-  const total = lines.reduce((s, l) => s + fineOf(l), 0);
+  const [saving, guard] = useSaving();
+  // Whole mg, as the backend rounds net and tunch before fine_of.
+  const lineFine = (l: { net: string; tunch: string }) => fineOf(toMg(l.net), toBp(l.tunch));
+  const total = lines.reduce((s, l) => s + lineFine(l), 0);
   const now = balance[metal] ?? 0;
-  const after = roundTo(inward ? now - total : now + total, 3);
+  const after = (Math.round(now * 1000) + (inward ? -total : total)) / 1000;
+  const problem = badNumber(lines.flatMap((l, n): [string, string][] => {
+    const at = lines.length > 1 ? ` on line ${n + 1}` : "";
+    return [[`Net g${at}`, l.net], [`Tunch %${at}`, l.tunch]];
+  }));
 
-  async function save() {
+  const save = () => guard(async () => {
     setError(null);
     try {
       const voucher = await api.createMetalMove(company.id, {
         vtype, date, party_id: Number(party), metal, narration,
-        items: lines.filter((l) => l.net).map((l) => ({ item: l.item || null, net: l.net, tunch: parseAmount(l.tunch) || null })),
+        items: lines.filter((l) => l.net.trim()).map((l) => ({ item: l.item || null, net: l.net, tunch: parseAmount(l.tunch) || null })),
       });
       setSaved(voucher);
       setLines([{ item: "", net: "", tunch: lines[0].tunch }]);
@@ -264,7 +295,7 @@ export function MetalMoveForm({ company, ledgers, onSaved }: Props) {
     } catch (e) {
       setError((e as Error).message);
     }
-  }
+  });
 
   return (
     <div className="entry-grid">
@@ -303,12 +334,12 @@ export function MetalMoveForm({ company, ledgers, onSaved }: Props) {
                 <input value={line.item} placeholder="Old gold / bar" onChange={(e) => setLines((all) => all.map((x, j) => (j === i ? { ...x, item: e.target.value } : x)))} />
               </td>
               <td className="num">
-                <input inputMode="decimal" value={line.net} onChange={(e) => setLines((all) => all.map((x, j) => (j === i ? { ...x, net: e.target.value } : x)))} />
+                <NumberInput value={line.net} onChange={(e) => setLines((all) => all.map((x, j) => (j === i ? { ...x, net: e.target.value } : x)))} />
               </td>
               <td className="num">
-                <input inputMode="decimal" value={line.tunch} placeholder="99.5" onChange={(e) => setLines((all) => all.map((x, j) => (j === i ? { ...x, tunch: e.target.value } : x)))} />
+                <NumberInput value={line.tunch} placeholder="99.5" onChange={(e) => setLines((all) => all.map((x, j) => (j === i ? { ...x, tunch: e.target.value } : x)))} />
               </td>
-              <td className="num">{formatGrams(fineOf(line))}</td>
+              <td className="num">{formatGrams(lineFine(line) / 1000)}</td>
               <td>
                 {lines.length > 1 ? (
                   <button className="icon-button" onClick={() => setLines((all) => all.filter((_, j) => j !== i))} aria-label="Remove line">
@@ -337,8 +368,9 @@ export function MetalMoveForm({ company, ledgers, onSaved }: Props) {
         <span>Narration</span>
         <input value={narration} onChange={(e) => setNarration(e.target.value)} />
       </label>
-      <button className="button primary" onClick={() => void save()} disabled={!party || total <= 0}>
-        Save {inward ? "metal received" : "metal given"}
+      {problem ? <div className="callout warning">{problem}</div> : null}
+      <button className="button primary" onClick={() => void save()} disabled={saving || !party || total <= 0 || Boolean(problem)}>
+        {saving ? "Saving…" : `Save ${inward ? "metal received" : "metal given"}`}
       </button>
       {error ? <div className="callout warning">{error}</div> : null}
       <SavedVoucher voucher={saved} />
@@ -360,10 +392,15 @@ export function RateCutForm({ company, ledgers, onSaved }: Props) {
   const balance = usePartyMetal(company.id, party, refresh);
   const owed = balance[metal] ?? 0;
   const withMetal = ledgers.filter((l) => l.metal?.[metal]?.closing_mg);
-  const value = roundTo(parseAmount(fine) * parseAmount(rate), 2);
-  const tax = roundTo((value * parseAmount(gst)) / 100, 2);
+  const [saving, guard] = useSaving();
+  // Paise from whole mg and paise, as metal.rate_cut computes the value.
+  const fineMg = toMg(fine);
+  const ratePaise = toPaise(rate);
+  const value = halfUp(fineMg * ratePaise, 1000);
+  const tax = gstOn(value, gst);
+  const problem = badNumber([["Fine g", fine], ["Rate", rate], ["GST %", gst]]);
 
-  async function save() {
+  const save = () => guard(async () => {
     setError(null);
     try {
       const voucher = await api.createRateCut(company.id, { date, party_id: Number(party), metal, fine, rate, gst_rate: parseAmount(gst) });
@@ -374,7 +411,7 @@ export function RateCutForm({ company, ledgers, onSaved }: Props) {
     } catch (e) {
       setError((e as Error).message);
     }
-  }
+  });
 
   return (
     <div className="entry-grid">
@@ -406,27 +443,28 @@ export function RateCutForm({ company, ledgers, onSaved }: Props) {
       <div className="report-params">
         <label className="field">
           <span>Fine g to convert</span>
-          <input inputMode="decimal" value={fine} onChange={(e) => setFine(e.target.value)} />
+          <NumberInput value={fine} onChange={(e) => setFine(e.target.value)} />
         </label>
         <label className="field">
           <span>Rate ₹ per g fine</span>
-          <input inputMode="decimal" value={rate} onChange={(e) => setRate(e.target.value)} />
+          <NumberInput value={rate} onChange={(e) => setRate(e.target.value)} />
         </label>
         <label className="field">
           <span>GST %</span>
-          <input inputMode="decimal" value={gst} onChange={(e) => setGst(e.target.value)} />
+          <NumberInput value={gst} onChange={(e) => setGst(e.target.value)} />
         </label>
       </div>
       <p className="entry-summary">
         <span>
-          {formatGrams(parseAmount(fine))} × ₹{parseAmount(rate).toLocaleString("en-IN")} = {formatValue(value, "money")}
+          {formatGrams(fineMg / 1000)} × ₹{(ratePaise / 100).toLocaleString("en-IN")} = {formatValue(value / 100, "money")}
         </span>
         <span>
-          + GST {formatValue(tax, "money")} ≈ <strong>{formatValue(value + tax, "money")}</strong> {owed < 0 ? "payable to the party" : "from the party"}
+          + GST {formatValue(tax / 100, "money")} ≈ <strong>{formatValue((value + tax) / 100, "money")}</strong> {owed < 0 ? "payable to the party" : "from the party"}
         </span>
       </p>
-      <button className="button primary" onClick={() => void save()} disabled={!party || !parseAmount(fine) || !parseAmount(rate)}>
-        Save rate cut
+      {problem ? <div className="callout warning">{problem}</div> : null}
+      <button className="button primary" onClick={() => void save()} disabled={saving || !party || fineMg <= 0 || ratePaise <= 0 || Boolean(problem)}>
+        {saving ? "Saving…" : "Save rate cut"}
       </button>
       {error ? <div className="callout warning">{error}</div> : null}
       <SavedVoucher voucher={saved} />

@@ -144,17 +144,33 @@ function VoucherRowView({ voucher, showFine, open, onToggle, onCancel }: {
 }) {
   return (
     <>
-      <tr className={voucher.cancelled ? "row-cancelled" : undefined} onClick={onToggle} aria-expanded={Boolean(open)}>
+      {/* The row still opens on a click or tap; the number is a real button for keyboard and screen-reader users. */}
+      <tr className={voucher.cancelled ? "row-cancelled" : undefined} onClick={onToggle}>
         <td>{formatValue(voucher.date, "date")}</td>
         <td>{voucher.vtype}</td>
-        <td>{voucher.number}</td>
+        <td>
+          <button
+            type="button"
+            className="link-button"
+            style={{ fontSize: "inherit" }}
+            aria-expanded={Boolean(open)}
+            aria-controls={open ? `voucher-${voucher.id}` : undefined}
+            aria-label={`${voucher.vtype} ${voucher.number}, lines and bills`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggle();
+            }}
+          >
+            {voucher.number}
+          </button>
+        </td>
         <td className="wrap">{voucher.cancelled ? "Cancelled" : voucher.ledgers.join(", ")}</td>
         <td>{voucher.reference || ""}</td>
         <td className="num">{voucher.amount ? formatValue(voucher.amount / 100, "money") : ""}</td>
         {showFine ? <td className="num">{voucher.fine_mg ? formatGrams(voucher.fine_mg / 1000) : ""}</td> : null}
       </tr>
       {open ? (
-        <tr className="row-detail">
+        <tr className="row-detail" id={`voucher-${voucher.id}`}>
           <td colSpan={showFine ? 7 : 6}>
             <table className="data-table compact">
               <thead>
