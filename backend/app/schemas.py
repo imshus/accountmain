@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 ProviderId = Literal["openai", "anthropic"]
 
@@ -37,11 +38,25 @@ class CloudCopy(BaseModel):
     updated_at: datetime
 
 
+class MongoSummary(BaseModel):
+    """The live copy of the records in MongoDB (configured=False when it is not set up): uploads and conversations sent,
+    waiting or failed. Only host names are shown, never the connection string."""
+
+    configured: bool
+    hosts: list[str] = []
+    database: str | None = None
+    pending: int = 0
+    done: int = 0
+    failed: int = 0
+    last_error: str | None = None
+
+
 class Health(BaseModel):
     status: str
     providers: list[ProviderStatus]
     default_provider: ProviderId
     cloud: CloudSummary | None = None
+    mongo: MongoSummary | None = None
     storage_problem: str | None = None  # set when the backend cannot write its data folder
 
 
@@ -260,6 +275,65 @@ class ChatRequest(BaseModel):
 class FilesChatRequest(ChatRequest):
     """A chat over files shared in the conversation (the main chat screen)."""
     dataset_ids: list[int] = Field(default=[], max_length=10)  # none yet: general accounting questions
+
+
+class FollowupsRequest(BaseModel):
+    """The conversation so far (as a chat endpoint receives it), ending with the latest answer, and the data it is about."""
+    messages: list[ChatMessage] = Field(min_length=1)
+    dataset_ids: list[int] = Field(default=[], max_length=10)  # the home chat's files, or [id] for a single-file chat
+    book_id: int | None = None  # a sales + purchases set; wins over dataset_ids
+    provider: ProviderId | None = None
+
+
+class Followups(BaseModel):
+    suggestions: list[str]  # 0-3 short questions; empty when the model is not set up or failed
+
+
+# Chat history kept on the server: "home", an upload's chat ("ds-<id>") or a set's chat ("book-<id>").
+CHAT_SCOPE = r"^(home|ds-[0-9]+|book-[0-9]+)$"
+CHAT_ID = r"^[A-Za-z0-9_-]{1,64}$"
+MAX_CHAT_TURNS = 40
+
+
+def chat_time(value: int | float) -> int | float:
+    """Milliseconds since 1970: finite, from 0 up to the largest whole number JavaScript holds exactly."""
+    if not math.isfinite(value) or not 0 <= value <= 2**53 - 1:
+        raise ValueError("must be a time in milliseconds since 1970")
+    return int(value) if float(value).is_integer() else value
+
+
+class Conversation(BaseModel):
+    """One conversation as the app stores it. Only what the server relies on is checked: turns, documents and any
+    newer fields are kept exactly as sent, so the app's shape can grow."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str = Field(pattern=CHAT_ID)
+    title: str = ""
+    updated: int | float  # ms since epoch, set by the app on every change: the larger one wins
+    datasetIds: list[int] = []
+    documents: list[Any] = []
+    turns: list[Any] = Field(default=[], max_length=MAX_CHAT_TURNS)
+
+    @field_validator("updated")
+    @classmethod
+    def _milliseconds(cls, value: int | float) -> int | float:
+        return chat_time(value)
+
+
+class ChatTombstone(BaseModel):
+    id: str
+    updated: int | float
+
+
+class ChatList(BaseModel):
+    chats: list[dict[str, Any]]  # the conversations as stored, newest first
+    deleted: list[ChatTombstone]  # conversations deleted on any device: a device that still has one drops it
+
+
+class ChatSaved(BaseModel):
+    chat: dict[str, Any] | None  # the copy the server kept; None when a deletion as new or newer won
+    deleted: ChatTombstone | None = None  # that deletion
 
 
 class DocumentsRequest(BaseModel):

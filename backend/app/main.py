@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout  # the builtin TimeoutError only from Python 3.11
@@ -13,19 +15,21 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.exc import OperationalError
 
 from datetime import date
 
-from . import analysis, books, classify, cloud, config, database, detect, editing, llm, reports
+from . import analysis, books, classify, cloud, config, database, detect, editing, llm, mongo_sync, reports
 from .accounts import api as accounts_api
 from .accounts import db as _accounts_tables  # noqa: F401  (registers the books tables before create_all)
 from .analytics import profile_sheet
 from .calc import CalcError, evaluate_number, format_decimal
 from .duck import Session, cached, sheet_key
 from .excel_loader import UploadError, read_workbook
+from .llm import followups
 from .llm.common import describe_tables, warm_tables
 from .schemas import (
     AddRowRequest,
@@ -36,17 +40,25 @@ from .schemas import (
     CreateBookRequest,
     CalcRequest,
     CalcResult,
+    CHAT_ID,
+    CHAT_SCOPE,
+    ChatList,
     ChatRequest,
     ChatResponse,
+    ChatSaved,
     ColumnCalcRequest,
     ColumnCalcResult,
     CloudSummary,
+    Conversation,
     DatasetDetail,
     DocumentsRequest,
     FilesChatRequest,
+    Followups,
+    FollowupsRequest,
     DatasetSummary,
     GstNetOut,
     Health,
+    MongoSummary,
     NotesRequest,
     QueryOut,
     Report,
@@ -55,6 +67,7 @@ from .schemas import (
     SetupRequest,
     SheetDetail,
     SqlRequest,
+    chat_time,
 )
 
 # Older turns beyond this are dropped; the table context is resent every turn anyway.
@@ -75,6 +88,7 @@ async def lifespan(_app: FastAPI):
         if not problem:
             print(f"The database is read-only, so nothing can be saved until that is fixed: {exc}")
     cloud.resume()  # copies to Supabase that were still waiting when the backend stopped
+    mongo_sync.start()  # the live copy of the records in MongoDB, when set up
     if config.openai_configured():
         threading.Thread(target=llm.gpt.warm_up, daemon=True).start()  # the first question skips the handshake
     yield
@@ -110,8 +124,35 @@ class _ErrorsAsJson:
             await JSONResponse({"detail": detail}, status_code=500)(scope, receive, send)
 
 
+class _ChatBodyLimit:
+    """A conversation sent to PUT /api/chats is refused (413) as soon as it is known to be too large: from its
+    Content-Length, or while a body without one arrives. It is never read whole and parsed first."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] != "PUT" or not scope["path"].startswith("/api/chats/"):
+            return await self.app(scope, receive, send)
+        length = dict(scope["headers"]).get(b"content-length", b"")
+        if length.isdigit() and int(length) > MAX_CHAT_BODY:
+            return await JSONResponse({"detail": CHAT_TOO_LARGE}, status_code=413)(scope, receive, send)
+        received = 0
+
+        async def counted():
+            nonlocal received
+            message = await receive()
+            received += len(message.get("body", b""))
+            if received > MAX_CHAT_BODY:
+                raise HTTPException(status_code=413, detail=CHAT_TOO_LARGE)
+            return message
+
+        await self.app(scope, counted, send)
+
+
 app = FastAPI(title="Accounts.ai API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(_ErrorsAsJson)  # added first, so it runs inside CORSMiddleware
+app.add_middleware(_ChatBodyLimit)  # inside CORSMiddleware too, so the app can read its 413
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
@@ -160,7 +201,7 @@ def _detail(dataset: dict) -> dict:
 @app.get("/api/health", response_model=Health)
 def health():
     return {"status": "ok", "providers": llm.provider_status(), "default_provider": llm.default_provider(),
-            "cloud": cloud.summary(), "storage_problem": database.storage_problem()}
+            "cloud": cloud.summary(), "mongo": mongo_sync.summary(), "storage_problem": database.storage_problem()}
 
 
 @app.post("/api/upload", response_model=DatasetDetail, status_code=201)
@@ -188,6 +229,7 @@ def upload(file: UploadFile = File(...)):
         cloud.enqueue(dataset_id, filename, content)  # background copy to Supabase, when set up
     except Exception as exc:  # noqa: BLE001 - the upload has succeeded; the copy must never turn it into an error
         print(f"Supabase copy of upload {dataset_id} not queued ({type(exc).__name__}).")
+    mongo_sync.touch("upload", dataset_id)  # after enqueue, so MongoDB's copy shows the Supabase copy as waiting
     return _detail(_dataset_or_404(dataset_id))
 
 
@@ -205,6 +247,20 @@ def cloud_retry():
     return {"retried": cloud.retry_failed()}
 
 
+@app.get("/api/mongo", response_model=MongoSummary)
+def mongo_summary():
+    """The live copy of the records in MongoDB: how many uploads and conversations are sent, waiting or failed."""
+    return mongo_sync.summary()
+
+
+@app.post("/api/mongo/retry")
+def mongo_retry():
+    """Send every failed record again (e.g. after fixing MONGODB_URI in backend/.env and restarting)."""
+    if not mongo_sync.configured():
+        raise HTTPException(status_code=409, detail="MongoDB is not set up: add MONGODB_URI to backend/.env and restart the backend.")
+    return {"retried": mongo_sync.retry_failed()}
+
+
 @app.get("/api/datasets", response_model=list[DatasetSummary])
 def list_datasets():
     return database.list_datasets()
@@ -219,6 +275,8 @@ def get_dataset(dataset_id: int):
 def delete_dataset(dataset_id: int):
     if not database.delete_dataset(dataset_id):
         raise HTTPException(status_code=404, detail="Upload not found.")
+    mongo_sync.touch("upload", dataset_id)
+    _delete_chats(f"ds-{dataset_id}")
 
 
 def _sql(sheets: list[dict], sql: str, extra: dict | None = None) -> dict:
@@ -280,6 +338,7 @@ def calculate_column(dataset_id: int, table_name: str, body: ColumnCalcRequest):
         if body.save_as:
             name = editing.save_column(sheet, body.save_as, result, frame)
             editing.refresh_profile(sheet, {"columns": 1}, {name: body.save_as.strip()})
+            mongo_sync.touch("upload", dataset_id)
             out |= {"saved_column": name, "sheet": _fresh_sheet(dataset_id, table_name)}
     except (CalcError, editing.EditError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -305,6 +364,7 @@ def add_row(dataset_id: int, table_name: str, body: AddRowRequest):
     except editing.EditError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     editing.refresh_profile(sheet, {"added": 1})
+    mongo_sync.touch("upload", dataset_id)
     return _fresh_sheet(dataset_id, table_name)
 
 
@@ -316,12 +376,14 @@ def delete_row(dataset_id: int, table_name: str, rowid: int):
     except editing.EditError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     editing.refresh_profile(sheet, {"deleted": 1})
+    mongo_sync.touch("upload", dataset_id)
     return _fresh_sheet(dataset_id, table_name)
 
 
 @app.put("/api/datasets/{dataset_id}/sheets/{table_name}/notes", response_model=SheetDetail)
 def save_notes(dataset_id: int, table_name: str, body: NotesRequest):
     editing.save_notes(_sheet_or_404(dataset_id, table_name), body.notes)
+    mongo_sync.touch("upload", dataset_id)
     return _fresh_sheet(dataset_id, table_name)
 
 
@@ -353,6 +415,7 @@ def save_setup(dataset_id: int, table_name: str, body: SetupRequest):
         editing.save_setup(sheet, body.mapping, body.classification)
     except editing.EditError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    mongo_sync.touch("upload", dataset_id)
     return _setup(_sheet_or_404(dataset_id, table_name))
 
 
@@ -698,6 +761,7 @@ def set_book_sheets(book_id: int, body: BookRegistersRequest):
 def delete_book(book_id: int):
     if not database.delete_book(book_id):
         raise HTTPException(status_code=404, detail="Books not found.")
+    _delete_chats(f"book-{book_id}")
 
 
 @app.get("/api/books/{book_id}/reports/{kind}", response_model=Report)
@@ -763,3 +827,82 @@ def book_chat(book_id: int, body: ChatRequest):
         return llm.chat(body.provider, _chat_messages(body), sheets, extra)
     except llm.LLMError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
+@app.post("/api/chat/followups", response_model=Followups)
+def chat_followups(body: FollowupsRequest):
+    """Up to three short questions the person may ask next (the chips under an answer), about the same data as the
+    chat: the set's registers (book_id), else the shared files (dataset_ids), else none. Empty when the model fails."""
+    if body.book_id is not None:
+        sheets, extra = _book_tables(_book_or_404(body.book_id))
+    else:
+        sheets, extra = _shared_files(body.dataset_ids)[0], None
+    # Any length, as for the chat. Older turns are dropped, though more are kept than for an answer: the earlier
+    # questions are listed to the model so that none is suggested again.
+    messages = [m.model_dump() for m in body.messages][-2 * MAX_CHAT_MESSAGES:]
+    return {"suggestions": followups.suggest(messages, sheets, extra, body.provider)}
+
+
+# --- Chat history, kept here so that every device shows the same conversations ----------------
+
+MAX_CHAT_BYTES = 2 * 1024 * 1024
+MAX_CHAT_BODY = MAX_CHAT_BYTES + MAX_CHAT_BYTES // 4  # a body this large is refused before it is parsed
+CHAT_TOO_LARGE = "This conversation is larger than 2 MB; start a new chat to go on."
+# Conversations kept per scope (the app keeps 30): older ones become deletions at their own time, so the history a
+# device reads stays bounded.
+MAX_CHATS_PER_SCOPE = 100
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _delete_chats(scope: str) -> None:
+    """The upload or set of this scope was deleted: so are its conversations, on every device and in MongoDB."""
+    for chat_id in database.delete_scope_chats(scope):
+        mongo_sync.touch("chat", f"{scope}/{chat_id}")
+
+
+@app.get("/api/chats", response_model=ChatList)
+def list_chats(scope: str = Query(pattern=CHAT_SCOPE, max_length=40)):
+    """The scope's conversations, newest first, and those deleted on any device (a device that still has one drops it)."""
+    chats, deleted = database.list_chats(scope, MAX_CHATS_PER_SCOPE)
+    return {"chats": chats, "deleted": deleted}
+
+
+@app.put("/api/chats/{scope}/{chat_id}", response_model=ChatSaved)
+def save_chat(body: Conversation, scope: str = PathParam(pattern=CHAT_SCOPE, max_length=40),
+              chat_id: str = PathParam(pattern=CHAT_ID)):
+    """Keep the newer copy: the body when its "updated" is larger than that of the server's copy or deletion (equal: the
+    server's). Returns the copy kept, so a device holding an older one replaces it."""
+    if body.id != chat_id:
+        raise HTTPException(status_code=422, detail="The conversation's id does not match the address.")
+    try:
+        data = json.dumps(body.model_dump(), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except ValueError as exc:  # NaN or Infinity, which JSON (and so the app) cannot read back
+        raise HTTPException(status_code=422, detail="The conversation holds a number that is not finite.") from exc
+    # Half of a surrogate pair (a title cut in the middle of an emoji) cannot be stored as UTF-8 here or in MongoDB: it
+    # becomes U+FFFD. A whole pair is already one character.
+    data = _LONE_SURROGATE.sub("\ufffd", data)
+    # The app measures 2 MB on its own JSON; written again here a number can grow (1e-7 becomes 1e-07), so the limit
+    # here is the body's.
+    if len(data.encode()) > MAX_CHAT_BODY:
+        raise HTTPException(status_code=413, detail=CHAT_TOO_LARGE)
+    if not database.chat_scope_exists(scope):
+        # The upload or set was deleted (a device that did not know yet kept answering in it): the conversation goes
+        # too, so the device drops it. Nothing is stored for a scope that does not exist. Not a 404, which the app
+        # reads as a server without these routes.
+        return {"chat": None, "deleted": {"id": chat_id, "updated": max(int(time.time() * 1000), body.updated)}}
+    kept = database.save_chat(scope, chat_id, body.updated, data)
+    mongo_sync.touch("chat", f"{scope}/{chat_id}")
+    for old, updated in database.trim_chats(scope, MAX_CHATS_PER_SCOPE):
+        mongo_sync.touch("chat", f"{scope}/{old}")
+        if old == chat_id:  # older than every conversation kept
+            kept = {"chat": None, "deleted": {"id": old, "updated": updated}}
+    return kept
+
+
+@app.delete("/api/chats/{scope}/{chat_id}", status_code=204)
+def delete_chat(scope: str = PathParam(pattern=CHAT_SCOPE, max_length=40), chat_id: str = PathParam(pattern=CHAT_ID),
+                updated: float | None = Query(None, ge=0, le=2**53 - 1, allow_inf_nan=False)):
+    """Delete a conversation on every device: a tombstone at ``updated`` (ms since 1970; default now), unless the
+    server's copy is newer."""
+    database.delete_chat(scope, chat_id, int(time.time() * 1000) if updated is None else chat_time(updated))
+    mongo_sync.touch("chat", f"{scope}/{chat_id}")

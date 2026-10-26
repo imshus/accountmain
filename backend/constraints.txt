@@ -5,6 +5,7 @@ annotated-types==0.8.0
 anthropic==2.1.0
 anyio==4.15.1
 click==8.5.0
+dnspython==2.9.0
 docstring_parser==0.18.0
 duckdb==2.0.0
 et_xmlfile==2.0.0
@@ -21,6 +22,7 @@ opentelemetry-api==1.45.1
 pandas==3.0.6
 pydantic==2.14.1
 pydantic_core==2.50.1
+pymongo==4.19.0
 python-dateutil==3.0.0
 python-dotenv==1.2.4
 python-multipart==0.0.32

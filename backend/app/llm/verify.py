@@ -16,6 +16,7 @@ from __future__ import annotations
 import bisect
 import math
 import re
+import unicodedata
 
 import numpy as np
 
@@ -25,9 +26,12 @@ _SCALE = {
     "million": 1e6, "mn": 1e6,
     "crore": 1e7, "crores": 1e7, "cr": 1e7, "cr.": 1e7,
     "billion": 1e9, "bn": 1e9,
+    # In Devanagari, looked up without the nukta (करोड़ -> करोड, हज़ार -> हजार); see _unit_key.
+    "हजार": 1e3, "लाख": 1e5, "लाखों": 1e5, "करोड": 1e7,
 }
 _CURRENCY_MARK = "\x00"  # stands in for ₹ / Rs / INR, so "(₹1,234)" is not mistaken for a negative "(1,234)"
-_UNIT = r"(?:(?i:thousand|lakhs?|lacs?|lakh|million|mn|crores?|cr\.?|billion|bn)|[kK]|L)"
+_UNIT = (r"(?:(?i:thousand|lakhs?|lacs?|lakh|million|mn|crores?|cr\.?|billion|bn)|[kK]|L"
+         r"|ह(?:ज\u093c?|\u095b)ार|लाख(?:ों)?|करो(?:ड\u093c?|\u095c))")  # हज़ार, लाख, लाखों, करोड़, with or without the nukta
 # Numbers as people write them: -1,23,456.78  1,234,567  12.5%  35.37 lakh  2.5Cr  500/-.
 # Digits glued to letters, hyphens or slashes (GSTR-3B, 26AS, 194C, S/0071) are identifiers; the second
 # number of a range such as 1,000-2,000 is still read.
@@ -55,11 +59,12 @@ _DATES = re.compile(
     re.IGNORECASE,
 )
 # Legal references and document numbers: Section 49, Rule 88A, Rules 42 and 43, Table 3.1(a), Form 26AS,
-# u/s 194C, Invoice No. 45. They are not amounts.
+# u/s 194C, Invoice No. 45, AS 29, Ind AS 115. They are not amounts. "AS" only in capitals: "shown as 500" is one.
 _REF = r"\d+(?:\.\d+)*[A-Za-z]*(?:\([0-9A-Za-z]+\))*(?![.,]?\d)"
 _REFERENCES = re.compile(
     r"(?:\b(?:sections?|secs?\.?|rules?|tables?|form|schedules?|articles?|clauses?|chapters?|paras?|paragraphs?"
     r"|annexures?|notifications?|circulars?)\s+"
+    r"|(?-i:\b(?:Ind\s+|IND\s+)?AS)\s+"
     r"|\bu/s\.?\s*"
     r"|\b(?:invoice|inv|bill|voucher|challan|sr|s|serial|ref|entry|order|receipt)\.?\s*(?:no\.?|number|#)\s*[-#:]?\s*)"
     rf"{_REF}(?:\s*(?:,|&|and|or|to|-|–)\s*{_REF})*(?!\s?%)",
@@ -68,6 +73,11 @@ _REFERENCES = re.compile(
 _CURRENCY = re.compile(r"₹\s*|\b(?:Rs|INR)\b\.?\s*(?=[-−–]?\d)", re.IGNORECASE)
 _LIST_MARKER = re.compile(r"^\s*\d+[.)]\s", re.MULTILINE)
 _TOTAL_ROWS = 25  # a tool result this short holds totals, not a listing, so its values may be combined
+
+
+def _unit_key(unit: str) -> str:
+    """The _SCALE key of a unit as written: lower case, and Devanagari without the nukta (करोड़ is typed both ways)."""
+    return unicodedata.normalize("NFD", unit).replace("\u093c", "").lower()
 
 
 def _face_too(unit: str, face: float, grouped: bool, currency: bool, decimals: int) -> bool:
@@ -110,7 +120,7 @@ def _figures(text: str) -> list[dict]:
         face = float(number.replace(",", ""))
         decimals = len(number.split(".")[1]) if "." in number else 0
         percent = bool(match.group("percent"))
-        unit = (match.group("unit") or "").lower()
+        unit = _unit_key(match.group("unit") or "")
         before, after = cleaned[:match.start()].rstrip(), cleaned[match.end():].lstrip()
         sign = (match.group("sign") or "").replace(_CURRENCY_MARK, "")
         currency = _CURRENCY_MARK in match.group(0) or before.endswith(_CURRENCY_MARK)
@@ -155,20 +165,34 @@ def figures_in(text: str) -> list[tuple[str, float, int, bool]]:
 
 
 _WESTERN = re.compile(r"(?<![\d,.])(\d{1,3}(?:,\d{3})+)(\.\d+)?(?![\d,])")
+# Commas in the wrong places, as in 1,19,26,34.00 for 11,92,634.00, which no figure pattern reads. Only amounts with
+# paise: without them, 1,19,26,34 may be a list. Not inside a longer token (v1,2,3.4; 1.1,19,26,34.00; 1,19,26,34.00,5).
+_MISGROUPED = re.compile(r"(?<![\w,/])(?<!\d\.)(\d{1,3}(?:,\d{2,3})+)(\.\d{1,2})(?![\w,]|\.\d)")
+_INDIAN = re.compile(r"\d{1,2}(?:,\d{2})*,\d{3}")
+
+
+def _indian(whole: int) -> str:
+    digits = str(whole)
+    head, tail = digits[:-3], digits[-3:]
+    pairs = [head[max(0, i - 2):i] for i in range(len(head), 0, -2)][::-1]
+    return ",".join(pairs + [tail])
 
 
 def indian_digits(text: str) -> str:
-    """Rewrite Western digit grouping as Indian (2,328,413.00 -> 23,28,413.00); smaller numbers look the same."""
+    """Rewrite Western digit grouping as Indian (2,328,413.00 -> 23,28,413.00), and misplaced commas too
+    (1,19,26,34.00 -> 11,92,634.00), so the figure can be checked; smaller numbers look the same."""
     def regroup(match: re.Match) -> str:
         whole = int(match.group(1).replace(",", ""))
         if whole < 100_000:
             return match.group(0)
-        digits = str(whole)
-        head, tail = digits[:-3], digits[-3:]
-        pairs = [head[max(0, i - 2):i] for i in range(len(head), 0, -2)][::-1]
-        return ",".join(pairs + [tail]) + (match.group(2) or "")
+        return _indian(whole) + (match.group(2) or "")
 
-    return _WESTERN.sub(regroup, text)
+    def misgrouped(match: re.Match) -> str:
+        if _INDIAN.fullmatch(match.group(1)):
+            return match.group(0)
+        return _indian(int(match.group(1).replace(",", ""))) + match.group(2)
+
+    return _MISGROUPED.sub(misgrouped, _WESTERN.sub(regroup, text))
 
 
 class Known(list):
@@ -335,6 +359,11 @@ def _ratios(figures: list[dict], local: list[tuple], operands: np.ndarray, amoun
     return found
 
 
+# A grouped figure cut off mid-way ("12,00,?", "11,92,**"): no number can be read from it, so it is reported as
+# unverified (which asks for a correction) instead of slipping through as text.
+_BROKEN = re.compile(r"(?<![\w,.])\d{1,3}(?:,\d{2,3})+,(?![\d\s])")
+
+
 def _precise(figure: dict) -> bool:
     # Arithmetic counts only for figures precise enough that a coincidence is unlikely.
     return figure["percent"] or figure["decimals"] > 0 or figure["face"] >= 1000
@@ -367,11 +396,12 @@ def verify(answer: str, known: list[float]) -> dict:
         ratios = _ratios(open_percents, local, operands, near)
         derived |= {id(f) for f, ok in zip(open_percents, _sums(open_percents, percents) | ratios) if ok}
         unverified = [f["token"] for f, v in zip(figures, direct) if v is None and id(f) not in derived]
-    unique = list(dict.fromkeys(unverified))
-    if not figures:
+    broken = [m.group(0) for m in _BROKEN.finditer(answer)]
+    unique = list(dict.fromkeys(unverified + broken))
+    if not figures and not broken:
         status = "no_figures"
     elif unique:
         status = "unverified"
     else:
         status = "verified"
-    return {"status": status, "figures": len(figures), "unverified": unique}
+    return {"status": status, "figures": len(figures) + len(broken), "unverified": unique}

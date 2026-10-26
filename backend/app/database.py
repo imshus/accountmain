@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -31,9 +32,12 @@ from sqlalchemy import (
     create_engine,
     delete,
     event,
+    func,
     insert,
     select,
+    update,
 )
+from sqlalchemy.dialects.sqlite import insert as upsert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
 
@@ -103,11 +107,25 @@ book_sheets = Table(
 # The highest upload id ever handed out. SQLite reuses the largest id once that row is deleted, and a
 # corrected re-upload would then get the deleted file's table names, so cached tables, cached answers,
 # books and "already imported" voucher marks would all point at the new file as if it were the old one.
+# The same for set ids ("books"): a new set must not get a deleted set's conversations ("book-<id>").
 id_high_water = Table(
     "id_high_water",
     metadata,
     Column("name", String(50), primary_key=True),
     Column("value", Integer, nullable=False),
+)
+
+# Chat conversations as the app stores them, per scope ("home", "ds-<upload id>" or "book-<set id>"), so every device
+# sees the same history. A deleted conversation stays as a tombstone (deleted, no data), so a device that still has
+# it drops it instead of sending it back.
+chats = Table(
+    "chats",
+    metadata,
+    Column("scope", String(40), primary_key=True),
+    Column("chat_id", String(64), primary_key=True),
+    Column("updated", Integer, nullable=False),  # ms since epoch, set by the app on every change
+    Column("deleted", Boolean, nullable=False),
+    Column("data", Text),  # the conversation's JSON; NULL for a tombstone
 )
 
 
@@ -148,6 +166,8 @@ def init_db() -> None:
                 conn.exec_driver_sql(trigger)
         if conn.execute(select(id_high_water.c.value).where(id_high_water.c.name == "datasets")).first() is None:
             conn.execute(insert(id_high_water).values(name="datasets", value=_highest_dataset_id(conn)))
+        if conn.execute(select(id_high_water.c.value).where(id_high_water.c.name == "books")).first() is None:
+            conn.execute(insert(id_high_water).values(name="books", value=_highest_book_id(conn)))
 
 
 # Places that still name an upload's tables (ds<id>_...) after the upload itself is deleted.
@@ -182,6 +202,27 @@ def _next_dataset_id(conn) -> int:
         return row[0]
     value = _highest_dataset_id(conn) + 1
     conn.execute(insert(id_high_water).values(name="datasets", value=value))
+    return value
+
+
+def _highest_book_id(conn) -> int:
+    """The largest set id in use or named by a conversation ("book-<id>"); databases made before sets were tracked in
+    id_high_water start from it."""
+    scopes = conn.execute(select(chats.c.scope).where(chats.c.scope.like("book-%")).distinct()).scalars()
+    highest = conn.exec_driver_sql("SELECT COALESCE(MAX(id), 0) FROM books").scalar()
+    return max([highest, *(int(scope[5:]) for scope in scopes if scope[5:].isdigit())])
+
+
+def _next_book_id(conn) -> int:
+    """A new set id, never one used before (call inside the transaction that adds the set)."""
+    row = conn.exec_driver_sql(
+        "UPDATE id_high_water SET value = max(value, (SELECT COALESCE(MAX(id), 0) FROM books)) + 1 "
+        "WHERE name = 'books' RETURNING value"
+    ).first()
+    if row is not None:
+        return row[0]
+    value = _highest_book_id(conn) + 1
+    conn.execute(insert(id_high_water).values(name="books", value=value))
     return value
 
 
@@ -296,9 +337,8 @@ def _load_profile(profile_json: str) -> dict:
 def create_book(name: str, registers: list[tuple[str, str]]) -> int:
     """registers: (table_name, "sales" | "purchases" | "unused") pairs."""
     with engine.begin() as conn:
-        book_id = conn.execute(
-            insert(books).values(name=name, created_at=datetime.now(timezone.utc))
-        ).inserted_primary_key[0]
+        book_id = _next_book_id(conn)
+        conn.execute(insert(books).values(id=book_id, name=name, created_at=datetime.now(timezone.utc)))
         for table_name, register in registers:
             conn.execute(insert(book_sheets).values(book_id=book_id, table_name=table_name, register=register))
     return book_id
@@ -396,6 +436,87 @@ def delete_dataset(dataset_id: int) -> bool:
 def read_preview(table_name: str, limit: int) -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql_query(f"SELECT * FROM {quote_ident(table_name)} LIMIT {int(limit)}", conn)
+
+
+# --- Chat history ------------------------------------------------------------------------
+
+
+# At most this many deletions (the newest) go out with a scope's list, so the list stays bounded. All of them stay
+# stored: a device still holding an older one is answered with its deletion when it sends that conversation.
+MAX_TOMBSTONES = 500
+
+
+def chat_scope_exists(scope: str) -> bool:
+    """Whether the upload ("ds-<id>") or set ("book-<id>") a conversation belongs to still exists; "home" always does."""
+    kind, _, number = scope.partition("-")
+    table = {"ds": datasets, "book": books}.get(kind)
+    if table is None:
+        return True
+    with engine.connect() as conn:
+        return conn.execute(select(table.c.id).where(table.c.id == int(number))).first() is not None
+
+
+def list_chats(scope: str, limit: int | None = None) -> tuple[list[dict], list[dict]]:
+    """The scope's conversations (the ``limit`` newest, newest first) and its newest tombstones ({"id", "updated"})."""
+    live = (chats.c.scope == scope) & ~chats.c.deleted
+    with engine.connect() as conn:
+        kept = conn.execute(select(chats.c.data).where(live).order_by(chats.c.updated.desc(), chats.c.chat_id)
+                            .limit(limit)).scalars().all()
+        gone = conn.execute(select(chats.c.chat_id, chats.c.updated).where((chats.c.scope == scope) & chats.c.deleted)
+                            .order_by(chats.c.updated.desc()).limit(MAX_TOMBSTONES)).all()
+    return [json.loads(data) for data in kept], [{"id": chat_id, "updated": updated} for chat_id, updated in gone]
+
+
+def trim_chats(scope: str, keep: int) -> list[tuple[str, int | float]]:
+    """Turn every conversation of the scope but the ``keep`` newest into a tombstone at its own time (a device that
+    still has that copy drops it; a later edit revives it). Returns their (id, updated)."""
+    live = (chats.c.scope == scope) & ~chats.c.deleted
+    newest = select(chats.c.chat_id).where(live).order_by(chats.c.updated.desc(), chats.c.chat_id).limit(keep)
+    with engine.begin() as conn:  # one statement: a conversation saved meanwhile is never the one dropped
+        return [tuple(row) for row in conn.execute(update(chats).where(live & chats.c.chat_id.not_in(newest))
+                                                   .values(deleted=True, data=None)
+                                                   .returning(chats.c.chat_id, chats.c.updated))]
+
+
+def delete_scope_chats(scope: str) -> list[str]:
+    """Delete every conversation of a scope whose upload or set was deleted: each becomes a tombstone at now (or at its
+    own time, should a device's clock be ahead), so a device that still has it drops it. Returns their ids."""
+    now = int(time.time() * 1000)
+    with engine.begin() as conn:
+        return conn.execute(update(chats).where((chats.c.scope == scope) & ~chats.c.deleted)
+                            .values(deleted=True, data=None, updated=func.max(chats.c.updated, now))
+                            .returning(chats.c.chat_id)).scalars().all()
+
+
+def _kept_chat(row) -> dict:
+    if row["deleted"]:
+        return {"chat": None, "deleted": {"id": row["chat_id"], "updated": row["updated"]}}
+    return {"chat": json.loads(row["data"]), "deleted": None}
+
+
+def _keep_newer(scope: str, chat_id: str, values: dict, wins) -> dict:
+    """Store ``values`` only where ``wins`` (a comparison of the new row with the stored one) holds, and return what is
+    kept. One statement decides and writes, so two devices saving at the same moment cannot lose the newer copy."""
+    statement = upsert(chats).values(scope=scope, chat_id=chat_id, **values)
+    statement = statement.on_conflict_do_update(
+        index_elements=[chats.c.scope, chats.c.chat_id], set_=values, where=wins(statement.excluded))
+    with engine.begin() as conn:
+        conn.execute(statement)  # the transaction now holds the write lock, so the row read back is the one kept
+        row = conn.execute(select(chats).where((chats.c.scope == scope) & (chats.c.chat_id == chat_id))).mappings().one()
+    return _kept_chat(row)
+
+
+def save_chat(scope: str, chat_id: str, updated: int | float, data: str) -> dict:
+    """Keep the conversation (JSON ``data``) unless the stored copy or tombstone is as new or newer. Returns
+    {"chat": the conversation kept, "deleted": None}, or {"chat": None, "deleted": {"id", "updated"}}."""
+    return _keep_newer(scope, chat_id, {"updated": updated, "deleted": False, "data": data},
+                       lambda new: new.updated > chats.c.updated)
+
+
+def delete_chat(scope: str, chat_id: str, updated: int | float) -> dict:
+    """Leave a tombstone at ``updated`` unless the stored conversation is newer."""
+    return _keep_newer(scope, chat_id, {"updated": updated, "deleted": True, "data": None},
+                       lambda new: new.updated >= chats.c.updated)
 
 
 # --- Guarded read-only queries ---------------------------------------------------------

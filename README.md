@@ -172,6 +172,38 @@ other's documents. `GET /api/health` and `GET /api/cloud` show how many copies a
 upload's detail (`GET /api/datasets/{id}`) shows its copy's status and path. Deleting an upload in the app keeps
 its copy in Supabase. The key never leaves the server; the apps do not talk to Supabase directly.
 
+## MongoDB live copy of records (optional)
+
+With `MONGODB_URI` in `backend/.env`, the backend keeps a live copy of the app's records in MongoDB (database
+`MONGODB_DB`, default `accountsai`): collection **uploads**, one document per upload (`_id` = upload id: file name,
+size, upload time, each sheet's statistics, notes and report setup — column roles and account groups — and the state
+of its Supabase copy), and collection **chats**, one document per conversation (`_id` = `<scope>/<id>`: title, time,
+files, turns). Each change (an upload, an entry added or deleted, a calculated column, notes, setup, a chat saved, the
+Supabase copy's state) is sent within seconds, and a deleted upload or conversation is deleted there too (deleting an
+upload or a set also deletes its conversations). Not copied: the sheets' rows, the company books and vouchers, and the
+uploaded files themselves (see Supabase above). SQLite stays the main copy, so MongoDB never slows a request down or
+makes it fail: while it cannot be reached, records wait in the `mongo_sync` table and are retried. A pass at startup and
+every 5 minutes sends every record that changed since MongoDB last confirmed it, every record when `MONGODB_DB` or the
+cluster changed, and every record MongoDB no longer holds (a collection emptied in Atlas), so uploads and chats made
+before MongoDB was set up are copied too. A change made to a document directly in MongoDB is not detected. Only
+problems retrying cannot fix (wrong password, no permission) are marked failed; after fixing them, restart the backend
+or call `POST /api/mongo/retry`.
+
+MongoDB Atlas:
+
+1. Create a free cluster at cloud.mongodb.com.
+2. **Database Access**: add a database user with a password and only the **readWrite** role on the database
+   `accountsai` (Specific Privileges), not Atlas admin.
+3. **Network Access**: add the server's public IP address, not `0.0.0.0/0`.
+4. **Connect → Drivers**: copy the `mongodb+srv://…` string and put the user's password in it, percent-encoded (`@`
+   as `%40`, `:` as `%3A`, `/` as `%2F`, `?` as `%3F`, `+` as `%2B`, `%` as `%25`; a `+` left as it is is read as a
+   space). `python -c "import urllib.parse; print(urllib.parse.quote_plus(input()))"` prints the encoded password.
+5. Add `MONGODB_URI=<that string>` to `backend/.env` (and `MONGODB_DB` if the database is not `accountsai`), then
+   restart the backend.
+6. `GET /api/mongo` (also in `GET /api/health`) shows the hosts, the database, how many records are sent, waiting or
+   failed, and the last error. The connection string and its password never appear in a message, log or answer; only
+   the host names do. A plain `mongodb://` address must use `tls=true` unless MongoDB runs on the same machine.
+
 ## API
 
 | Method | Path | Purpose |
@@ -179,12 +211,17 @@ its copy in Supabase. The key never leaves the server; the apps do not talk to S
 | GET | `/api/health` | Backend status and which chat models have API keys |
 | POST | `/api/upload` | Upload a spreadsheet (multipart field `file`); also copied to Supabase when set up |
 | GET / POST | `/api/cloud` · `/api/cloud/retry` | Supabase copies: counts; send failed copies again |
+| GET / POST | `/api/mongo` · `/api/mongo/retry` | MongoDB live copy: hosts, database, counts and the last error; send failed records again (409 when not set up) |
+| GET | `/api/chats?scope=home` | Chat history kept on the server, per scope (`home`, `ds-<upload id>`, `book-<set id>`): `{"chats": [conversation, ...], "deleted": [{"id", "updated"}]}`; `deleted` lists conversations removed on any device. The newest 100 conversations per scope are kept: older ones become deletions at their own time, and deleting an upload or a set deletes its conversations |
+| PUT | `/api/chats/{scope}/{id}` | Save a conversation `{"id", "title", "updated", "datasetIds", "documents", "turns"}` (at most 40 turns and 2 MB; a larger body is refused with 413 before it is read): the larger `updated` (ms) wins, equal keeps the server's copy; answers `{"chat": the copy kept}`, or `{"chat": null, "deleted": {"id", "updated"}}` when a deletion as new or newer won |
+| DELETE | `/api/chats/{scope}/{id}?updated=<ms>` | Delete a conversation on every device: a tombstone at that time (default now), unless the server's copy is newer |
 | GET / DELETE | `/api/datasets[/{id}]` | List, open or delete uploads |
 | POST | `/api/datasets/{id}/sql` | Run a read-only DuckDB `SELECT` |
 | GET | `/api/datasets/{id}/fields` · `/api/books/{id}/fields` | Tables and columns available to Analyse (kind and exact decimals) |
 | POST | `/api/datasets/{id}/analyse` · `/api/books/{id}/analyse` | Analyse: `{"table", "measures": [{"agg": "sum", "column"}], "group_by": [{"column", "bucket": "month"}], "filters": [{"column", "op", "value"}], "sort", "limit", "across"}` |
 | POST | `/api/datasets/{id}/chat` | Chat: `{"messages": [...], "provider": "openai"}` → answer, queries, calculations, formula checks, verification |
 | POST | `/api/chat/stream` | The home chat over the files shared in it: `{"dataset_ids": [...], "messages": [...]}`; streams Server-Sent Events (`step`, `delta`, `reset`, `analysis`, `done`, `error`). With a sales and a purchase register, the model also gets the app's exact comparison of the two. `/api/datasets/{id}/chat/stream` and `/api/books/{id}/chat/stream` stream the same way |
+| POST | `/api/chat/followups` | Up to three suggested next questions: `{"messages": [...], "dataset_ids": [...], "book_id": null, "provider": null}` → `{"suggestions": [...]}`; an empty list when the model is not set up or fails |
 | POST | `/api/documents` | What each shared file is: `{"dataset_ids": [...]}` → kind (sales, purchases, bank, ledger, other), confidence, reasons |
 | POST | `/api/ai/warm` | Opens the connection to OpenAI while the person types, so the first answer starts sooner |
 | POST | `/api/calc` | Exact calculator: `{"expression": "1,200 - 350.50"}` |
@@ -223,6 +260,7 @@ its copy in Supabase. The key never leaves the server; the apps do not talk to S
 | `OPENAI_MODEL` | `gpt-6-luna` | OpenAI model used for chat |
 | `OPENAI_REASONING_EFFORT` | `low` | Effort for the first answer, `none` … `max`; low answers about twice as fast as high, and every figure is still checked |
 | `OPENAI_REPAIR_EFFORT` | `medium` | Effort for the correction round, used only when a figure fails the check |
+| `OPENAI_FOLLOWUP_EFFORT` | `low` | Effort for the suggested next questions shown under an answer |
 | `OPENAI_SERVICE_TIER` | — | Set `priority` for faster processing from OpenAI at a higher price per token |
 | `ANTHROPIC_API_KEY` | — | Enables Claude as a second option in the chat |
 | `ANTHROPIC_MODEL` | `claude-opus-5-5` | Claude model used for chat |
@@ -231,6 +269,7 @@ its copy in Supabase. The key never leaves the server; the apps do not talk to S
 | `MAX_UPLOAD_MB` | `25` | Upload size limit |
 | `SUPABASE_URL` / `SUPABASE_SECRET_KEY` | — | Optional: also store every uploaded document in Supabase Storage (the https:// Project URL, and a secret key `sb_secret_…` from Supabase → Project Settings → API Keys; a legacy service_role key also works; `SUPABASE_SERVICE_KEY` is accepted as the name too) |
 | `SUPABASE_BUCKET` / `SUPABASE_FOLDER` | `documents` / `uploads` | Private bucket (created if missing; a public one is refused) and folder: `<folder>/<YYYY-MM>/<upload id>-<content fingerprint>-<file name>` |
+| `MONGODB_URI` / `MONGODB_DB` | — / `accountsai` | Optional: a live copy of the uploads (sheet statistics, notes, setup) and chat conversations in MongoDB; the `mongodb+srv://` string from Atlas (TLS with certificate checks is required for any host but this machine) |
 | `DATA_DIR` | `backend/data` | Where `accounts.db` is stored |
 
 ## Limits to know

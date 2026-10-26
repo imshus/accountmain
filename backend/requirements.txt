@@ -16,6 +16,10 @@ openai>=2.0,<3; python_version < "3.10"
 # duckdb 2.x has wheels for Python 3.11+ only.
 duckdb>=2.0; python_version >= "3.11"
 duckdb>=1.4,<2; python_version < "3.11"
+# The live MongoDB copy of the records (app/mongo_sync.py); it brings dnspython, needed for mongodb+srv:// addresses.
+# pymongo 4.19 needs Python 3.11+.
+pymongo>=4.19; python_version >= "3.11"
+pymongo>=4.10,<4.19; python_version < "3.11"
 # Lets pydantic and FastAPI read "str | None" annotations on Python 3.9.
 eval_type_backport>=0.2; python_version < "3.10"
 # SQLAlchemy's greenlet: 3.2.5 has no Windows wheel for Python 3.9 (building it needs a C++ compiler); Linux is unaffected.

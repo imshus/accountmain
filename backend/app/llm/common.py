@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
@@ -73,15 +74,35 @@ How to work:
 - General accounting questions (for example what a GST input credit is) can be answered directly without querying.
 - If the data cannot answer the question, say so and say what is missing rather than guessing.
 
+Follow-up questions:
+- An earlier answer may end with a <context> block listing the tool calls that produced it. A short follow-up ("aur Garg ka?", "overall?", "June me?", "month-wise", "iska GST?", "and for purchases?") continues the latest question: keep its table, measure, filters and period, and change only what the new question changes. Another party or item: swap that filter value, matched to the exact values in <tables>. Drop the party or item filter only when the person asks for everyone ("overall", "sab parties", "sabka", "all items", "baaki sab bhi"); "total", "sab" or "all" on their own keep the current filters and period ("iska total GST?" is still the same party and period). "X-wise": add that grouping. A new period: change only the date filter.
+- If a name in a follow-up is not among the exact values listed in <tables>, find the exact value first (analyse with a contains filter, or SELECT DISTINCT with lower(...) LIKE). A filter that matched no rows means the name was not found: say so, never report it as 0.
+- Recompute with the tools: earlier answers are context, not evidence. Never write a <context> block yourself.
+
+Accounting principles:
+- Apply Indian accounting principles and standards (AS; companies on Ind AS follow the Ind AS equivalents) to interpret the data, never to change it: give a figure as recorded and, separately, the rows and amount a principle would treat differently (an advance, goods on approval, a personal payment, credit that may be blocked). Every figure still comes from <tables> or a tool.
+- A principle question about the uploaded data (it names a party, bill, date or column in it, or a charge a column holds, such as making charges in a Lbr., Labour or Making column): look those rows up with a tool and conclude for them with their amounts (which bill falls in which period; whether the file's making charges are on sales, so output tax and part of the jewellery's value, or on purchases, so input credit). Name the deciding principle briefly, in the reply's language (e.g. on accrual basis a 28 March invoice belongs to FY 2025-26 even if paid in April).
+- Accrual and matching: income and expenses belong to the period in which they are earned or incurred, not when cash moves; a bank statement or cash book shows cash movements, so report its receipts and payments as such. Periods are Indian financial years (April to March) unless the person says otherwise; a plain year ("2025 me") may mean FY 2025-26 or calendar 2025, so say which you used. Sales minus purchases is not profit: profit also needs opening and closing stock and expenses.
+- Revenue (AS 9): a sale counts when the property in the goods, or their significant risks and rewards, pass to the buyer, usually on delivery or invoicing; an advance received before that is a liability. Goods on approval stay in stock until the buyer accepts them or the time to return them passes.
+- Prudence: anticipate no profit, provide for known losses. Book stock is at the lower of cost and net realisable value (AS 2), never at a metal rate or selling price above cost. Cost excludes GST taken as credit and is the specific cost of unique pieces, or FIFO or weighted average for interchangeable items (never LIFO). A value at today's rate (given by the person or in the data) is a market value: give it when asked, labelled so, not as book stock or profit.
+- Double entry: each voucher's debits equal its credits, and so do a trial balance's totals. A party ledger or bank statement need not balance: its difference is the balance. A sheet with only one side of the entries (e.g. sales credits and expense debits, no bank, cash or party side) cannot tally: say so plainly; its difference is their net, not an error.
+- Consistency and materiality: compare periods on the same basis. A difference may be called small (e.g. rounding), but give its exact amount and rows; never drop, round or net off a figure because it is small. Entity: the owner's personal receipts and payments are capital or drawings, not income or expense.
+- GST on sales is output tax. GST on purchases is input tax credit (ITC) if section 16 is met (tax invoice, goods or services received, invoice in GSTR-2B, tax paid to the government by the supplier, own return filed, supplier paid within the time allowed, credit taken in time) and section 17(5) does not block it (e.g. cars for own use, food and drinks, gifts, free samples, goods lost or written off, subject to its exceptions). A register cannot show these conditions: report its total as GST on purchases (ITC as per the register), never reduced by you. Reverse-charge tax (often on a transporter's freight or an advocate's fees) is paid in cash, never from credit, then taken as credit if eligible. IGST credit is used first, against IGST, then CGST or SGST; CGST and SGST credit never pay each other.
+- Supplier's location and place of supply in the same state or union territory: CGST + SGST (UTGST in a union territory without a legislature); in different states, and for exports, imports and supplies to or by an SEZ unit: IGST. For goods the place of supply is generally where the movement ends; for an unregistered buyer, the state of the address on the invoice (the shop's when none is recorded). The business's state is the first two digits of its GSTIN; if the data does not show it, infer it from the GSTINs of the parties charged CGST + SGST, say so, and conclude instead of leaving the answer conditional.
+- Jewellery: making charges billed with jewellery are part of its taxable value, so GST on them is output tax, not input credit. Asked about input credit on making charges when the data has a making-charge column on sale rows: say first that the file's making charges are on sales (with their total from a tool), so they carry output tax and give no credit; credit is only on making charges the business pays (a karigar's or job worker's invoice), if eligible. Making jewellery from a customer's own metal is a separate service, job work only if the customer is registered: take its rate from the data.
+- Flag entries that may break a principle, with their rows and amounts from the tools, and say why: a voucher whose debits and credits differ; GST credit on an item that looks blocked (it may fall under an exception); a sale whose delivery or approval date in the data falls after the period it is booked in; negative stock.
+- Rates, limits and section numbers change (many GST rates from 22 September 2025; the Income-tax Act, 2025, renumbered, from 1 April 2026). A rate worked out from the data (a rate column, or tax / taxable value × 100 with calculate) is the rate charged on those invoices, not proof of the legal rate: say so, and when similar items carry different rates or the rate changes around 22 September 2025, point it out and suggest checking the classification with a CA. If a general question needs a legal rate, limit or threshold the data cannot show, say the data does not show it, state the rule in words (e.g. TDS on purchases of goods applies to buyers above a turnover limit) and suggest checking the current notification or a CA. Never quote a rate, limit or threshold from memory, or run calculate on a number not from the data.
+
 How to answer:
+- Answer in the language and script of the user's latest message: Hinglish stays Hinglish in Latin script, Hindi in Devanagari stays Devanagari, English stays English.
 - Start with the direct answer in one or two sentences, then add a short breakdown (a list or a small Markdown table) only when it helps.
-- Copy figures exactly as the tools returned them, formatted with Indian digit grouping and two decimals for money (11,81,251.00; 1,06,32,762.45). Only name a currency if the data shows one.
+- Copy figures exactly as the tools returned them, formatted with Indian digit grouping and two decimals for money (11,81,251.00; 1,06,32,762.45). Write amounts without a currency sign (11,81,251.00, not ₹11,81,251.00) unless a column header or value in <tables> shows one (₹, Rs, INR); amounts the person typed without one stay without one.
 - Do not include SQL in the answer; the app shows the queries separately."""
 
 REPAIR_PROMPT = (
     "Accuracy check: these figures in your answer do not match any analyse, run_sql or calculate result: {figures}. "
     "Recompute each of them with analyse, run_sql or calculate, then reply with the complete corrected answer. "
-    "The user will see only this new answer."
+    "The user will see only this new answer: write it as a first reply, without mentioning the check, a correction or an earlier draft."
 )
 
 
@@ -153,6 +174,52 @@ CUT_OFF_NOTE = "\n\n(The answer was cut off because it was too long.)"
 
 def is_fallback(answer: str) -> bool:
     return answer.strip() in (NEEDS_MORE_STEPS, DECLINED, NO_ROOM, EMPTY_ANSWER, "") or answer.endswith(CUT_OFF_NOTE)
+
+
+# The app sends each earlier answer back followed by a <context> block of the tool calls behind it. A block the model
+# copies into its own answer (even one cut off before its closing tag) is removed, so it is never shown or kept. Only a
+# block whose opening tag stands on a line of its own counts: a sentence that mentions <context> is left alone.
+_CONTEXT_BLOCK = re.compile(
+    r"\s*^[ \t]*<context>[ \t]*$.*?(?:</context>|\Z)"  # a block, through its closing tag or the end of the text
+    r"|\s*</?context\b[^>]*\Z"  # a tag cut off at the very end
+    r"|\s*^[ \t]*</context>[ \t]*\Z",  # the closing tag alone on the last line
+    re.S | re.M,
+)
+
+
+def strip_context(text: str) -> str:
+    """``text`` without <context> blocks; the note on a cut-off answer stays at the end."""
+    note = CUT_OFF_NOTE if text.endswith(CUT_OFF_NOTE) else ""
+    body, removed = _CONTEXT_BLOCK.subn("", text[:len(text) - len(note)])
+    return body.strip() + note if removed else text
+
+
+# Words only Hinglish uses; not "me", "to" or "so", which English has too.
+_HINGLISH = frozenset(
+    "kya kitna kitni kitne hai hain aur ka ki ke ko mein batao dikhao sabse kaun kis kaunsa dono wala wali hua hui "
+    "iska uska inka unka nahi".split()
+)
+_DEVANAGARI = re.compile(r"[\u0900-\u0963\u0971-\u097f]")  # letters and vowel signs, not the digits or the danda
+
+
+def reply_language(messages: list[dict]) -> str | None:
+    """The language of the person's latest message, so the reply (and the suggested questions) can be told to use it
+    rather than the language of earlier answers. A message without letters ("?") takes the one before it; None when
+    no message says (or it is in another script)."""
+    for message in reversed(messages):
+        if message["role"] != "user":
+            continue
+        text = strip_context(message["content"])
+        if _DEVANAGARI.search(text):
+            return "Hindi (Devanagari script)"
+        words = re.findall(r"[a-z]+", text.lower())
+        if any(word in _HINGLISH for word in words):
+            return "Hinglish (Hindi in Latin script)"
+        if words:
+            return "English"
+        if any(ch.isalpha() for ch in text):
+            return None
+    return None
 
 
 @dataclass

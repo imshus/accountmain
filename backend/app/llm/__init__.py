@@ -20,10 +20,11 @@ from dataclasses import dataclass
 from .. import config
 from ..duck import sheet_key
 from . import claude, gpt
-from .common import REPAIR_PROMPT, CancelEvent, Cancelled, LLMError, Reply, Toolbox, build_instructions, is_fallback
+from .common import (EMPTY_ANSWER, REPAIR_PROMPT, CancelEvent, Cancelled, LLMError, Reply, Toolbox, build_instructions,
+                     is_fallback, reply_language, strip_context)
 from .verify import indian_digits, known_values, verify
 
-__all__ = ["CancelEvent", "Cancelled", "LLMError", "chat", "default_provider", "provider_status"]
+__all__ = ["CancelEvent", "Cancelled", "LLMError", "chat", "default_provider", "provider_status", "strip_context"]
 
 _MODEL_LABELS = {
     "gpt-6-luna": "GPT-6 Luna",
@@ -124,8 +125,12 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         out = provider.run(conversation, instructions, tools, emit, effort, **({"transcript": transcript} if transcript else {}))
         reply = out if isinstance(out, Reply) else Reply(*out)
         answer = indian_digits(reply.text)  # the model sometimes writes 2,328,413.00; accounts here read 23,28,413.00
+        answer = strip_context(answer) or EMPTY_ANSWER  # a copied <context> block is neither checked nor kept
         tools.check_cancelled()
         if not provider.streams:
+            emit({"type": "delta", "text": answer})
+        elif answer != reply.text:  # the streamed draft showed a <context> block (or Western digits): replace it
+            emit({"type": "reset"})
             emit({"type": "delta", "text": answer})
         return dataclasses.replace(reply, text=answer, complete=reply.complete and not is_fallback(answer))
 
@@ -136,6 +141,9 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         threading.Thread(target=tools.prepare, daemon=True).start()
         emit({"type": "step", "text": "Reading the question…"})
         instructions, dictionary = build_instructions(sheets, registers=bool(extra and "registers" in extra), documents=documents)
+        language = reply_language(messages)
+        if language:  # last, so the long start of the instructions stays the same and is served from the prompt cache
+            instructions += f"\n\nThe person's latest message is in {language}: reply in {language}."
         # Figures may come from what the person wrote, the data dictionary (computed by the app) or this answer's
         # tool results. Earlier answers are not evidence: a wrong figure there must not verify a repeat of it.
         known_text = [m["content"] for m in messages if m["role"] == "user"] + [dictionary]

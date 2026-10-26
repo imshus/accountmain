@@ -174,7 +174,8 @@ def _client() -> openai.OpenAI:
     global _CLIENT
     if _CLIENT is None:
         limits = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=90)
-        _CLIENT = openai.OpenAI(http_client=_HttpClient(limits=limits))
+        # A stalled answer fails within minutes instead of the SDK's 10 minutes x 3 tries.
+        _CLIENT = openai.OpenAI(http_client=_HttpClient(limits=limits), timeout=httpx.Timeout(120.0, connect=10.0), max_retries=1)
     return _CLIENT
 
 

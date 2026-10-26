@@ -214,6 +214,9 @@ def _write(statement) -> None:
 
 def _set(dataset_id: int, **values) -> None:
     _write(update(cloud_files).where(cloud_files.c.dataset_id == dataset_id).values(updated_at=_now(), **values))
+    from .mongo_sync import touch  # mongo_sync imports this module
+
+    touch("upload", dataset_id)  # MongoDB's copy of the upload shows the copy's new state (never raises)
 
 
 def _run(dataset_id: int) -> None:
