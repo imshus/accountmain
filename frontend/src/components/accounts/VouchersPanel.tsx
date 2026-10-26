@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../../api";
 import { formatCount, formatGrams, formatValue } from "../../format";
 import type { Company, VoucherDetail, VoucherRow } from "../../types";
+import { useBillTotals } from "../../screens/books/billTotal";
+import { Button, Sheet, Spinner } from "../../ui";
 
 type Props = {
   company: Company;
@@ -13,6 +15,8 @@ type Props = {
 const PAGE = 50;
 
 /** Every voucher, newest first, with filters; open one to see its lines and bills, or cancel it. */
+const NO_ROWS: VoucherRow[] = [];
+
 export default function VouchersPanel({ company, voucherTypes, refreshKey, onChanged }: Props) {
   const [filters, setFilters] = useState({ vtype: "", start: "", end: "", search: "" });
   const [applied, setApplied] = useState(filters);
@@ -20,6 +24,10 @@ export default function VouchersPanel({ company, voucherTypes, refreshKey, onCha
   const [page, setPage] = useState<{ total: number; rows: VoucherRow[] } | null>(null);
   const [open, setOpen] = useState<VoucherDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The voucher waiting for "Cancel voucher" in the confirm sheet.
+  const [doomed, setDoomed] = useState<VoucherDetail | null>(null);
+  // The list's amount counts a debit round-off; show the bill total, as the invoice and the party's balance do.
+  const rows = useBillTotals(page?.rows ?? NO_ROWS);
   const showFine = Boolean(page?.rows.some((r) => r.fine_mg));
 
   const load = useCallback(async () => {
@@ -45,7 +53,7 @@ export default function VouchersPanel({ company, voucherTypes, refreshKey, onCha
   }
 
   async function cancel(voucher: VoucherDetail) {
-    if (!window.confirm(`Cancel ${voucher.vtype} ${voucher.number}? It stays in the list marked cancelled and stops counting in every report; the audit log records the change.`)) return;
+    setDoomed(null);
     try {
       await api.cancelVoucher(company.id, voucher.id);
       setOpen(await api.voucher(company.id, voucher.id));
@@ -113,8 +121,8 @@ export default function VouchersPanel({ company, voucherTypes, refreshKey, onCha
                 </tr>
               </thead>
               <tbody>
-                {page.rows.map((v) => (
-                  <VoucherRowView key={v.id} voucher={v} showFine={showFine} open={open?.id === v.id ? open : null} onToggle={() => void show(v.id)} onCancel={(d) => void cancel(d)} />
+                {rows.map((v) => (
+                  <VoucherRowView key={v.id} voucher={v} showFine={showFine} open={open?.id === v.id ? open : null} onToggle={() => void show(v.id)} onCancel={setDoomed} />
                 ))}
               </tbody>
             </table>
@@ -130,7 +138,25 @@ export default function VouchersPanel({ company, voucherTypes, refreshKey, onCha
             </div>
           ) : null}
         </>
-      ) : null}
+      ) : error ? null : (
+        <Spinner>Loading vouchers…</Spinner>
+      )}
+      <Sheet
+        open={doomed !== null}
+        onClose={() => setDoomed(null)}
+        title={doomed ? `Cancel ${doomed.vtype} ${doomed.number}?` : "Cancel voucher?"}
+        description="It stays in the list marked cancelled and stops counting in every report; the audit trail records the change."
+        actions={
+          <>
+            <Button onClick={() => setDoomed(null)} data-autofocus>
+              Keep it
+            </Button>
+            <Button variant="danger" onClick={() => doomed && void cancel(doomed)}>
+              Cancel voucher
+            </Button>
+          </>
+        }
+      />
     </section>
   );
 }

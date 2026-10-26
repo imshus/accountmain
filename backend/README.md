@@ -18,7 +18,7 @@ copy .env.example .env            # macOS/Linux: cp .env.example .env  — then 
 | For | Command | Reachable from |
 | --- | --- | --- |
 | Development on this PC | `uvicorn app.main:app --reload --port 8000` | this PC only |
-| The Android app / other computers | `start-server.bat` | your network (prints the address to enter in the app) |
+| The Android app / other computers | `start-server.bat` | your network (prints the line to put in `frontend/.env` before building the APK) |
 
 There is no password: anyone on the same network who knows the address can open the books, so run
 `start-server.bat` only on a network you trust (your office or home Wi-Fi). The first time, Windows Firewall asks whether Python may accept connections: allow **Private networks**

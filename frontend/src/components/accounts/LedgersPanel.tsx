@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api";
 import { formatDate, formatValue } from "../../format";
 import type { AccountsMeta, Company, Ledger } from "../../types";
+import { Icon } from "../../ui";
 import { signedOpening } from "./shared";
 
 type Props = {
@@ -212,7 +213,7 @@ export default function LedgersPanel({ company, ledgers, groups, onChanged, onCo
         choose when it has none) decides CGST+SGST (same state as you) or IGST (other state) on invoices.
       </p>
       {error ? <div className="callout warning">{error}</div> : null}
-      {message ? <p className="verify verified">✓ {message}</p> : null}
+      {message ? <p className="verify verified"><Icon name="check" size={14} stroke={2.2} /> {message}</p> : null}
 
       <h2>Books begin from</h2>
       <p className="muted small">

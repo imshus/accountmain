@@ -1,0 +1,55 @@
+.ui-tiles {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.ui-tiles::-webkit-scrollbar {
+  display: none;
+}
+
+.ui-tile {
+  width: 96px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: 600 13px var(--body);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ui-tile__art {
+  height: 92px;
+  border-radius: 16px;
+  background: var(--poster);
+  border: 1px solid var(--border);
+  border-top-color: var(--edge);
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s;
+}
+
+.ui-tile:hover .ui-tile__art,
+.ui-tile:active .ui-tile__art {
+  transform: scale(0.97);
+}
+
+.ui-tile__art--mint {
+  color: var(--tile-mint);
+}
+
+.ui-tile__art--amber {
+  color: var(--tile-amber);
+}
+
+.ui-tile__art--brand {
+  color: var(--tile-brand);
+}

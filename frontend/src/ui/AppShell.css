@@ -1,0 +1,89 @@
+.ui-shell {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.ui-shell--narrow {
+  --col: var(--col-narrow);
+}
+
+.ui-shell--wide {
+  --col: var(--col-wide);
+}
+
+.ui-shell__col {
+  position: relative;
+  z-index: 1;
+  max-width: var(--col);
+  margin: 0 auto;
+  padding-bottom: calc(var(--tabbar-clear) + var(--safe-bottom));
+}
+
+.ui-shell.has-composer .ui-shell__col {
+  padding-bottom: calc(var(--composer-clear) + var(--safe-bottom));
+}
+
+/* The phone keyboard is open (useKeyboard): the ask box sits just above it and the tab bar steps aside, so the page
+   keeps room for the box alone. */
+:root[data-keyboard="open"] .ui-shell.has-composer .ui-shell__col {
+  padding-bottom: calc(var(--composer-clear) - var(--dock-bottom-normal) + var(--dock-bottom-keyboard));
+}
+
+:root[data-keyboard="open"] .ui-shell.has-composer .ui-tabbar {
+  display: none;
+}
+
+/* Content sits on the gutter; full-bleed rows (the quick-action pills) use .ui-bleed. */
+.ui-shell__main {
+  padding: 0 var(--gutter);
+}
+
+.ui-shell__main:focus {
+  outline: none;
+}
+
+.ui-shell {
+  --dock-bottom-normal: 112px;
+  --dock-bottom-keyboard: 10px;
+}
+
+.ui-shell__dock {
+  --dock-bottom: calc(var(--dock-bottom-normal) + var(--safe-bottom));
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: var(--dock-bottom);
+  z-index: 20;
+  width: min(calc(100% - 32px), calc(var(--col-narrow) - 32px));
+  margin: 0 auto;
+}
+
+:root[data-keyboard="open"] .ui-shell__dock {
+  --dock-bottom: var(--dock-bottom-keyboard);
+}
+
+/* The page fades out behind the ask box (and the tab bar under it), from a little above the box to the bottom edge,
+   so the chat never shows through the gaps around them. */
+.ui-shell__dock::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: -28px;
+  bottom: calc(-1 * var(--dock-bottom));
+  left: -50vw;
+  right: -50vw;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--bg) 28px);
+}
+
+/* The attach menu is open: the tab bar steps back, as in the mockup. */
+.ui-shell:has(.ui-composer.is-menu-open) .ui-tabbar {
+  opacity: 0.6;
+}
+
+/* A row that scrolls sideways from edge to edge of the column, e.g. the Home pills. */
+.ui-bleed {
+  margin-inline: calc(-1 * var(--gutter));
+  padding-inline: var(--gutter);
+}

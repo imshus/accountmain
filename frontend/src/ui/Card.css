@@ -1,0 +1,51 @@
+.ui-card {
+  position: relative;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border-radius: 28px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-top-color: var(--edge);
+  box-shadow: var(--shadow-lg);
+}
+
+.ui-card__title {
+  margin: 0;
+  font: 700 17px var(--display);
+  letter-spacing: -0.2px;
+}
+
+.ui-box {
+  display: block;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-top-color: var(--edge);
+}
+
+.ui-box--warn {
+  border-color: var(--rose-warn);
+  border-top-color: var(--rose-warn-top);
+}
+
+.ui-box--hero {
+  padding: 18px;
+  border-radius: 18px;
+}
+
+.ui-overline {
+  display: block;
+  margin: 0;
+  font: 700 10.5px var(--body);
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--soft);
+}
+
+.ui-section-title {
+  margin: 0 0 10px;
+  font: 600 16px var(--display);
+}

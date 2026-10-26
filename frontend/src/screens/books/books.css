@@ -1,0 +1,13 @@
+/* Shared by the books screens: the bell's sheet. */
+
+.bell-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.bell-foot {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--soft);
+}

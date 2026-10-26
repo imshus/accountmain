@@ -1,0 +1,164 @@
+/* Design tokens: the only place colours are written. Dark is the default; <html class="theme-light"> switches.
+   Ported from the owner's design (design-html/css/styles.css), plus the tints the design writes inline and the
+   legacy names (--surface, --accent, ...) the older screens use, mapped onto the new tokens. */
+
+:root {
+  /* ── Surfaces and text ── */
+  --page: #050507;
+  --bg: #0a0a0c;
+  --raised: #17171b;
+  --elevated: #222227;
+  --border: #2c2c33;
+  --border-dash: #3a3a43;
+  --edge: rgba(255, 255, 255, 0.14);
+  --hairline: rgba(255, 255, 255, 0.09);
+  --ink: #f5f6fa;
+  --soft: #a7adbd;
+  --faint: #858b9e; /* 4.5:1 on --elevated */
+
+  /* ── Brand ── */
+  --brand: #7c5cfc;
+  --brand-light: #9b82ff;
+  --brand-solid: #7350f0; /* fills that carry white text (4.5:1+) */
+  --brand-deep: #5b3fe0;
+  --brand-tint: rgba(124, 92, 252, 0.16);
+  --brand-tint-weak: rgba(124, 92, 252, 0.08);
+  --brand-tint-mid: rgba(124, 92, 252, 0.13);
+  --brand-tint-strong: rgba(124, 92, 252, 0.22);
+  --brand-text: linear-gradient(135deg, #7350f0, #3a6bd0); /* white text passes 4.5:1 */
+  --on-brand: #ffffff;
+  --on-brand-soft: rgba(255, 255, 255, 0.88);
+
+  /* ── Signal colours and their tints ── */
+  --mint: #34d8a3;
+  --amber: #f5b25c;
+  --rose: #f76e8b;
+  --gold: #e4c078;
+  --mint-tint: rgba(52, 216, 163, 0.08);
+  --mint-soft: rgba(52, 216, 163, 0.12);
+  --mint-edge: rgba(52, 216, 163, 0.22);
+  --amber-soft: rgba(245, 178, 92, 0.14);
+  --rose-tint: rgba(247, 110, 139, 0.08);
+  --rose-soft: rgba(247, 110, 139, 0.12);
+  --rose-edge: rgba(247, 110, 139, 0.25);
+  --rose-warn: rgba(247, 110, 139, 0.35);
+  --rose-warn-top: rgba(247, 110, 139, 0.5);
+  --gold-soft: rgba(228, 192, 120, 0.14);
+  --gold-pressed: rgba(228, 192, 120, 0.16);
+  --gold-edge: rgba(228, 192, 120, 0.28);
+  --gold-panel: linear-gradient(160deg, rgba(228, 192, 120, 0.1), rgba(228, 192, 120, 0.02));
+
+  /* ── Tiles, menu-row icons, stat bars ── */
+  --tile-mint: #3de8b4;
+  --tile-amber: #ffc474;
+  --tile-brand: #9b82ff;
+  --tint-violet: #8a6bff;
+  --tint-mint: #3de8b4;
+  --tint-amber: #ffc474;
+  --tint-rose: #ff84a0;
+  --tint-violet-soft: rgba(138, 107, 255, 0.12);
+  --tint-mint-soft: rgba(61, 232, 180, 0.12);
+  --tint-amber-soft: rgba(255, 196, 116, 0.12);
+  --tint-rose-soft: rgba(255, 132, 160, 0.12);
+  --bar-mint: linear-gradient(90deg, #3de8b4, #1fae85);
+  --bar-amber: linear-gradient(90deg, #ffc474, #e8934a);
+  --bar-brand: linear-gradient(90deg, #8a6bff, #4e8cf5);
+  --bar-rose: linear-gradient(90deg, #ff84a0, #e0537a);
+  --bar-brand-up: linear-gradient(180deg, #8a6bff, #4e8cf5); /* Reports' weekly bars, purple at the top */
+
+  /* ── Glass, glow, shadows, overlays ── */
+  --poster: linear-gradient(160deg, #2c2c34, #17171b);
+  --glass: rgba(20, 20, 24, 0.9);
+  --composer: rgba(23, 23, 27, 0.94);
+  --glow-brand: rgba(124, 92, 252, 0.24);
+  --glow-gold: rgba(228, 192, 120, 0.14);
+  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 18px 32px rgba(0, 0, 0, 0.45);
+  --shadow-glow: 0 6px 18px rgba(124, 92, 252, 0.55);
+  --scrim: rgba(5, 5, 7, 0.45);
+  --scrim-strong: rgba(5, 5, 7, 0.62);
+  --shimmer-base: #858b9e;
+  --shimmer-hi: #e6e8ef;
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%23A7ADBD' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+  /* ── Type ── */
+  --display: "Plus Jakarta Sans", system-ui, sans-serif;
+  --body: Manrope, system-ui, sans-serif;
+  --mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Menlo, Consolas, monospace;
+
+  /* ── Layout ── */
+  --gutter: 20px;
+  --col-narrow: 560px; /* Home, chat, entry forms, stock */
+  --col-wide: 1100px; /* Transactions, Reports, files and books */
+  --tabbar-clear: 128px; /* bottom space a screen keeps free under the floating tab bar */
+  --composer-clear: 200px; /* ... and under the composer + tab bar */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+
+  /* ── Legacy names (older screens): follow the theme through the tokens above ── */
+  --surface: var(--raised);
+  --surface-2: var(--elevated);
+  --text: var(--ink);
+  --muted: var(--soft);
+  --accent: var(--brand-solid);
+  --accent-strong: var(--brand-deep);
+  --accent-soft: var(--brand-tint);
+  --accent-ink: var(--brand-light); /* brand-coloured text and outlines */
+  --on-accent: var(--on-brand);
+  --success: var(--mint);
+  --success-soft: var(--mint-soft);
+  --warning: var(--amber);
+  --warning-soft: var(--amber-soft);
+  --danger: var(--rose);
+  --danger-soft: var(--rose-soft);
+  --shadow: var(--shadow-sm);
+  --radius: 14px;
+
+  color-scheme: dark;
+}
+
+.theme-light {
+  --page: #dcdfe7;
+  --bg: #f4f5f9;
+  --raised: #ffffff;
+  --elevated: #eef0f5;
+  --border: #e5e8f0;
+  --border-dash: #cfd3de;
+  --edge: rgba(255, 255, 255, 0.9);
+  --hairline: #e5e8f0;
+  --ink: #12151d;
+  --soft: #5b6275;
+  --faint: #646b7e;
+  --brand-light: #5b3fe0;
+  --mint: #15a579;
+  --amber: #c98228;
+  --rose: #e0536f;
+  --gold: #b8903f;
+  --tile-mint: #15a579;
+  --tile-amber: #b06f1c;
+  --tile-brand: #5b3fe0;
+  --tint-violet: #6a4cf0;
+  --tint-mint: #128a66;
+  --tint-amber: #b06f1c;
+  --tint-rose: #d0466a;
+  --poster: linear-gradient(160deg, #e7e9ef, #d3d6e0);
+  --glass: rgba(255, 255, 255, 0.9);
+  --composer: rgba(255, 255, 255, 0.92);
+  --glow-brand: rgba(124, 92, 252, 0.13);
+  --glow-gold: rgba(184, 144, 63, 0.09);
+  --shadow-sm: 0 2px 6px rgba(135, 145, 172, 0.1);
+  --shadow-lg: 0 18px 32px rgba(135, 145, 172, 0.16);
+  --shadow-glow: 0 6px 18px rgba(124, 92, 252, 0.3);
+  --scrim: rgba(15, 17, 25, 0.2);
+  --scrim-strong: rgba(15, 17, 25, 0.32);
+  --shimmer-base: #646b7e;
+  --shimmer-hi: #c5c9d6;
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%235B6275' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+  /* Small legacy status text needs more contrast on white than the design's bright signal colours give. */
+  --success: #0e7c58;
+  --warning: #96580a;
+  --danger: #c43553;
+
+  color-scheme: light;
+}

@@ -1,0 +1,195 @@
+/* Sale / Purchase entry (design-html/sales.html, purchase.html). */
+
+.entry {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.entry__form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.entry-date {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.entry-err {
+  margin: -14px 0 0;
+  text-align: right;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--rose);
+}
+
+.entry-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.entry-head__title {
+  margin: 0;
+  font: 700 17px var(--display);
+  letter-spacing: -0.2px;
+}
+
+/* Net weight while it is worked out from the gross: shown, but reads as computed until typed over. */
+.entry-auto-input.entry-auto-input {
+  color: var(--soft);
+  border-style: dashed;
+  border-color: var(--border-dash);
+}
+
+.entry-labelrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.entry-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--brand-light);
+  font: 700 11.5px var(--body);
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+}
+
+.entry-link:hover {
+  text-decoration: underline;
+}
+
+.entry-total {
+  margin-top: 4px;
+  padding: 18px;
+  border-radius: 20px;
+  background: var(--brand-text);
+  box-shadow: var(--shadow-glow);
+  color: var(--on-brand);
+}
+
+.entry-total p {
+  margin: 0;
+}
+
+.entry-total__label {
+  font: 700 10.5px var(--body);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--on-brand-soft);
+}
+
+.entry-total .entry-total__amount {
+  margin-top: 4px;
+  font: 700 34px/1.15 var(--display);
+  letter-spacing: -1px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.entry-total .entry-total__line {
+  margin-top: 6px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--on-brand-soft);
+}
+
+.entry-note {
+  margin: 0;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+/* Add-new sheet */
+.entry-add {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.entry-add__actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* Saved sheet */
+.entry-saved {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.entry-saved > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--elevated);
+}
+
+.entry-saved dt {
+  font: 700 10.5px var(--body);
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--soft);
+}
+
+.entry-saved dd {
+  margin: 0;
+  font: 700 16px var(--display);
+  color: var(--ink);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.entry-saved dd.entry-saved__gold {
+  color: var(--gold);
+}
+
+.entry-saved__check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--mint-soft);
+  color: var(--mint);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.entry-saved__check .ui-ico {
+  flex: none;
+  margin-top: 1px;
+}
+
+.entry-saved__check.is-off {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.entry-saved__owe {
+  margin: 10px 0 0;
+  font-size: 12.5px;
+  color: var(--soft);
+}

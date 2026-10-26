@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../api";
 import type { Company, Metal, Report } from "../../types";
 import ReportBody from "../ReportBody";
+import { Segmented } from "../../ui";
 
 type Props = {
   company: Company;
@@ -54,7 +55,7 @@ export default function GoldPanel({ company, metals, refreshKey }: Props) {
   }, [view, metal, refreshKey]);
 
   return (
-    <section className="panel">
+    <section className="panel gold-books">
       <div className="panel-heading">
         <div className="segmented" role="tablist">
           {VIEWS.map(([key, label]) => (
@@ -64,13 +65,13 @@ export default function GoldPanel({ company, metals, refreshKey }: Props) {
           ))}
         </div>
         {metals.length > 1 ? (
-          <select value={metal} onChange={(e) => setMetal(e.target.value as Metal)} aria-label="Metal">
-            {metals.map((m) => (
-              <option key={m} value={m}>
-                {m === "gold" ? "Gold" : "Silver"}
-              </option>
-            ))}
-          </select>
+          <Segmented
+            variant="metal"
+            label="Metal"
+            value={metal}
+            onChange={setMetal}
+            options={metals.map((m) => ({ value: m, label: m === "gold" ? "Gold" : "Silver" }))}
+          />
         ) : null}
       </div>
       {view === "metal_balances" ? (

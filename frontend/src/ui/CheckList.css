@@ -1,0 +1,29 @@
+.ui-checks {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ui-checks__item {
+  display: flex;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--soft);
+}
+
+.ui-checks__item > .ui-ico {
+  margin-top: 1px;
+}
+
+.ui-checks__item--ok {
+  color: var(--mint);
+}
+
+.ui-checks__item--warning,
+.ui-checks__item--error {
+  color: var(--rose);
+}

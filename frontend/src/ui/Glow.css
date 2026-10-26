@@ -1,0 +1,35 @@
+/* Absolute at the top of the page (it scrolls away with the header, as in the mockups). Placed relative to the
+   centred column, so on a wide window it frames the content instead of the window corners. */
+.ui-glow {
+  --glow-col: min(100vw, var(--col, var(--col-narrow)));
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 420px;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.ui-glow__brand,
+.ui-glow__gold {
+  position: absolute;
+  border-radius: 50%;
+}
+
+.ui-glow__brand {
+  top: -160px;
+  left: calc(50% + var(--glow-col) / 2 - 230px);
+  width: 340px;
+  height: 340px;
+  background: linear-gradient(180deg, var(--glow-brand), transparent);
+}
+
+.ui-glow__gold {
+  top: -100px;
+  left: calc(50% - var(--glow-col) / 2 - 130px);
+  width: 280px;
+  height: 280px;
+  background: linear-gradient(180deg, var(--glow-gold), transparent);
+}

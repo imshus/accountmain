@@ -1,0 +1,46 @@
+.ui-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid transparent;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.ui-notice > .ui-ico {
+  margin-top: 1px;
+}
+
+.ui-notice__text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ui-notice__action {
+  flex-shrink: 0;
+}
+
+.ui-notice--error {
+  background: var(--rose-tint);
+  border-color: var(--rose-edge);
+  color: var(--danger);
+}
+
+.ui-notice--warning {
+  background: var(--amber-soft);
+  color: var(--warning);
+}
+
+.ui-notice--success {
+  background: var(--mint-tint);
+  border-color: var(--mint-edge);
+  color: var(--success);
+}
+
+.ui-notice--info {
+  background: var(--elevated);
+  color: var(--soft);
+}

@@ -1,0 +1,117 @@
+/* Reports (the owner's picture): Total Spent and Total Income side by side, then the week's spend. */
+
+.rep-title {
+  margin: 4px 0 16px;
+  font: 700 26px/1.2 var(--display);
+  letter-spacing: -0.4px;
+}
+
+.rep-notice {
+  margin-bottom: 16px;
+}
+
+.rep-totals,
+.rep-skeleton {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.rep-skeleton > :last-child {
+  grid-column: 1 / -1;
+}
+
+/* ── Weekly spend ── */
+
+.rep-week {
+  margin-top: 12px;
+  padding: 18px 16px 14px;
+  border-radius: 16px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-top-color: var(--edge);
+  box-shadow: var(--shadow-sm);
+}
+
+.rep-week__title {
+  margin: 0;
+  font: 600 15px var(--display);
+}
+
+/* The picked day and its amount (else the week's total), above the bars. */
+.rep-week__readout {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 6px 0 16px;
+  min-height: 24px;
+}
+
+.rep-week__readout span {
+  font-size: 12.5px;
+  color: var(--soft);
+}
+
+.rep-week__readout strong {
+  font: 700 18px var(--display);
+  font-variant-numeric: tabular-nums;
+}
+
+.rep-week__bars {
+  display: flex;
+  gap: 6px;
+  height: 160px;
+}
+
+.rep-bar {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--faint);
+  font: 600 11px var(--body);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.rep-bar:focus-visible {
+  outline: 2px solid var(--brand-light);
+  outline-offset: 2px;
+}
+
+.rep-bar__track {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  max-width: 30px;
+}
+
+.rep-bar__fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  min-height: 6px;
+  border-radius: 8px;
+  background: var(--bar-brand-up);
+  transition: opacity 0.15s;
+}
+
+.rep-bar__fill.is-zero {
+  background: var(--elevated);
+}
+
+/* A bar is picked: the others step back. */
+.rep-week__bars.has-pick .rep-bar:not(.is-picked) .rep-bar__fill {
+  opacity: 0.45;
+}
+
+.rep-bar.is-picked {
+  color: var(--ink);
+}

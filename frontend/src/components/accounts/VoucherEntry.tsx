@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api";
 import { formatValue } from "../../format";
 import type { Company, Ledger, VoucherDetail, VoucherType } from "../../types";
+import { Icon } from "../../ui";
 import { JewelleryForm, MetalMoveForm, RateCutForm } from "./MetalEntry";
 import { CASH_BANK, LedgerSelect, NumberInput, PARTIES, SavedVoucher as Saved, badNumber, parseAmount, today, useSaving } from "./shared";
 
@@ -156,7 +157,7 @@ function InvoiceForm({ company, ledgers, onSaved }: Props) {
               <td>
                 {items.length > 1 ? (
                   <button className="icon-button" onClick={() => setItems((all) => all.filter((_, j) => j !== i))} aria-label="Remove item">
-                    ×
+                    <Icon name="close" size={15} stroke={2.2} />
                   </button>
                 ) : null}
               </td>
@@ -446,7 +447,7 @@ function LinesForm({ company, ledgers, onSaved }: Props) {
               <td>
                 {lines.length > 2 ? (
                   <button className="icon-button" onClick={() => setLines((all) => all.filter((_, j) => j !== i))} aria-label="Remove line">
-                    ×
+                    <Icon name="close" size={15} stroke={2.2} />
                   </button>
                 ) : null}
               </td>

@@ -1,7 +1,7 @@
 import type { CapacitorConfig } from "@capacitor/cli";
 
 // The Android app is this frontend (dist/) inside a WebView. It talks to the Accounts.ai backend
-// running on your computer or server, whose address the user enters in the app (menu → Server).
+// running on your computer or server, whose address is VITE_API_URL in frontend/.env, built into the app.
 const config: CapacitorConfig = {
   appId: "in.itsolution.accountsai",
   appName: "Accounts.ai",

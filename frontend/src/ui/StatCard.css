@@ -1,0 +1,65 @@
+.ui-stat {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 16px;
+  border-radius: 16px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-top-color: var(--edge);
+  box-shadow: var(--shadow-sm);
+  color: var(--ink);
+}
+
+.ui-stat__label {
+  margin-bottom: 8px;
+  font-size: 12.5px;
+  color: var(--soft);
+}
+
+/* A crore-sized figure wraps rather than being cut off (where the card cannot be measured, see below). */
+.ui-stat__value {
+  --stat-size: 22px;
+  font: 700 var(--stat-size)/1.25 var(--display);
+  letter-spacing: -0.3px;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A break inside a figure reads as another amount (₹12,34,567.5 / 0), so it stays on one line and shrinks to fit the
+   card instead: about 0.6em a character (a digit is 0.6em, a comma less), --chars set by StatCard. */
+@supports (width: 1cqi) {
+  .ui-stat {
+    container-type: inline-size;
+  }
+
+  .ui-stat__value {
+    white-space: nowrap;
+    font-size: min(var(--stat-size), 100cqi / (var(--chars, 10) * 0.6));
+  }
+}
+
+.ui-stat__bar {
+  width: 44px;
+  height: 4px;
+  margin-top: 12px;
+  border-radius: 2px;
+}
+
+.ui-stat__bar--mint {
+  background: var(--bar-mint);
+}
+
+.ui-stat__bar--brand {
+  background: var(--bar-brand);
+}
+
+.ui-stat__bar--rose {
+  background: var(--bar-rose);
+}
+
+@media (max-width: 360px) {
+  .ui-stat__value {
+    --stat-size: 19px;
+  }
+}

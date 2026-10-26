@@ -1,6 +1,7 @@
 import type { Check } from "../types";
+import { Icon, type IconName } from "../ui";
 
-const ICON = { ok: "✓", info: "i", warning: "!" } as const;
+const ICON: Record<Check["level"], IconName> = { ok: "check", info: "info", warning: "alert" };
 
 /** Data checks from importing a file or from a report: warnings first, then confirmations, then notes. */
 export default function ChecksList({ checks, title }: { checks: Check[]; title?: string }) {
@@ -20,7 +21,7 @@ export default function ChecksList({ checks, title }: { checks: Check[]; title?:
         {sorted.map((check, index) => (
           <li key={index} className={`check check-${check.level}`}>
             <span className="check-icon" aria-hidden="true">
-              {ICON[check.level]}
+              <Icon name={ICON[check.level]} size={15} stroke={2.2} />
             </span>
             <span>{check.message}</span>
           </li>

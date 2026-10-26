@@ -1,0 +1,123 @@
+/* The inside of "how this was calculated": the design's gold step lines, then the work itself. */
+
+.chat-work {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.chat-work__lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--gold);
+}
+
+.chat-work__lines:empty {
+  display: none;
+}
+
+.chat-work__lines li + li {
+  margin-top: 6px;
+}
+
+.chat-work__item {
+  border-top: 1px solid var(--border);
+}
+
+.chat-work__item > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 6px 0;
+  list-style: none;
+  color: var(--ink);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-work__item > summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-work__item > summary::before {
+  content: "▸";
+  color: var(--brand-light);
+}
+
+.chat-work__item[open] > summary::before {
+  content: "▾";
+}
+
+.chat-work__title {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.chat-work__meta {
+  color: var(--faint);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.chat-work__body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 2px 0 10px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.chat-work__body > * {
+  max-width: 100%;
+}
+
+.chat-work__sql {
+  width: 100%;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  color: var(--soft);
+  font: 11px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-work__note {
+  margin: 0;
+  color: var(--soft);
+}
+
+.chat-work__error {
+  margin: 0;
+  color: var(--rose);
+}
+
+.chat-work__calcs {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--soft);
+}
+
+.chat-work__calcs code {
+  font-family: var(--mono);
+  color: var(--ink);
+}
+
+.chat-work__calcs strong {
+  color: var(--ink);
+}
