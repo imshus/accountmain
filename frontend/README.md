@@ -19,8 +19,9 @@ Point it at another backend with `BACKEND_URL=http://host:8000 npm run dev`.
 npm run build        # static files in dist/ — host them anywhere
 ```
 
-Build with `VITE_API_URL=https://your-backend` (see `.env.example`) or leave it empty and set the server
-address in the app (menu → Server). Add the site's address to the backend's `CORS_ORIGINS`.
+Set the backend's address in `.env` (`VITE_API_URL=https://your-backend`, see `.env.example`) before building; the
+app has no address field and reads it from there only (`npm run dev` ignores it and keeps using the proxy above).
+Add the site's address to the backend's `CORS_ORIGINS`.
 
 ## Android app (APK)
 
@@ -34,7 +35,7 @@ gradlew.bat assembleDebug    # -> android/app/build/outputs/apk/debug/app-debug.
 ```
 
 Install the APK on a phone (allow "install unknown apps" for the file manager or browser you open it with).
-On first start the app asks for the server address that `backend\start-server.bat` prints. CSV downloads open Android's share sheet (save to Files, send on WhatsApp or email).
+The app calls the server in `.env` (`VITE_API_URL`), so set it before `npm run build`. CSV downloads open Android's share sheet (save to Files, send on WhatsApp or email).
 
 For the Play Store, build a signed release instead: open `android/` in Android Studio →
 Build → Generate Signed App Bundle / APK, and keep the keystore safe (updates must use the same key).

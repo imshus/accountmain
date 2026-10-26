@@ -1,0 +1,64 @@
+.ui-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+}
+
+.ui-drawer.is-open {
+  pointer-events: auto;
+}
+
+.ui-drawer__backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--scrim-strong);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.ui-drawer.is-open .ui-drawer__backdrop {
+  opacity: 1;
+}
+
+.ui-drawer__panel {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: min(300px, 85%);
+  padding: calc(28px + var(--safe-top)) 20px calc(24px + var(--safe-bottom));
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--raised);
+  border-radius: 0 30px 30px 0;
+  border: 1px solid var(--hairline);
+  border-left: 0;
+  box-shadow: var(--shadow-lg);
+  transform: translateX(calc(-100% - 24px));
+  transition: transform 0.34s cubic-bezier(0.2, 0.8, 0.2, 1);
+  scrollbar-width: none;
+}
+
+/* Children keep their size; the panel scrolls when they do not fit (a short window). */
+.ui-drawer__panel > * {
+  flex-shrink: 0;
+}
+
+.ui-drawer__panel:focus {
+  outline: none;
+}
+
+.ui-drawer.is-open .ui-drawer__panel {
+  transform: none;
+}
+
+@media (min-width: 900px) {
+  .ui-drawer__panel {
+    width: 340px;
+  }
+}

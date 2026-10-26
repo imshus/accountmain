@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../../api";
 import { formatDate, formatTimestamp } from "../../format";
 import type { AccountsMeta, BookSummary, Company, DatasetSummary, Ledger, Metal, Report } from "../../types";
+import { Icon } from "../../ui";
 import ReportBody from "../ReportBody";
 import AccountsImport from "./AccountsImport";
 import AccountsReports from "./AccountsReports";
@@ -15,6 +16,8 @@ type Props = {
   books: BookSummary[];
   datasets: DatasetSummary[];
   onCompanyChange: (company: Company) => void;
+  /** Open on this tab (e.g. "gold", "ledgers") instead of the dashboard. */
+  initialTab?: string;
 };
 
 const TABS = [
@@ -34,8 +37,10 @@ const MORE = [
 ] as const;
 
 /** One company's double-entry books. */
-export default function CompanyView({ company, books, datasets, onCompanyChange }: Props) {
-  const [tab, setTab] = useState<Tab>("dashboard");
+const TAB_KEYS: string[] = [...TABS.map(([key]) => key), ...MORE.map(([key]) => key)];
+
+export default function CompanyView({ company, books, datasets, onCompanyChange, initialTab }: Props) {
+  const [tab, setTab] = useState<Tab>(initialTab && initialTab !== "more" && TAB_KEYS.includes(initialTab) ? (initialTab as Tab) : "dashboard");
   const [meta, setMeta] = useState<AccountsMeta | null>(null);
   const [ledgers, setLedgers] = useState<Ledger[]>([]);
   // Bumped whenever vouchers or ledgers change so open lists and reports reload.
@@ -258,7 +263,7 @@ function Settings({ company, onCompanyChange }: { company: Company; onCompanyCha
         ) : null}
       </div>
       {error ? <div className="callout warning">{error}</div> : null}
-      {message ? <p className="verify verified">✓ {message}</p> : null}
+      {message ? <p className="verify verified"><Icon name="check" size={14} stroke={2.2} /> {message}</p> : null}
     </section>
   );
 }

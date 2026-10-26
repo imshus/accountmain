@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../../api";
 import { formatGrams, formatValue } from "../../format";
 import type { Company, Ledger, Metal, VoucherDetail } from "../../types";
+import { Icon, Segmented } from "../../ui";
 import {
   LedgerSelect, NumberInput, PARTIES, SavedVoucher, badNumber, fineOf, gstOn, halfUp, metalBalanceText, parseAmount, toBp, toMg, toPaise, today,
   useSaving, weights,
@@ -35,13 +36,19 @@ const EMPTY_ITEM: Item = {
 
 function MetalPicker({ value, onChange }: { value: Metal; onChange: (m: Metal) => void }) {
   return (
-    <label className="field">
+    <div className="field metal-field">
       <span>Metal</span>
-      <select value={value} onChange={(e) => onChange(e.target.value as Metal)}>
-        <option value="gold">Gold</option>
-        <option value="silver">Silver</option>
-      </select>
-    </label>
+      <Segmented
+        variant="metal"
+        label="Metal"
+        value={value}
+        onChange={onChange}
+        options={[
+          { value: "gold", label: "Gold" },
+          { value: "silver", label: "Silver" },
+        ]}
+      />
+    </div>
   );
 }
 
@@ -162,7 +169,7 @@ export function JewelleryForm({ company, ledgers, onSaved }: Props) {
               Item {i + 1}
               {items.length > 1 ? (
                 <button className="icon-button" onClick={() => setItems((all) => all.filter((_, j) => j !== i))} aria-label={`Remove item ${i + 1}`}>
-                  ×
+                  <Icon name="close" size={15} stroke={2.2} />
                 </button>
               ) : null}
             </legend>
@@ -258,8 +265,8 @@ export function JewelleryForm({ company, ledgers, onSaved }: Props) {
 }
 
 /** Metal received from a party (old gold, bullion, settlement) or given to one (karigar issue, metal paid). */
-export function MetalMoveForm({ company, ledgers, onSaved }: Props) {
-  const [vtype, setVtype] = useState<"Metal Receipt" | "Metal Issue">("Metal Receipt");
+export function MetalMoveForm({ company, ledgers, onSaved, direction = "Metal Receipt" }: Props & { direction?: "Metal Receipt" | "Metal Issue" }) {
+  const [vtype, setVtype] = useState<"Metal Receipt" | "Metal Issue">(direction);
   const [date, setDate] = useState(today());
   const [party, setParty] = useState("");
   const [metal, setMetal] = useState<Metal>("gold");
@@ -343,7 +350,7 @@ export function MetalMoveForm({ company, ledgers, onSaved }: Props) {
               <td>
                 {lines.length > 1 ? (
                   <button className="icon-button" onClick={() => setLines((all) => all.filter((_, j) => j !== i))} aria-label="Remove line">
-                    ×
+                    <Icon name="close" size={15} stroke={2.2} />
                   </button>
                 ) : null}
               </td>

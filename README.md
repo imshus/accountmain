@@ -121,7 +121,8 @@ cp backend/.env.example backend/.env    # then edit backend/.env and set OPENAI_
 docker compose up -d --build            # first build takes a few minutes
 ```
 
-Open `http://<server-ip>` in a browser; in the Android app enter `http://<server-ip>` as the server.
+Open `http://<server-ip>` in a browser. For the Android app, put `VITE_API_URL=http://<server-ip>` (or your
+HTTPS domain) in `frontend/.env` before building the APK.
 Allow port 80 in the VPS firewall (Hostinger hPanel → VPS → Firewall, or `ufw allow 80`).
 
 - Update after a new push: `git pull && docker compose up -d --build`
@@ -146,6 +147,10 @@ pm2 start venv/bin/python --name backend-app --interpreter none -- -m uvicorn ap
 Without pm2: `venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 2000`. Allow the port in the
 EC2 Security Group (inbound TCP). After a `git pull`, run the `pip install` line again and `pm2 restart backend-app`.
 
+Behind nginx (a domain with HTTPS), raise nginx's 1 MB upload limit in the site's `server { }` block, or larger
+spreadsheets fail to upload (the app then reports it cannot reach the server):
+`client_max_body_size 30m;`, then `sudo nginx -t && sudo systemctl reload nginx`.
+
 ## Android app
 
 `frontend/android` is the Android project. To build the APK, double-click **`build-apk.bat`** in the project
@@ -153,10 +158,11 @@ folder (needs Node.js and Android Studio); it builds the web app, copies it into
 Gradle and leaves the result in `apk\Accounts.ai-1.0-debug.apk`. The same steps by hand: `npm run build`,
 `npx cap sync android`, then `gradlew.bat assembleDebug` in `frontend/android` (details in `frontend/README.md`).
 
-To use it: on the PC that holds the books, run `backend\start-server.bat` (allow Python on **Private
-networks** when Windows Firewall asks), install the APK on the phone, and enter the address the script
-prints. There is no password, so use it only on a network you trust. The phone must be on the same Wi-Fi,
-or the backend must be hosted where the phone can reach it (use HTTPS for that).
+The app talks only to the server named in `frontend/.env` (`VITE_API_URL=https://account.example.in`); it has no
+address field, and `build-apk.bat` will not build without that line. For a PC on your Wi-Fi, run
+`backend\start-server.bat` (allow Python on **Private networks** when Windows Firewall asks) and put the address it
+prints there. There is no password, so use it only on a network you trust; a backend reachable over the internet
+should use HTTPS.
 
 ## API
 

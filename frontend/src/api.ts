@@ -19,6 +19,8 @@ import type {
   ColumnCalcResult,
   DatasetDetail,
   DatasetSummary,
+  FollowupsRequest,
+  FollowupsResponse,
   GstNet,
   Health,
   ProviderId,
@@ -31,81 +33,25 @@ import type {
 
 import { Capacitor } from "@capacitor/core";
 
-// Where the backend is. In development it is empty: Vite forwards /api to the backend. A frontend
-// built for another host sets VITE_API_URL; the Android app asks the user (menu → Server) and keeps
-// the address on the phone.
-const SERVER_KEY = "accountsai.server";
+// Where the backend is: VITE_API_URL in frontend/.env, built into the app (build-apk.bat checks it). Nothing else sets
+// it; the app has no address field. `npm run dev` ignores it and calls /api, which Vite forwards to BACKEND_URL, so
+// development never writes into the books on the real server.
+const CONFIGURED = (import.meta.env.VITE_API_URL ?? "").trim().replace(/\/+$/, "");
+// Without http(s):// the WebView would fetch "account.example.in/api/..." from the app itself, so treat it as missing.
+const API_URL = import.meta.env.DEV || !/^https?:\/\/[^\s/]+/i.test(CONFIGURED) ? "" : CONFIGURED;
 
-/** Running inside the Android app (no development proxy, so a server address is required). */
+/** Running inside the Android app (no development proxy, so the build must carry VITE_API_URL). */
 export const isApp = Capacitor.isNativePlatform();
 
-function stored(key: string): string {
-  try {
-    return localStorage.getItem(key) ?? "";
-  } catch {
-    return "";
-  }
-}
-
 export function serverUrl(): string {
-  return (stored(SERVER_KEY) || import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+  return API_URL;
 }
 
-export function saveServer(url: string): void {
-  localStorage.setItem(SERVER_KEY, normaliseServer(url));
-}
-
-// A computer on the local network (an IP address or localhost) rarely has HTTPS; a server with a domain name nearly always does.
-const LOCAL_HOST = /^(localhost|\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])(:\d+)?$/i;
-
-/** "192.168.1.10:8000" -> "http://192.168.1.10:8000"; "account.example.in" -> "https://account.example.in" */
-export function normaliseServer(url: string): string {
-  const text = url.trim().replace(/\/+$/, "");
-  if (!text || /^https?:\/\//i.test(text)) return text;
-  return `${LOCAL_HOST.test(text) ? "http" : "https"}://${text}`;
-}
-
-async function healthAt(base: string): Promise<Health> {
-  const response = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(8000) });
-  if (!response.ok) throw new Error(String(response.status));
-  return (await response.json()) as Health;
-}
-
-/** Check an address before saving it: the backend must answer its health check. An http:// address that fails is
- * tried again over https://, because a server that redirects http to https blocks the app's requests at the redirect.
- * Returns the address that answered. */
-export async function checkServer(url: string): Promise<{ base: string; health: Health }> {
-  const base = normaliseServer(url);
-  const secure = /^http:\/\//i.test(base) ? base.replace(/^http:/i, "https:") : null;
-  for (const candidate of secure ? [base, secure] : [base]) {
-    try {
-      return { base: candidate, health: await healthAt(candidate) };
-    } catch {
-      // Try the next form of the address.
-    }
-  }
-  throw new ApiError(
-    0,
-    `No Accounts.ai backend answered at ${base}${secure ? ` or ${secure}` : ""}. Check the address, that the backend is running, and (for a computer on your network) that the phone is on the same Wi-Fi.`,
-  );
-}
-
-let httpsTried = false;
-
-/** A saved http:// address whose server now only works over https (it redirects): switch to https once, if the backend
- * answers there, so the app keeps working without the user retyping the address. */
-async function switchToHttps(): Promise<boolean> {
-  const base = serverUrl();
-  if (httpsTried || !stored(SERVER_KEY) || !/^http:\/\//i.test(base)) return false;
-  httpsTried = true;
-  const secure = base.replace(/^http:/i, "https:");
-  try {
-    await healthAt(secure);
-  } catch {
-    return false;
-  }
-  saveServer(secure);
-  return true;
+// Earlier versions kept a typed-in address on the phone; it is no longer read, so drop it.
+try {
+  localStorage.removeItem("accountsai.server");
+} catch {
+  // Storage blocked: nothing to drop.
 }
 
 export class ApiError extends Error {
@@ -120,6 +66,7 @@ function errorMessage(status: number, body: unknown): string {
   const detail = (body as { detail?: unknown } | null)?.detail;
   if (typeof detail === "string") return detail;
   if (Array.isArray(detail) && detail[0]?.msg) return String(detail[0].msg);
+  if (status === 413) return "This file is larger than the server accepts. Raise the upload limit on the server (nginx: client_max_body_size).";
   if (status === 502 || status === 503 || status === 504) {
     return "The backend is not responding (it may be restarting). Try again in a moment.";
   }
@@ -129,13 +76,34 @@ function errorMessage(status: number, body: unknown): string {
 
 function unreachable(): string {
   const base = serverUrl();
-  return base ? `Cannot reach the backend at ${base}. Is it running, and is this device on the same network?` : "Cannot reach the backend. Is it running on port 8000?";
+  return base
+    ? `Cannot reach the backend at ${base}. Check that this device can reach it (for a PC on your network, be on the same Wi-Fi) and that the server is running.`
+    : "Cannot reach the backend. Is it running on port 8000?";
 }
 
-// Without a limit, a phone whose saved server is off (or out of Wi-Fi range) waits minutes for the OS to give up.
+const CRASHED =
+  "The server is running but failed on this request without saying why (a server error). Try again; if it keeps happening, the reason is in the server's log (pm2 logs backend-app).";
+
+/** A request that got no readable answer. If the server still answers its health check, it did reply, but without
+ * CORS headers, which is how a crash on the server (or a web-server error page) looks from the app. */
+async function whyNoAnswer(): Promise<{ up: boolean; message: string }> {
+  try {
+    const response = await fetch(`${serverUrl()}/api/health`, { signal: AbortSignal.timeout(5000) });
+    if (response.ok) return { up: true, message: CRASHED };
+  } catch {
+    // Really out of reach.
+  }
+  return { up: false, message: unreachable() };
+}
+
+// Without a limit, a phone whose server is off or out of reach waits minutes for the OS to give up.
 const TIMEOUT_MS = 20_000;
 /** For requests that can rightly take longer (a whole register imported, a non-streamed AI answer). */
 const NO_TIMEOUT = 0;
+/** Suggested questions are optional: not worth a long wait. */
+const FOLLOWUPS_TIMEOUT_MS = 15_000;
+/** Chat copies go up and down in the background and can be large (up to 2 MB each, a scope holds up to 30). */
+const CHATS_TIMEOUT_MS = 60_000;
 
 function timedOut(init: RequestInit | undefined, ms: number): string {
   const seconds = Math.round(ms / 1000);
@@ -152,8 +120,7 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs: number = 
   try {
     response = await fetch(serverUrl() + path, { ...init, signal });
   } catch {
-    if (!expired() && (await switchToHttps())) return request<T>(path, init, timeoutMs);
-    throw new ApiError(0, expired() ? timedOut(init, timeoutMs) : unreachable());
+    throw new ApiError(0, expired() ? timedOut(init, timeoutMs) : (await whyNoAnswer()).message);
   }
   let body: unknown = null;
   if (response.status !== 204) {
@@ -182,8 +149,7 @@ async function streamChat(path: string, payload: object, onEvent: (event: ChatEv
     });
   } catch (error) {
     if ((error as Error).name === "AbortError") throw error;
-    if (await switchToHttps()) return streamChat(path, payload, onEvent, options);
-    throw new ApiError(0, unreachable());
+    throw new ApiError(0, (await whyNoAnswer()).message);
   }
   if (!response.ok || !response.body) {
     const body = await response.json().catch(() => null);
@@ -222,12 +188,16 @@ function postJson<T>(path: string, payload: unknown, timeoutMs: number = TIMEOUT
   );
 }
 
-function putJson<T>(path: string, payload: unknown): Promise<T> {
-  return request<T>(path, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+function putJson<T>(path: string, payload: unknown, timeoutMs: number = TIMEOUT_MS): Promise<T> {
+  return request<T>(
+    path,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+    timeoutMs,
+  );
 }
 
 export const api = {
@@ -286,10 +256,29 @@ export const api = {
     const query = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== ""));
     return request<Report>(`/api/books/${id}/reports/${kind}?${query}`);
   },
-  /** The main chat: questions about the files shared in the conversation (or general questions without files). */
-  filesChatStream: (datasetIds: number[], messages: ChatMessage[], provider: ProviderId, onEvent: (event: ChatEvent) => void, options?: StreamOptions) =>
-    streamChat("/api/chat/stream", { messages, provider, dataset_ids: datasetIds }, onEvent, options),
+  /** The main chat: questions about the files shared in the conversation (or general questions without files). With a
+   * company the AI can also add a shared sales or purchase sheet to its books (the result's `imports`). */
+  filesChatStream: (
+    datasetIds: number[],
+    companyId: number | null,
+    messages: ChatMessage[],
+    provider: ProviderId,
+    onEvent: (event: ChatEvent) => void,
+    options?: StreamOptions,
+  ) => streamChat("/api/chat/stream", { messages, provider, dataset_ids: datasetIds, company_id: companyId }, onEvent, options),
   documents: (datasetIds: number[]) => postJson<DocumentInfo[]>("/api/documents", { dataset_ids: datasetIds }),
+  /** Up to three questions worth asking next, for the conversation ending with an answer. */
+  followups: (body: FollowupsRequest) => postJson<FollowupsResponse>("/api/chat/followups", body, FOLLOWUPS_TIMEOUT_MS),
+  /** The server's copy of one scope's AI chats ("home", "ds-2", "book-1"), and the ones deleted on any device. */
+  chats: (scope: string) => request<{ chats: unknown[]; deleted: unknown[] }>(`/api/chats?${new URLSearchParams({ scope })}`, undefined, CHATS_TIMEOUT_MS),
+  /** Keep a conversation on the server; it answers with the copy it kept (a newer one from another device wins), or
+   * chat null with the delete that won. */
+  putChat: (scope: string, chat: { id: string }) =>
+    putJson<{ chat: unknown; deleted?: unknown }>(`/api/chats/${encodeURIComponent(scope)}/${encodeURIComponent(chat.id)}`, chat, CHATS_TIMEOUT_MS),
+  deleteChat: (scope: string, id: string, updated: number) =>
+    request<null>(`/api/chats/${encodeURIComponent(scope)}/${encodeURIComponent(id)}?${new URLSearchParams({ updated: String(updated) })}`, {
+      method: "DELETE",
+    }),
   bookChatStream: (id: number, messages: ChatMessage[], provider: ProviderId, onEvent: (event: ChatEvent) => void, options?: StreamOptions) =>
     streamChat(`/api/books/${id}/chat/stream`, { messages, provider }, onEvent, options),
   bookChat: (id: number, messages: ChatMessage[], provider: ProviderId) =>
@@ -372,7 +361,18 @@ export function uploadFile(file: File, onProgress: (fraction: number) => void, s
       if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response as DatasetDetail);
       else reject(new ApiError(xhr.status, errorMessage(xhr.status, xhr.response)));
     };
-    xhr.onerror = () => reject(new ApiError(0, unreachable()));
+    // A web server that refuses a large file (nginx answers 413 without CORS headers) also lands here.
+    xhr.onerror = () =>
+      void whyNoAnswer().then(({ up, message }) =>
+        reject(
+          new ApiError(
+            0,
+            up && file.size > 1024 * 1024
+              ? `The server is running but refused this ${(file.size / (1024 * 1024)).toFixed(1)} MB file: most likely its upload limit (nginx: client_max_body_size 30m), otherwise a server error (see pm2 logs backend-app).`
+              : message,
+          ),
+        ),
+      );
     const form = new FormData();
     form.append("file", file);
     xhr.send(form);

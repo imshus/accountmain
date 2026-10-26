@@ -1,0 +1,66 @@
+.ui-tabbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(22px + var(--safe-bottom));
+  z-index: 30;
+  width: 240px;
+  margin: 0 auto;
+  padding: 9px 12px;
+  display: flex;
+  border-radius: 32px;
+  border: 1px solid var(--hairline);
+  border-top-color: var(--edge);
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  box-shadow: var(--shadow-lg);
+  transition: opacity 0.2s;
+}
+
+.ui-tab {
+  width: 72px;
+  padding-top: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+  font-size: 10.5px;
+  color: var(--faint);
+  text-decoration: none;
+  border-radius: 14px;
+}
+
+.ui-tab__bar {
+  width: 22px;
+  height: 3px;
+  margin-bottom: 6px;
+  border-radius: 2px;
+}
+
+.ui-tab__icon {
+  width: 64px;
+  height: 26px;
+  border-radius: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.2s;
+}
+
+.ui-tab.is-active {
+  color: var(--brand-light);
+}
+
+.ui-tab.is-active .ui-tab__bar {
+  background: var(--brand-light);
+}
+
+.ui-tab.is-active .ui-tab__icon {
+  background: var(--brand-tint);
+}
+
+.ui-tab:not(.is-active):hover {
+  color: var(--soft);
+}

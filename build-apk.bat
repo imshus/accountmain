@@ -10,6 +10,10 @@ if not exist node_modules (
     call npm ci || goto :fail
 )
 
+rem The server address is built into the app, and it comes only from VITE_API_URL in frontend\.env.
+set "VITE_API_URL="
+node scripts\check-server.mjs || goto :fail
+
 echo [1/3] Building the web app...
 call npm run build || goto :fail
 
@@ -37,9 +41,12 @@ if not exist "%ROOT%apk" mkdir "%ROOT%apk"
 copy /y "%ROOT%frontend\android\app\build\outputs\apk\debug\app-debug.apk" "%ROOT%apk\Accounts.ai-1.0-debug.apk" >nul || goto :fail
 echo.
 echo APK ready: %ROOT%apk\Accounts.ai-1.0-debug.apk
+if not defined NO_PAUSE pause
 exit /b 0
 
 :fail
 echo.
 echo APK build failed - see the messages above.
+rem Opened by double-click: keep the window open so the message can be read. NO_PAUSE=1 skips this.
+if not defined NO_PAUSE pause
 exit /b 1

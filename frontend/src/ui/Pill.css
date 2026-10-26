@@ -1,0 +1,106 @@
+/* Every shortcut stays in view: the row wraps instead of scrolling (a hidden sideways scroll hid the last ones), and
+   on phones the pills share the width. */
+.ui-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-bottom: 4px;
+}
+
+.ui-pill {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 26px;
+  white-space: nowrap;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--raised);
+  box-shadow: var(--shadow-sm);
+  color: var(--ink);
+  font: 600 15px var(--body);
+  cursor: pointer;
+  transition: transform 0.12s;
+}
+
+.ui-pill:active {
+  transform: scale(0.97);
+}
+
+@media (max-width: 500px) {
+  .ui-pills {
+    gap: 8px;
+  }
+
+  .ui-pill {
+    flex: 1 1 auto;
+    padding: 13px 10px;
+    font-size: 14px;
+  }
+}
+
+.ui-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ui-chip {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--raised);
+  color: var(--soft);
+  font: 600 12.5px var(--body);
+  cursor: pointer;
+}
+
+.ui-chip[aria-pressed="true"] {
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--bg);
+  font-weight: 700;
+}
+
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font: 700 10px/1.6 var(--body);
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+
+.ui-badge--neutral {
+  background: var(--elevated);
+  color: var(--soft);
+}
+
+.ui-badge--amber {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.ui-badge--rose {
+  background: var(--rose-soft);
+  color: var(--rose);
+}
+
+.ui-badge--gold {
+  background: var(--gold-soft);
+  color: var(--gold);
+}
+
+.ui-badge--mint {
+  background: var(--mint-soft);
+  color: var(--mint);
+}
+
+.ui-badge--brand {
+  background: var(--brand-tint);
+  color: var(--brand-light);
+}

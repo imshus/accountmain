@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import type { InputHTMLAttributes } from "react";
 import { formatGrams, formatValue } from "../../format";
 import type { Ledger, VoucherDetail } from "../../types";
+import { Icon } from "../../ui";
 
 export const CASH_BANK = new Set(["Cash-in-Hand", "Bank Accounts", "Bank OD A/c"]);
 export const PARTIES = new Set(["Sundry Debtors", "Sundry Creditors"]);
@@ -192,7 +193,8 @@ export function SavedVoucher({ voucher }: { voucher: VoucherDetail | null }) {
     .map((m) => `${m.ledger} ${m.dr_mg ? "Dr" : "Cr"} ${formatGrams((m.dr_mg || m.cr_mg) / 1000)} fine ${m.metal}`);
   return (
     <p className="verify verified">
-      ✓ Saved {voucher.vtype} {voucher.number}: {[...rupees, ...metal].join(" · ")}
+      <Icon name="check" size={14} stroke={2.2} />
+      Saved {voucher.vtype} {voucher.number}: {[...rupees, ...metal].join(" · ")}
     </p>
   );
 }

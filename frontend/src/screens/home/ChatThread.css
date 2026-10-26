@@ -1,0 +1,559 @@
+/* The chat in the design's bubbles (chat.html): mint file banner, violet question, raised answer card. */
+
+.chat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.chat-exchange {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ── shared file ── */
+
+.chat-file {
+  align-self: center;
+  max-width: 92%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--mint-tint);
+  border: 1px solid var(--mint-edge);
+  color: var(--soft);
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.chat-file > .ui-ico {
+  flex-shrink: 0;
+  color: var(--mint);
+}
+
+.chat-file b {
+  color: var(--ink);
+}
+
+.chat-file.is-failed {
+  background: var(--rose-tint);
+  border-color: var(--rose-edge);
+}
+
+.chat-file.is-failed > .ui-ico {
+  color: var(--rose);
+}
+
+/* ── question ── */
+
+.chat-q {
+  align-self: flex-end;
+  max-width: 86%;
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 18px 18px 6px 18px;
+  background: var(--brand-text);
+  box-shadow: var(--shadow-sm);
+  color: var(--on-brand);
+  font-size: 13.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ── answer ── */
+
+.chat-a {
+  align-self: flex-start;
+  box-sizing: border-box;
+  max-width: 90%;
+  min-width: 0;
+  padding: 13px;
+  border-radius: 18px 18px 18px 6px;
+  border: 1px solid var(--border);
+  border-top-color: var(--edge);
+  background: var(--elevated);
+  box-shadow: var(--shadow-sm);
+  color: var(--ink);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.chat-a.is-typing {
+  padding: 12px 13px;
+}
+
+.chat-a.is-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  background: var(--rose-tint);
+  border-color: var(--rose-edge);
+}
+
+.chat-a.is-error > .ui-ico {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--rose);
+}
+
+.chat-a.is-error p {
+  margin: 0;
+}
+
+.chat-a__note {
+  margin: 0;
+  color: var(--soft);
+  font-size: 11.5px;
+}
+
+.chat-a__note + .chat-md,
+.chat-md + .chat-a__note {
+  margin-top: 8px;
+}
+
+.chat-a__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.chat-a__tools {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  margin-right: -6px;
+}
+
+.chat-tool {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+}
+
+.chat-tool:hover {
+  background: var(--raised);
+  color: var(--ink);
+}
+
+/* "Every figure checked" */
+.chat-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--mint);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.chat-check.is-warn {
+  color: var(--amber);
+}
+
+.chat-how {
+  margin-top: 4px;
+}
+
+.chat-how > summary {
+  display: inline-block;
+  padding: 4px 0;
+  list-style: none;
+  color: var(--brand-light);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-how > summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-how > summary::before {
+  content: "▸ ";
+}
+
+.chat-how[open] > summary::before {
+  content: "▾ ";
+}
+
+.chat-how .chat-work__lines {
+  font-size: 10.5px;
+}
+
+/* The live step: spinner, what the AI is doing now, seconds. */
+.chat-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--soft);
+  font-size: 11.5px;
+}
+
+.chat-md + .chat-step {
+  margin-top: 10px;
+}
+
+.chat-step__text {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-step__time {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-a.is-typing .analysis-result {
+  margin-top: 10px;
+}
+
+/* ── after the answer ── */
+
+.chat-after {
+  align-self: flex-start;
+  max-width: 90%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.chat-compare,
+.chat-suggest {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 8px 14px;
+  border: 1px solid var(--brand-tint-strong);
+  border-radius: 14px;
+  background: var(--brand-tint-weak);
+  color: var(--brand-light);
+  font: 600 13px/1.35 var(--body);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-suggest {
+  border-radius: 999px;
+}
+
+.chat-compare:hover:not(:disabled),
+.chat-suggest:hover {
+  background: var(--brand-tint);
+}
+
+.chat-compare:disabled {
+  cursor: progress;
+}
+
+.chat-after__error {
+  margin: 0;
+  color: var(--rose);
+  font-size: 12px;
+}
+
+/* Suggested next questions under the latest answer: a wrapping row of pills. */
+.chat-followups {
+  align-self: flex-start;
+  max-width: 90%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  animation: chat-fade-in 0.25s ease-out both;
+}
+
+.chat-followup {
+  min-height: 40px;
+  max-width: 100%;
+  padding: 8px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--brand-light);
+  font: 600 13px/1.35 var(--body);
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.chat-followup:hover {
+  border-color: var(--brand-tint-strong);
+  background: var(--brand-tint);
+}
+
+/* Sheets the AI added to the books: a line with the counts, then a chip to each register. */
+.chat-imported {
+  align-self: flex-start;
+  max-width: 90%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-imported .chat-followups {
+  max-width: 100%;
+}
+
+.chat-imported__note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--soft);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chat-imported__note > .ui-ico {
+  flex-shrink: 0;
+  color: var(--mint);
+}
+
+/* The answer asked "sales or purchase?": one row per sheet (named when several), the data's guess tinted like Home's
+   "Chat with data" pill. The suggested questions follow below. */
+.chat-registers {
+  align-self: flex-start;
+  max-width: 90%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: chat-fade-in 0.25s ease-out both;
+}
+
+.chat-register {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-register__name {
+  max-width: 100%;
+  color: var(--soft);
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.chat-register__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.chat-register__chip.is-suggested {
+  border-color: var(--brand-tint-mid);
+  background: var(--brand-tint);
+  color: var(--ink);
+}
+
+.chat-register__chip.is-suggested .ui-ico {
+  color: var(--brand-light);
+}
+
+.chat-register__chip.is-suggested:hover {
+  border-color: var(--brand-tint-strong);
+}
+
+@keyframes chat-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+.chat-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--brand-light);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ── markdown inside an answer ── */
+
+.chat-md {
+  overflow-wrap: anywhere;
+}
+
+.chat-md > :first-child {
+  margin-top: 0;
+}
+
+.chat-md > :last-child {
+  margin-bottom: 0;
+}
+
+.chat-md p,
+.chat-md ul,
+.chat-md ol,
+.chat-md blockquote {
+  margin: 0 0 8px;
+}
+
+.chat-md strong {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.chat-md ul,
+.chat-md ol {
+  padding-left: 20px;
+}
+
+.chat-md li + li {
+  margin-top: 3px;
+}
+
+.chat-md li > p {
+  margin: 0;
+}
+
+.chat-md h1,
+.chat-md h2,
+.chat-md h3,
+.chat-md h4 {
+  margin: 12px 0 6px;
+  font-family: var(--display);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.chat-md h1 {
+  font-size: 16px;
+}
+
+.chat-md h2 {
+  font-size: 15px;
+}
+
+.chat-md h3,
+.chat-md h4 {
+  font-size: 14px;
+}
+
+.chat-md hr {
+  margin: 12px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+.chat-md a {
+  color: var(--brand-light);
+}
+
+.chat-md code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--raised);
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+.chat-md blockquote {
+  padding-left: 10px;
+  border-left: 3px solid var(--border-dash);
+  color: var(--soft);
+}
+
+.chat-md__table {
+  max-width: 100%;
+  margin: 0 0 8px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.chat-md table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-md th,
+.chat-md td {
+  padding: 6px 9px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.chat-md th {
+  background: var(--raised);
+  color: var(--soft);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chat-md tr:last-child td {
+  border-bottom: 0;
+}
+
+/* A caret after the text while it is being written. */
+.chat-md.is-streaming > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  margin-left: 3px;
+  vertical-align: -2px;
+  border-radius: 2px;
+  background: var(--brand-light);
+  animation: chat-blink 1s steps(2, start) infinite;
+}
+
+@keyframes chat-blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-md.is-streaming > :last-child::after,
+  .chat-followups,
+  .chat-registers {
+    animation: none;
+  }
+}
+
+/* Wide windows: the phone sizes read small. */
+@media (min-width: 768px) {
+  .chat-q,
+  .chat-a {
+    font-size: 14.5px;
+  }
+
+  .chat-file,
+  .chat-step,
+  .chat-a__note {
+    font-size: 12.5px;
+  }
+
+  .chat-check,
+  .chat-how > summary,
+  .chat-how .chat-work__lines {
+    font-size: 11.5px;
+  }
+}

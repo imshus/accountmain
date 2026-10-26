@@ -1,0 +1,68 @@
+.ui-seg--block {
+  position: relative;
+  padding: 4px;
+  display: grid;
+  grid-template-columns: repeat(var(--seg-n, 2), minmax(0, 1fr));
+  gap: 4px;
+  border-radius: 16px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+}
+
+.ui-seg--block .ui-seg__opt {
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--soft);
+  font: 600 14px var(--body);
+  cursor: pointer;
+}
+
+.ui-seg--block .ui-seg__opt[aria-pressed="true"] {
+  background: var(--elevated);
+  box-shadow: var(--shadow-sm);
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.ui-seg--block .ui-seg__opt--mint[aria-pressed="true"] .ui-ico {
+  color: var(--tile-mint);
+}
+
+.ui-seg--block .ui-seg__opt--amber[aria-pressed="true"] .ui-ico {
+  color: var(--tile-amber);
+}
+
+.ui-seg--block .ui-seg__opt--brand[aria-pressed="true"] .ui-ico {
+  color: var(--tile-brand);
+}
+
+.ui-seg--metal {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+}
+
+.ui-seg--metal .ui-seg__opt {
+  height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--soft);
+  font: 600 12px var(--body);
+  cursor: pointer;
+}
+
+.ui-seg--metal .ui-seg__opt[aria-pressed="true"] {
+  background: var(--gold-pressed);
+  font-weight: 700;
+  color: var(--gold);
+}

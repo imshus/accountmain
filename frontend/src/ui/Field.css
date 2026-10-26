@@ -1,0 +1,164 @@
+.ui-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ui-field__hint,
+.ui-field__error {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.ui-field__hint {
+  color: var(--faint);
+}
+
+.ui-field__error {
+  color: var(--rose);
+}
+
+.ui-fieldrow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+/* Higher specificity than the legacy global input/select rules. */
+.ui-input.ui-input {
+  width: 100%;
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  border-top-color: var(--edge);
+  outline: none;
+  color: var(--ink);
+  font: 600 16px/1.3 var(--body);
+}
+
+.ui-input.ui-input::placeholder {
+  color: var(--faint);
+  font-weight: 500;
+}
+
+.ui-input.ui-input:focus-visible {
+  border-color: var(--brand);
+  border-top-color: var(--brand-light);
+  outline: none;
+}
+
+.ui-input.ui-input:disabled {
+  opacity: 0.6;
+}
+
+.ui-textarea.ui-textarea {
+  resize: vertical;
+  min-height: 88px;
+}
+
+.ui-select-wrap {
+  position: relative;
+}
+
+.ui-select.ui-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 40px;
+  background-image: var(--select-chevron);
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+}
+
+.ui-select option {
+  background: var(--raised);
+  color: var(--ink);
+}
+
+.ui-select__tag {
+  position: absolute;
+  right: 44px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--gold-soft);
+  font-weight: 700;
+  font-size: 11px;
+  color: var(--gold);
+  pointer-events: none;
+}
+
+.ui-auto {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px dashed var(--border-dash);
+}
+
+.ui-auto strong {
+  font: 700 17px var(--display);
+  white-space: nowrap;
+}
+
+.ui-auto small {
+  font-size: 10.5px;
+  color: var(--faint);
+  text-align: right;
+}
+
+.ui-auto--gold {
+  color: var(--gold);
+}
+
+.ui-auto--mint {
+  color: var(--mint);
+}
+
+.ui-auto--rose {
+  color: var(--rose);
+}
+
+.ui-datepill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--brand-tint-mid);
+  font: 700 15px var(--display);
+  color: var(--brand-light);
+}
+
+.ui-datepill:focus-within {
+  outline: 2px solid var(--brand-light);
+  outline-offset: 2px;
+}
+
+/* The real date input covers the chip, invisible, so a tap opens the picker. */
+.ui-datepill__input.ui-datepill__input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.ui-datepill__input::-webkit-calendar-picker-indicator {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}

@@ -1,0 +1,26 @@
+.ui-appheader {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: calc(20px + var(--safe-top)) var(--gutter) 16px;
+}
+
+.ui-appheader__middle {
+  flex: 1;
+  min-width: 0;
+}
+
+.ui-appheader__actions {
+  display: flex;
+  gap: 4px;
+  margin-right: -10px;
+}
+
+/* The design's phone header sits 4px higher (16px + the status bar). */
+@media (max-width: 500px) {
+  .ui-appheader {
+    padding-top: calc(16px + var(--safe-top));
+  }
+}

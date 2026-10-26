@@ -134,3 +134,36 @@ export function formatDate(isoDate: string): string {
 export function formatCount(value: number): string {
   return count.format(unsignedZero(value, 0));
 }
+
+// ── The design's money and weight wording ─────────────────────────────────────────────────────────
+
+/** Rupees with the ₹ sign and Indian grouping: 123456.78 -> "₹1,23,456.78"; -7571 -> "−₹7,571.00".
+ *  `decimals` 0 for whole rupees (₹5,923), as the entry screens show totals. `sign` puts "+" on positives too. */
+export function formatRupees(rupees: number, decimals = 2, sign = false): string {
+  const v = unsignedZero(rupees, decimals);
+  const body = `₹${formatFixed(Math.abs(v), decimals)}`;
+  return v < 0 ? `−${body}` : sign && v > 0 ? `+${body}` : body;
+}
+
+/** The books' paise -> rupees text: 2843800 -> "₹28,438.00". */
+export function formatPaise(paise: number, decimals = 2, sign = false): string {
+  return formatRupees(paise / 100, decimals, sign);
+}
+
+/** The books' milligrams -> grams with 3 decimals: 10534 -> "10.534 g". */
+export function formatMg(mg: number): string {
+  return formatGrams(mg / 1000);
+}
+
+/** "2026-10-24" -> "24/10/2026" (the entry screens' date chip). */
+export function formatDMY(isoDate: string): string {
+  const [y, m, d] = isoDate.slice(0, 10).split("-");
+  return y && m && d ? `${d}/${m}/${y}` : isoDate;
+}
+
+const dayHeading = new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+
+/** "2026-10-23" -> "23 Oct 2026" (Transactions' date groups, Reports' period line). */
+export function formatDay(isoDate: string): string {
+  return dayHeading.format(new Date(`${isoDate.slice(0, 10)}T00:00:00`));
+}

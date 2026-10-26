@@ -1,0 +1,48 @@
+.ui-avatar {
+  display: inline-flex;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+}
+
+.ui-avatar--sm {
+  padding: 2.5px;
+  border-radius: 13px;
+  border: 1px solid var(--edge);
+}
+
+.theme-light .ui-avatar--sm {
+  border-color: var(--border);
+}
+
+button.ui-avatar {
+  cursor: pointer;
+}
+
+.ui-avatar__face {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--brand-text);
+  box-shadow: var(--shadow-glow);
+  color: var(--on-brand);
+  font-family: var(--display);
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.ui-avatar__face--sm {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  font-size: 12px;
+}
+
+.ui-avatar__face--lg {
+  width: 64px;
+  height: 64px;
+  border-radius: 20px;
+  font-size: 22px;
+}

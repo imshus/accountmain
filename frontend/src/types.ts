@@ -163,7 +163,38 @@ export type ChatResult = {
   provider: ProviderId;
   /** Same question on unchanged data: answered from memory, instantly. */
   cached?: boolean;
+  /** Shared sheets the AI added to the company's books (home chat with a company_id); absent from older servers. */
+  imports?: ChatImport[];
+  /** Shared sheets that look like (or might be) a sales or purchase register and are not in the books yet: the answer
+   * ends by asking which register they are (home chat with a company_id); absent from older servers. */
+  pending_registers?: PendingRegister[];
 };
+
+/** A shared sheet the AI asks about; `suggestion` is the register its data points to, null when it cannot tell. */
+export type PendingRegister = {
+  dataset_id: number;
+  table: string;
+  filename: string;
+  sheet: string;
+  suggestion: "sales" | "purchases" | null;
+};
+
+/** One shared sheet added to the books as a sales or purchase register; rows already in the books are skipped. */
+export type ChatImport = {
+  register: "sales" | "purchases";
+  dataset_id: number;
+  table: string;
+  filename: string;
+  sheet: string;
+  created: number;
+  skipped: number;
+  problems: string[];
+};
+
+/** Suggested next questions after an answer: about a book's sheets (book_id), else the files in dataset_ids. */
+export type FollowupsRequest = { messages: ChatMessage[]; dataset_ids: number[]; book_id: number | null; provider: ProviderId | null };
+/** 0 to 3 short questions; empty when the model could not suggest any. */
+export type FollowupsResponse = { suggestions: string[] };
 
 export type RowsPage = { columns: string[]; rows: Cell[][]; total: number; offset: number };
 
@@ -303,6 +334,10 @@ export type VoucherRow = {
   amount: number; // paise
   fine_mg: number;
   ledgers: string[];
+  /** Up to 3 item names of the bill, in line order (absent from older servers). */
+  items?: string[];
+  /** The bill's total net weight in milligrams; null when no line has a weight (absent from older servers). */
+  net_mg?: number | null;
 };
 
 export type MetalLineDetail = {
@@ -323,7 +358,7 @@ export type MetalLineDetail = {
   tag_no: string | null;
 };
 
-export type VoucherDetail = Omit<VoucherRow, "amount" | "ledgers" | "fine_mg"> & {
+export type VoucherDetail = Omit<VoucherRow, "amount" | "ledgers" | "fine_mg" | "items" | "net_mg"> & {
   metal_lines: MetalLineDetail[];
   lines: {
     id: number;

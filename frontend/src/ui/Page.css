@@ -1,0 +1,33 @@
+.ui-page {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.ui-page--narrow {
+  --col: var(--col-narrow);
+}
+
+.ui-page--wide {
+  --col: var(--col-wide);
+}
+
+.ui-page--full {
+  --col: 1280px;
+}
+
+.ui-page__col {
+  position: relative;
+  z-index: 1;
+  max-width: var(--col);
+  margin: 0 auto;
+  padding-bottom: calc(40px + var(--safe-bottom));
+}
+
+.ui-page__main.is-padded {
+  padding: 0 var(--gutter);
+}
+
+.ui-page__main:focus {
+  outline: none;
+}

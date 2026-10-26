@@ -1,0 +1,136 @@
+.ui-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.ui-sheet__backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--scrim-strong);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  animation: ui-sheet-fade 0.2s ease;
+}
+
+.ui-sheet__panel {
+  position: relative;
+  width: 100%;
+  max-width: 560px;
+  max-height: calc(100dvh - 48px - var(--safe-top));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px 20px calc(20px + var(--safe-bottom));
+  border-radius: 28px 28px 0 0;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-top-color: var(--edge);
+  border-bottom: 0;
+  box-shadow: var(--shadow-lg);
+  animation: ui-sheet-up 0.28s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.ui-sheet__panel:focus {
+  outline: none;
+}
+
+.ui-sheet__grip {
+  display: block;
+  width: 36px;
+  height: 4px;
+  margin: 0 auto 10px;
+  border-radius: 2px;
+  background: var(--border-dash);
+}
+
+.ui-sheet__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ui-sheet__title {
+  margin: 0;
+  font: 700 19px var(--display);
+  letter-spacing: -0.2px;
+}
+
+.ui-sheet__close {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--elevated);
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.ui-sheet__desc {
+  margin: 6px 0 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--soft);
+}
+
+.ui-sheet__body {
+  margin-top: 16px;
+}
+
+.ui-sheet__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.ui-sheet__actions > * {
+  flex: 1 1 0;
+}
+
+@media (min-width: 640px) {
+  .ui-sheet {
+    align-items: center;
+    padding: 24px;
+  }
+
+  .ui-sheet__panel {
+    max-width: 440px;
+    padding: 20px 22px 22px;
+    border-radius: 24px;
+    border-bottom: 1px solid var(--border);
+    animation-name: ui-sheet-pop;
+  }
+
+  .ui-sheet__grip {
+    display: none;
+  }
+}
+
+@keyframes ui-sheet-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes ui-sheet-up {
+  from {
+    transform: translateY(40px);
+    opacity: 0;
+  }
+}
+
+@keyframes ui-sheet-pop {
+  from {
+    transform: scale(0.97);
+    opacity: 0;
+  }
+}

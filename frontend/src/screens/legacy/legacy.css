@@ -1,0 +1,309 @@
+/* The older screens inside the new design. Their own rules (styles.css) already take the theme's colours; these
+   bring their shapes closer to the design. */
+
+.legacy {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+/* The page header already names the file / set / company. */
+.legacy .dataset-header h1 {
+  display: none;
+}
+
+.legacy .dataset-header p {
+  margin: 0;
+}
+
+.legacy .panel,
+.legacy .card,
+.legacy .step,
+.legacy .table-scroll {
+  border-top-color: var(--edge);
+}
+
+.legacy .panel {
+  border-radius: 18px;
+  padding: 16px;
+}
+
+.legacy .button {
+  border-radius: 12px;
+  min-height: 38px;
+}
+
+.legacy .button.primary {
+  background: var(--brand-solid);
+  border-color: var(--brand-solid);
+}
+
+.legacy .segmented {
+  border-radius: 14px;
+  padding: 4px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+}
+
+.legacy .segmented button {
+  border-radius: 10px;
+  padding: 0.45rem 0.9rem;
+}
+
+.legacy .segmented button.active {
+  background: var(--elevated);
+  box-shadow: var(--shadow-sm);
+}
+
+.legacy .data-table th {
+  background: var(--elevated);
+}
+
+.legacy input[type="text"],
+.legacy input[type="date"],
+.legacy input[type="number"],
+.legacy input[type="search"],
+.legacy input:not([type]),
+.legacy select,
+.legacy textarea {
+  background: var(--elevated);
+  border-radius: 10px;
+}
+
+.legacy-switch {
+  margin-bottom: 16px;
+}
+
+/* ── Files & books, Masters ── */
+
+.lib-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 22px 18px;
+  align-items: start;
+}
+
+.lib-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.lib-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 36px;
+}
+
+.lib-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.lib-row {
+  display: flex;
+  align-items: center;
+  border-radius: 16px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+
+.lib-row__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 16px;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+}
+
+button.lib-row__main {
+  cursor: pointer;
+}
+
+.lib-row__icon {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border-radius: 20px;
+  background: var(--elevated);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--brand-light);
+}
+
+.lib-row__text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.lib-row__text strong {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.lib-row__text span {
+  font-size: 12px;
+  color: var(--soft);
+  overflow-wrap: anywhere;
+}
+
+.lib-row__chev {
+  color: var(--faint);
+}
+
+.lib-row__delete {
+  width: 44px;
+  height: 44px;
+  margin-right: 4px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 22px;
+  background: none;
+  color: var(--faint);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.lib-row__delete:hover {
+  background: var(--rose-tint);
+  color: var(--rose);
+}
+
+.lib-empty {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--soft);
+}
+
+.masters-tools {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.masters-tools .ui-input {
+  flex: 1;
+}
+
+.masters-amt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  text-align: right;
+}
+
+.masters-amt strong {
+  font-weight: 700;
+  font-size: 13.5px;
+  white-space: nowrap;
+}
+
+.masters-amt span {
+  font-size: 11.5px;
+  color: var(--gold);
+}
+
+.masters-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.masters-lists {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 22px 18px;
+}
+
+.masters-lists > .lib-empty {
+  grid-column: 1 / -1;
+}
+
+.masters-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.masters-chips .ui-badge {
+  font-size: 12px;
+  padding: 3px 10px;
+}
+
+/* ── Offline ── */
+
+.server-screen {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.server-screen__col {
+  position: relative;
+  z-index: 1;
+  max-width: 480px;
+  margin: 0 auto;
+  padding: calc(56px + var(--safe-top)) var(--gutter) calc(32px + var(--safe-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.server-screen__brand {
+  width: 56px;
+  height: 56px;
+  border-radius: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--brand-text);
+  box-shadow: var(--shadow-glow);
+  color: var(--on-brand);
+  font: 700 24px var(--display);
+}
+
+.server-screen__title {
+  margin: 0;
+  font: 700 26px/1.2 var(--display);
+  letter-spacing: -0.6px;
+}
+
+.server-screen__lead {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--soft);
+}
+
+/* Wide line tables of the older entry forms scroll sideways inside their card on phones. */
+.legacy .entry-grid > .data-table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}

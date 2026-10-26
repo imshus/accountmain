@@ -1,0 +1,82 @@
+.ui-backheader {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: calc(20px + var(--safe-top)) var(--gutter) 14px;
+}
+
+.ui-backheader__back {
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 22px;
+  background: var(--elevated);
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.12s;
+}
+
+.ui-backheader__back:active {
+  transform: scale(0.94);
+}
+
+.ui-backheader__title {
+  min-width: 0;
+  margin: 0;
+  font: 700 26px/1.2 var(--display);
+  letter-spacing: -0.6px;
+  overflow-wrap: anywhere;
+}
+
+.ui-backheader--sm .ui-backheader__title {
+  flex: 1;
+  font-size: 22px;
+  letter-spacing: 0;
+}
+
+.ui-backheader--lg .ui-backheader__right {
+  margin-left: auto;
+}
+
+.ui-backheader__right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* A long name (an uploaded file's) shrinks and ends in "…" rather than breaking mid-word. */
+.ui-backheader__title.is-long {
+  flex: 1;
+  font-size: 20px;
+  letter-spacing: -0.2px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ui-backheader__title:focus {
+  outline: none;
+}
+
+@media (max-width: 500px) {
+  .ui-backheader {
+    padding-top: calc(16px + var(--safe-top));
+  }
+}
+
+@media (max-width: 360px) {
+  .ui-backheader__title {
+    font-size: 22px;
+  }
+
+  .ui-backheader__title.is-long {
+    font-size: 18px;
+  }
+}

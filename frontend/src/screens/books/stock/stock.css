@@ -1,0 +1,92 @@
+/* Stock (the owner's picture): the total fine stock, then one card per item. */
+
+.stock-screen {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* The Gold / Silver switch in the header, with finger-sized options. */
+.stock-metal {
+  display: flex;
+}
+
+.stock-metal .ui-seg.ui-seg--metal {
+  padding: 2px;
+}
+
+.stock-metal .ui-seg--metal .ui-seg__opt {
+  height: 40px;
+  padding: 0 14px;
+}
+
+.stock-total {
+  margin-bottom: 4px;
+}
+
+.stock-total__label {
+  margin: 0;
+  font-size: 13px;
+  color: var(--soft);
+}
+
+.stock-total__value {
+  margin: 6px 0 0;
+  font: 700 30px/1.2 var(--display);
+  letter-spacing: -0.5px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.stock-total__value.is-negative {
+  color: var(--rose);
+}
+
+.stock-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.stock-item__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 700;
+  font-size: 15px;
+}
+
+.stock-item__head span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.stock-item__head strong {
+  flex-shrink: 0;
+  font-weight: 700;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.stock-item__line {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--soft);
+}
+
+.stock-in {
+  color: var(--mint);
+}
+
+.stock-out {
+  color: var(--rose);
+}
+
+.stock-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
