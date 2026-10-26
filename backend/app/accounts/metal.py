@@ -18,6 +18,7 @@ Metal entries (fine weight, balanced per voucher like rupees):
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import date
 
 import numpy as np
@@ -26,7 +27,7 @@ from sqlalchemy import and_, select
 
 from .. import reports
 from ..compat import to_datetime
-from ..database import engine
+from ..database import columns_of, engine
 from ..editing import load_frame
 from ..reports import _col, _report
 from . import chart, service
@@ -239,14 +240,20 @@ _DOC_TYPES = {"s": "Sales", "sale": "Sales", "sales": "Sales", "p": "Purchase", 
               "sr": "Credit Note", "sales return": "Credit Note", "pr": "Debit Note", "purchase return": "Debit Note"}
 
 
-def detect_jewellery(sheet: dict) -> dict[str, str] | None:
-    """Column mapping when the sheet is a jewellery register (fine weight, or net weight and tunch), else None."""
+def register_columns(sheet: dict) -> dict[str, str]:
+    """Role -> column of the jewellery columns (fine, net, tunch, item...) a register has, by name."""
     names = [c["name"] for c in sheet["profile"]["columns"]]
     found: dict[str, str] = {}
     for role, pattern in _COLUMNS.items():
         hit = next((n for n in names if re.match(pattern, n) and n not in found.values()), None)
         if hit:
             found[role] = hit
+    return found
+
+
+def detect_jewellery(sheet: dict) -> dict[str, str] | None:
+    """Column mapping when the sheet is a jewellery register (fine weight, or net weight and tunch), else None."""
+    found = register_columns(sheet)
     if "fine" in found or "silver_fine" in found or ("net" in found and "tunch" in found):
         return found
     return None
@@ -293,14 +300,16 @@ def _value(row, column: str | None):
     return None if value is None or (not isinstance(value, str) and pd.isna(value)) else value
 
 
-def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
+def import_jewellery(company_id: int, sheet: dict, register: str, before_commit: Callable[[], None] | None = None) -> dict:
     """Post a jewellery register: one voucher per invoice (date + voucher no. + party), rupees for the
     billed value and metal lines for every item's fine weight. Each item's net and fine weight are
-    re-computed and any difference from the register is reported (the register's figure is posted)."""
+    re-computed and any difference from the register is reported (the register's figure is posted).
+    Each voucher also keeps its rows' item names and net weight for the voucher list. ``before_commit``: as in
+    imports.import_register."""
     from ..books import _normalise  # rupee columns: taxable value, GST, invoice value, party, GSTIN
     from .imports import (_imported_sources, already_in_books, check_reported_state, document_number, duplicates_note,
-                          existing_documents, gstin_warnings, ledger_facts, note_bad_gstin, number_clash, party_state,
-                          place_of_supply, posting_lines, split_unsplit_gst)
+                          existing_documents, gstin_warnings, ledger_facts, note_bad_gstin, note_register, number_clash,
+                          party_state, place_of_supply, posting_lines, split_unsplit_gst)
 
     cols = detect_jewellery(sheet)
     if cols is None:
@@ -386,6 +395,10 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
             total = taxable = 0
             heads = {"cgst": 0, "sgst": 0, "igst": 0, "cess": 0}
             signs: dict[str, set[int]] = {"weights": set(), "rupees": set()}  # each the same way on every line of a return
+            # The bill's items and net weight, each register row once: a row with gold and silver fine posts two stock
+            # lines with the same details, and a row with no fine (a loose diamond, say) posts none.
+            names: list[str] = []
+            weight = 0
             for rowid in rowids:
                 r, m = raw.loc[rowid], money.loc[rowid]
                 where = f"row {rowid}"
@@ -437,6 +450,10 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
                     details["tag_no"] = str(details["tag_no"])[:40]
                 if details["item"] is not None:
                     details["item"] = str(details["item"])[:120]
+                    item = " ".join(details["item"].split())
+                    if item and item not in names:
+                        names.append(item)
+                weight += net
                 for name, fine in fines.items():
                     if fine:
                         metal.append(MetalLine(stock_ledger(conn, company_id, name), name, dr=0 if out else fine, cr=fine if out else 0, details=details))
@@ -472,7 +489,8 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
                 with conn.begin_nested():
                     service.save_voucher(company_id, vtype, pd.Timestamp(day).date(), lines, number=num or None, reference=reference,
                                          narration=f"Imported from {sheet['sheet_name']} ({len(rowids)} item{'s' if len(rowids) != 1 else ''})",
-                                         source=source, conn=conn, metal=metal)
+                                         source=source, conn=conn, metal=metal, items_text="\n".join(names) or None,
+                                         net_mg=weight or None)
                 created += 1
                 note_bad_gstin(bad_gstins, first.gstin, label, used)
                 for line in metal:
@@ -480,6 +498,9 @@ def import_jewellery(company_id: int, sheet: dict, register: str) -> dict:
                         moved[line.metal] += line.dr + line.cr
             except AccountsError as exc:
                 problems.append(number_clash(conn, in_books, vtype, num, on_day, label, str(exc)) or f"{label}: {exc}")
+        note_register(conn, company_id, sheet["table_name"], register)
+        if before_commit:
+            before_commit()
 
     already = duplicates_note(duplicates, register == "purchases")
     problems += gstin_warnings(bad_gstins)
@@ -516,6 +537,25 @@ def metal_entries(company_id: int, metal: str, until: date | None = None) -> pd.
     for col in ("dr", "cr"):
         frame[col] = frame[col].astype("int64")
     return frame
+
+
+def stored_items(company_id: int, start: date, end: date) -> pd.DataFrame:
+    """Item and net weight (mg) of every live bill in the period that only its voucher describes: a register imported
+    without tunch or fine posts no metal lines, but keeps the bill's item names (items_text) and net weight on the voucher.
+    A bill whose metal lines carry items is left out (those lines count it). Several items with one weight: "Mixed items".
+    'out': the metal left stock (a sale, or a purchase return)."""
+    m, v = metal_lines, vouchers
+    head = columns_of(v)  # NULL for a database that could not be given the columns: no bill then
+    described = select(m.c.voucher_id).where(m.c.item.isnot(None) | m.c.net_mg.isnot(None))
+    query = (select(v.c.vtype, head["items_text"], head["net_mg"])
+             .where(and_(v.c.company_id == company_id, v.c.cancelled.is_(False), v.c.date >= start, v.c.date <= end,
+                         v.c.vtype.in_(("Sales", "Purchase", "Credit Note", "Debit Note")), head["net_mg"] > 0,
+                         v.c.id.notin_(described))))
+    with engine.connect() as conn:
+        frame = pd.read_sql(query, conn)
+    names = [[n for n in text.split("\n") if n.strip()] if isinstance(text, str) else [] for text in frame["items_text"]]
+    return pd.DataFrame({"item": [n[0] if len(n) == 1 else "Mixed items" if n else "(no name)" for n in names],
+                         "net_mg": frame["net_mg"].astype("int64"), "out": frame["vtype"].isin(SALE_LIKE)})
 
 
 def _openings(company_id: int, metal: str) -> pd.Series:
@@ -721,6 +761,23 @@ def stock_grams(company: dict, metal: str, start: date | None, end: date | None)
         item_rows.append({"item": item, "karat": karat, "pcs": int(g.pcs.sum()), "gross": grams(g.gross_mg.sum()), "net": grams(g.net_mg.sum()),
                           "fine": grams(g.cr.sum()), "dia": int(g.dia_mct.sum()) / 1000, "stn": int(g.stn_mct.sum()) / 1000})
     item_rows.sort(key=lambda r: -r["fine"])
+
+    # Stock of each item: what came in less what went out, all karats together.
+    moves: dict[str, list[int]] = {}  # item -> [net in mg, net out mg, fine in - out mg, diamonds in - out mct]
+    for item, g in inside.groupby(inside.item.fillna("(no name)")):
+        i, o = g[g.dr > 0], g[g.cr > 0]
+        moves[item] = [int(i.net_mg.sum()), int(o.net_mg.sum()), int(g.dr.sum()) - int(g.cr.sum()),
+                       int(i.dia_mct.sum()) - int(o.dia_mct.sum())]
+    # Bills with no metal lines (a plain register, added here or from the chat) move their net weight too. Their metal is
+    # not known: they go in the report of the first metal in use (gold when none), so each counts once. Their fine and
+    # diamonds are not known either, so they add none, and the fine cards count metal lines only.
+    in_use = metals_in_use(company["id"])
+    if metal == (in_use or ["gold"])[0]:
+        for item, net_mg, out in stored_items(company["id"], start, end).itertuples(index=False):
+            moves.setdefault(item, [0, 0, 0, 0])[1 if out else 0] += int(net_mg)
+    stock_rows = [{"item": item, "net_in": grams(net_in), "net_out": grams(net_out), "net": grams(net_in - net_out),
+                   "fine": grams(fine), "dia": dia / 1000} for item, (net_in, net_out, fine, dia) in moves.items()]
+    stock_rows.sort(key=lambda r: (-abs(r["fine"]), -abs(r["net"]), r["item"]))
     w = _wcol
     report = _report(f"{metal.title()} stock in grams", {}, cards=[
         {"label": "Opening (fine)", "value": grams(opening), "format": "weight"},
@@ -742,7 +799,10 @@ def stock_grams(company: dict, metal: str, start: date | None, end: date | None)
                                                      w("gross", "Gross"), w("net", "Net"), w("fine", "Fine"),
                                                      _col("dia", "Diamonds", "carat"), _col("stn", "Stones", "carat")],
          "rows": item_rows, "total": None},
-    ], options={"metals": metals_in_use(company["id"]) or [metal]})
+        {"title": "By item", "columns": [_col("item", "Item", "text"), w("net_in", "Net in"), w("net_out", "Net out"),
+                                         w("net", "Net in − out"), w("fine", "Fine in − out"), _col("dia", "Diamonds in − out", "carat")],
+         "rows": stock_rows, "total": None},
+    ], options={"metals": in_use or [metal]})
     ok = opening + fine_in - fine_out == closing
     report["checks"].append({"level": "ok" if ok else "warning",
                              "message": f"Opening {_g(opening)} + in {_g(fine_in)} − out {_g(fine_out)} = closing {_g(closing)} (fine)."})

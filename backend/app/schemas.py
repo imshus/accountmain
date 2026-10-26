@@ -275,6 +275,8 @@ class ChatRequest(BaseModel):
 class FilesChatRequest(ChatRequest):
     """A chat over files shared in the conversation (the main chat screen)."""
     dataset_ids: list[int] = Field(default=[], max_length=10)  # none yet: general accounting questions
+    # The company whose books the AI may add a shared file to (as its sales or purchase register); None: it may not.
+    company_id: int | None = None
 
 
 class FollowupsRequest(BaseModel):
@@ -354,12 +356,29 @@ class Verification(BaseModel):
     corrected: bool
 
 
+class PendingRegister(BaseModel):
+    """A shared sheet that is (or may be) a sales or purchase register and is not in the company's books yet."""
+
+    dataset_id: int
+    table: str
+    filename: str
+    sheet: str
+    # The register the detection suggests (fairly sure, nothing pointing to the other one); None: unclear.
+    suggestion: Literal["sales", "purchases"] | None = None
+
+
 class ChatResponse(BaseModel):
     answer: str
     queries: list[QueryOut]
     calculations: list[CalculationOut]
     formula_checks: list[dict[str, Any]]
     analyses: list[dict[str, Any]] = []
+    # Shared sheets this answer added to the company's books: {register, dataset_id, table, filename, sheet, created,
+    # skipped, problems}. Rows already in the books are skipped, so a repeat creates 0.
+    imports: list[dict[str, Any]] = []
+    # With a company chosen: shared sheets not in its books yet, when the person's latest message did not say which
+    # register and this answer added nothing. The answer then ends asking which register; the app offers a button each.
+    pending_registers: list[PendingRegister] = []
     verification: Verification
     model: str
     provider: ProviderId

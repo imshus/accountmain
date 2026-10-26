@@ -25,12 +25,14 @@ from datetime import date
 from . import analysis, books, classify, cloud, config, database, detect, editing, llm, mongo_sync, reports
 from .accounts import api as accounts_api
 from .accounts import db as _accounts_tables  # noqa: F401  (registers the books tables before create_all)
+from .accounts import imports as accounts_imports
+from .accounts import service as accounts_service
 from .analytics import profile_sheet
 from .calc import CalcError, evaluate_number, format_decimal
 from .duck import Session, cached, sheet_key
 from .excel_loader import UploadError, read_workbook
 from .llm import followups
-from .llm.common import describe_tables, warm_tables
+from .llm.common import describe_tables, says_register, warm_tables
 from .schemas import (
     AddRowRequest,
     AnalysisRequest,
@@ -224,9 +226,12 @@ def upload(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     sheets = [(s.name, s.frame, profile_sheet(s.frame, s.labels, s.checks)) for s in parsed]
-    dataset_id = database.save_dataset(filename, len(content), sheets)
+    # Filed under the register it clearly is, else unsorted until a sheet of it is added to the books.
+    register = detect.upload_register([{"sheet_name": name, "row_count": len(frame), "profile": profile}
+                                       for name, frame, profile in sheets], filename)
+    dataset_id = database.save_dataset(filename, len(content), sheets, register)
     try:
-        cloud.enqueue(dataset_id, filename, content)  # background copy to Supabase, when set up
+        cloud.enqueue(dataset_id, filename, content, register)  # background copy to Supabase, when set up
     except Exception as exc:  # noqa: BLE001 - the upload has succeeded; the copy must never turn it into an error
         print(f"Supabase copy of upload {dataset_id} not queued ({type(exc).__name__}).")
     mongo_sync.touch("upload", dataset_id)  # after enqueue, so MongoDB's copy shows the Supabase copy as waiting
@@ -651,22 +656,53 @@ def documents(body: DocumentsRequest):
     return found
 
 
+def _books_company(company_id: int | None, sheets: list[dict]) -> int | None:
+    """The company whose books the chat may add a shared sheet to: one that exists, and only when files are shared.
+    A company deleted meanwhile is not an error: the chat still answers, without that tool."""
+    if company_id is None or not sheets:
+        return None
+    try:
+        accounts_service.get_company(company_id)
+    except accounts_service.AccountsError:
+        return None
+    return company_id
+
+
+def _pending_registers(found: list[dict], company_id: int | None, messages: list[dict]) -> list[dict]:
+    """Shared sheets that are (or may be) a sales or purchase register and are not in the company's books yet (nor
+    imported as a register already, whatever that import posted), while the person's latest message does not say which
+    register: the answer asks, and the app shows a button for each register. Only with a company. The suggestion is the
+    detected register when it is fairly sure and nothing points the other way."""
+    previous = messages[-2]["content"] if len(messages) > 1 and messages[-2]["role"] == "assistant" else ""
+    if company_id is None or says_register(messages[-1]["content"], llm.strip_context(previous)):
+        return []
+    candidates = [f for f in found if f["kind"] in books.REGISTERS]
+    tables = [f["table_name"] for f in candidates]
+    in_books = accounts_imports.imported_tables(company_id, tables) | accounts_imports.answered_tables(company_id, tables)
+    return [{"dataset_id": f["dataset_id"], "table": f["table_name"], "filename": f["filename"], "sheet": f["sheet_name"],
+             "suggestion": f["kind"] if f["confidence"] in _CONFIDENT and not f["against_register"] else None}
+            for f in candidates if f["table_name"] not in in_books]
+
+
 @app.post("/api/chat/stream")
 def files_chat_stream(body: FilesChatRequest):
-    sheets, registers, documents_text, _found = _shared_files(body.dataset_ids)
+    sheets, registers, documents_text, found = _shared_files(body.dataset_ids)
     messages = _chat_messages(body)
+    company_id = _books_company(body.company_id, sheets)
+    pending = _pending_registers(found, company_id, messages)
 
     def answer(emit, cancel):
         if not registers:
             return llm.chat(body.provider, messages, sheets, emit=emit, fresh=body.fresh, documents=documents_text,
-                            cancel=cancel)
+                            cancel=cancel, company_id=company_id, pending=pending)
         table, comparison = _register_jobs(registers)
         wait = _waiter(emit, cancel)
         stacked = wait(table)
         extra = {"registers": stacked} if stacked else {}
         # The app's exact comparison of the two registers, read only when the answer is not remembered.
         return llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh, documents=documents_text,
-                        combined=(lambda: wait(comparison)) if stacked else None, cancel=cancel)
+                        combined=(lambda: wait(comparison)) if stacked else None, cancel=cancel, company_id=company_id,
+                        pending=pending)
 
     return _stream_chat(answer)
 

@@ -24,7 +24,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from sqlalchemy import and_, func, insert, select, update
 
 from .. import gst
-from ..database import engine
+from ..database import columns_of, engine
 from ..excel_loader import to_number
 from . import chart
 from .db import audit_log, bank_lines, bill_allocations, companies, ledgers, metal_lines, metal_openings, voucher_lines, vouchers
@@ -434,7 +434,7 @@ def pending_by_bill(conn, party_id: int) -> dict[str, int]:
 
 
 def _snapshot(conn, voucher_id: int) -> dict:
-    head = conn.execute(select(vouchers).where(vouchers.c.id == voucher_id)).mappings().first()
+    head = conn.execute(select(*columns_of(vouchers).values()).where(vouchers.c.id == voucher_id)).mappings().first()
     lines = conn.execute(select(voucher_lines).where(voucher_lines.c.voucher_id == voucher_id).order_by(voucher_lines.c.position)).mappings().all()
     line_ids = [l["id"] for l in lines]
     bills = conn.execute(select(bill_allocations).where(bill_allocations.c.line_id.in_(line_ids))).mappings().all() if line_ids else []
@@ -467,7 +467,9 @@ def _write_lines(conn, voucher_id: int, day: date, lines: list[Line], credit_day
 
 def save_voucher(company_id: int, vtype: str, day: date, lines: list[Line], *, number: str | None = None, narration: str = "",
                  reference: str = "", source: str = "manual", voucher_id: int | None = None, conn=None,
-                 metal: list[MetalLine] | None = None) -> int:
+                 metal: list[MetalLine] | None = None, items_text: str | None = None, net_mg: int | None = None) -> int:
+    """items_text / net_mg: an imported bill's item names and net weight, for the voucher list (kept by an update that
+    leaves the items on its metal lines as they were)."""
     metal = metal or []
 
     def run(c) -> int:
@@ -486,15 +488,18 @@ def save_voucher(company_id: int, vtype: str, day: date, lines: list[Line], *, n
                 raise AccountsError("This voucher is in the locked period and cannot be changed.")
             c.execute(voucher_lines.delete().where(voucher_lines.c.voucher_id == voucher_id))
             c.execute(metal_lines.delete().where(metal_lines.c.voucher_id == voucher_id))
+            # Once an edit changes the items, the list reads them from the new metal lines, not the import's summary.
+            same = [[m[k] for k in METAL_DETAILS] for m in before["metal_lines"]] == [[l.details.get(k) for k in METAL_DETAILS] for l in metal]
             c.execute(update(vouchers).where(vouchers.c.id == voucher_id).values(
-                vtype=vtype, number=num, date=day, narration=narration, reference=reference, updated_at=_now()))
+                vtype=vtype, number=num, date=day, narration=narration, reference=reference, updated_at=_now(),
+                **({} if same else {"items_text": None, "net_mg": None})))
             _write_lines(c, voucher_id, day, lines, credit_days)
             _write_metal(c, voucher_id, metal)
             _audit(c, company_id, "update", "voucher", voucher_id, before, _snapshot(c, voucher_id))
             return voucher_id
         new_id = c.execute(insert(vouchers).values(
             company_id=company_id, vtype=vtype, number=num, date=day, narration=narration, reference=reference,
-            source=source, cancelled=False, created_at=_now(), updated_at=_now(),
+            source=source, cancelled=False, created_at=_now(), updated_at=_now(), items_text=items_text, net_mg=net_mg,
         )).inserted_primary_key[0]
         _write_lines(c, new_id, day, lines, credit_days)
         _write_metal(c, new_id, metal)
@@ -539,10 +544,14 @@ def stored_metal(snapshot: dict) -> list[MetalLine]:
 def list_vouchers(company_id: int, vtype: str | None, start: date | None, end: date | None, search: str | None,
                   offset: int, limit: int) -> dict:
     v, l, m = vouchers, voucher_lines, metal_lines
+    head = columns_of(v)
     totals = select(l.c.voucher_id, func.sum(l.c.dr_paise).label("amount")).group_by(l.c.voucher_id).subquery()
-    fine = select(m.c.voucher_id, func.sum(m.c.dr_mg).label("fine_mg")).group_by(m.c.voucher_id).subquery()
+    # Each item's net weight is on its own stock line; the party or Sales line on the other side carries none.
+    fine = (select(m.c.voucher_id, func.sum(m.c.dr_mg).label("fine_mg"), func.sum(m.c.net_mg).label("item_net_mg"))
+            .group_by(m.c.voucher_id).subquery())
     # Outer joins: metal-only vouchers have no rupee lines, and most vouchers have no metal.
-    query = (select(v, func.coalesce(totals.c.amount, 0).label("amount"), func.coalesce(fine.c.fine_mg, 0).label("fine_mg"))
+    query = (select(*head.values(), func.coalesce(totals.c.amount, 0).label("amount"), func.coalesce(fine.c.fine_mg, 0).label("fine_mg"),
+                    fine.c.item_net_mg)
              .outerjoin(totals, totals.c.voucher_id == v.c.id).outerjoin(fine, fine.c.voucher_id == v.c.id)
              .where(v.c.company_id == company_id))
     if vtype:
@@ -556,13 +565,14 @@ def list_vouchers(company_id: int, vtype: str | None, start: date | None, end: d
         matching = select(l.c.voucher_id).join(ledgers, ledgers.c.id == l.c.ledger_id).where(ledgers.c.name.ilike(like))
         matching_metal = select(m.c.voucher_id).join(ledgers, ledgers.c.id == m.c.ledger_id).where(
             ledgers.c.name.ilike(like) | m.c.item.ilike(like) | m.c.tag_no.ilike(like))
-        query = query.where(v.c.number.ilike(like) | v.c.narration.ilike(like) | v.c.reference.ilike(like)
+        query = query.where(v.c.number.ilike(like) | v.c.narration.ilike(like) | v.c.reference.ilike(like) | head["items_text"].ilike(like)
                             | v.c.id.in_(matching) | v.c.id.in_(matching_metal))
     with engine.connect() as conn:
         total = conn.execute(select(func.count()).select_from(query.subquery())).scalar_one()
         rows = conn.execute(query.order_by(v.c.date.desc(), v.c.id.desc()).offset(offset).limit(limit)).mappings().all()
         ids = [r["id"] for r in rows]
         parties: dict[int, list[str]] = {}
+        items: dict[int, list[str]] = {}
         if ids:
             for table in (l, m):
                 for vid, name in conn.execute(
@@ -571,7 +581,22 @@ def list_vouchers(company_id: int, vtype: str | None, start: date | None, end: d
                 ).all():
                     if name not in parties.setdefault(vid, []):
                         parties[vid].append(name)
-    return {"total": total, "rows": [dict(r) | {"ledgers": parties.get(r["id"], [])} for r in rows]}
+            # Each name once, in the order of its first line.
+            for vid, name in conn.execute(
+                select(m.c.voucher_id, m.c.item).where(m.c.voucher_id.in_(ids), m.c.item.isnot(None))
+                .group_by(m.c.voucher_id, m.c.item).order_by(func.min(m.c.position))
+            ).all():
+                items.setdefault(vid, []).append(name)
+    out = []
+    for r in rows:
+        row = dict(r) | {"ledgers": parties.get(r["id"], [])}
+        stored, item_net = row.pop("items_text"), row.pop("item_net_mg")
+        if stored is None and row["net_mg"] is None:  # entered by hand: its metal lines describe the items, if any
+            row |= {"items": items.get(r["id"], [])[:3], "net_mg": item_net}
+        else:  # imported: the register's own rows, each item and weight once (net_mg is the voucher's own column)
+            row["items"] = stored.split("\n")[:3] if stored else []
+        out.append(row)
+    return {"total": total, "rows": out}
 
 
 def audit_trail(company_id: int, limit: int = 200) -> list[dict]:

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 # pydantic (which builds the tool schemas) accepts typing.TypedDict only from Python 3.12 on.
 from typing_extensions import TypedDict
 
 from .. import config
-from .common import (CUT_OFF_NOTE, DECLINED, EMPTY_ANSWER, MAX_TOOL_ROUNDS, NEEDS_MORE_STEPS, LLMError, Reply, Toolbox,
-                     closing_on_cancel, tool_error)
+from .common import (BOOKS_TOOL_DESCRIPTION, CUT_OFF_NOTE, DECLINED, EMPTY_ANSWER, MAX_TOOL_ROUNDS, NEEDS_MORE_STEPS,
+                     LLMError, Reply, Toolbox, books_tool_schema, closing_on_cancel, tool_error)
 
 class MeasureArg(TypedDict):
     agg: Literal["sum", "count", "average", "min", "max", "distinct"]
@@ -103,6 +103,17 @@ def chat(messages: list[dict], instructions: str, tools: Toolbox, emit=None, eff
         except Exception as exc:  # noqa: BLE001
             raise ToolError(tool_error(exc)) from exc
 
+    def add_to_books(table: str, register: Optional[str] = None) -> str:  # None: the detected register
+        try:
+            return tools.add_to_books(table, register)
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(tool_error(exc)) from exc
+
+    available = [analyse, run_sql, calculate, check_formula]
+    if tools.can_add_to_books:  # its schema lists the shared tables, so it is built per chat
+        available.append(beta_tool(name="add_to_books", description=BOOKS_TOOL_DESCRIPTION,
+                                   input_schema=books_tool_schema(tools.sheets))(add_to_books))
+
     options = {}
     if config.ANTHROPIC_MODEL in _FALLBACK_MODELS:
         # If a safety classifier declines, the API retries on a fallback model in the same call.
@@ -115,7 +126,7 @@ def chat(messages: list[dict], instructions: str, tools: Toolbox, emit=None, eff
         model=config.ANTHROPIC_MODEL,
         max_tokens=16000,
         system=instructions,
-        tools=[analyse, run_sql, calculate, check_formula],
+        tools=available,
         output_config={"effort": effort or config.ANTHROPIC_EFFORT},
         max_iterations=MAX_TOOL_ROUNDS,
         messages=conversation,

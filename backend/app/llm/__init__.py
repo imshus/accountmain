@@ -2,7 +2,8 @@
 
 Both models get the same instructions and the same tools: ``analyse`` (totals and
 breakdowns on exact decimals, no SQL), ``run_sql`` (read-only DuckDB, limited to the tables
-of the selected upload), ``calculate`` (exact decimal arithmetic) and ``check_formula``. After each answer every figure in it is checked against what the tools
+of the selected upload), ``calculate`` (exact decimal arithmetic) and ``check_formula``; in a chat over shared files with
+a company chosen, also ``add_to_books`` (posts a shared sheet to that company's books). After each answer every figure in it is checked against what the tools
 returned; if any figure does not match, the model is asked once to recompute and
 correct its answer, and whatever is still unverified is reported to the user.
 """
@@ -21,7 +22,7 @@ from .. import config
 from ..duck import sheet_key
 from . import claude, gpt
 from .common import (EMPTY_ANSWER, REPAIR_PROMPT, CancelEvent, Cancelled, LLMError, Reply, Toolbox, build_instructions,
-                     is_fallback, reply_language, strip_context)
+                     is_fallback, pending_text, reply_language, strip_context)
 from .verify import indian_digits, known_values, verify
 
 __all__ = ["CancelEvent", "Cancelled", "LLMError", "chat", "default_provider", "provider_status", "strip_context"]
@@ -61,19 +62,23 @@ PROVIDERS = {
 }
 
 # Answers to the same conversation on the same data, so asking again is instant. Only checked, complete
-# answers are kept (never a refusal, a cut-off answer or a stopped one), and any change to a sheet changes the key.
+# answers are kept (never a refusal, a cut-off answer, a stopped one or one that added to the books), and any change
+# to a sheet changes the key.
 _ANSWERS: OrderedDict[tuple, dict] = OrderedDict()
 _ANSWERS_MAX = 200
 _ANSWERS_LOCK = threading.Lock()
 
 
 def _answer_key(provider: Provider, messages: list[dict], sheets: list[dict], extra: dict | None,
-                documents: str | None, combined: bool) -> tuple:
+                documents: str | None, combined: bool, company_id: int | None = None,
+                pending: list[dict] | None = None) -> tuple:
     extra_keys = tuple(sorted((name, str(frame.attrs.get("cache_key"))) for name, (frame, *_rest) in (extra or {}).items()))
     # A chat about shared files (told what each file is) must not reuse an answer given without that context.
-    # The comparison text is derived from the registers in ``extra``, which the key already covers.
+    # The comparison text is derived from the registers in ``extra``, which the key already covers. The company
+    # decides whether the model may add to the books, and whose: an answer for another company is never reused. An
+    # answer asking which register a file is holds only while the file is still not in the books, and the reverse.
     return (provider.id, provider.model, provider.effort(), tuple(sheet_key(s) for s in sheets), extra_keys, documents,
-            combined, json.dumps(messages, ensure_ascii=False))
+            combined, company_id, json.dumps(pending or [], sort_keys=True), json.dumps(messages, ensure_ascii=False))
 
 
 def default_provider() -> str:
@@ -93,10 +98,13 @@ def provider_status() -> list[dict]:
 
 def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extra: dict | None = None, emit=None,
          fresh: bool = False, documents: str | None = None, combined: Callable[[], str] | None = None,
-         cancel: threading.Event | None = None) -> dict:
+         cancel: threading.Event | None = None, company_id: int | None = None, pending: list[dict] | None = None) -> dict:
     """Answer the conversation. ``emit`` receives live progress: steps, answer text as it is written,
     and "reset" when a draft is replaced (a correction round). ``combined`` returns the registers comparison
     added to ``documents``; it is called only when the answer is not remembered (it can take seconds).
+    With ``company_id`` (an existing company) and sheets, the model may post a sheet to that company's books.
+    ``pending``: shared sheets not in that company's books whose register the person has not said; the answer asks,
+    and returns them as pending_registers unless it added a sheet to the books.
     Once ``cancel`` is set the answer stops with Cancelled and is not kept."""
     send = emit or (lambda _event: None)
 
@@ -110,7 +118,9 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         raise LLMError(
             503, f"{provider.label} is not set up. Add {provider.key_name} to backend/.env and restart the backend."
         )
-    key = _answer_key(provider, messages, sheets, extra, documents, combined is not None)
+    company_id = company_id if sheets else None
+    pending = list(pending or []) if company_id is not None else []
+    key = _answer_key(provider, messages, sheets, extra, documents, combined is not None, company_id, pending)
     with _ANSWERS_LOCK:
         remembered = copy.deepcopy(_ANSWERS[key]) if key in _ANSWERS and not fresh else None
         if remembered:
@@ -119,7 +129,11 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         emit({"type": "delta", "text": remembered["answer"]})
         return {**remembered, "cached": True}
 
-    tools = Toolbox({sheet["table_name"]: sheet for sheet in sheets}, extra, emit=emit, cancel=cancel)
+    latest = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+    # The answer the latest message replies to: if it asked which register, naming both, the person may overrule the detection.
+    previous = messages[-2]["content"] if len(messages) > 1 and messages[-2]["role"] == "assistant" else ""
+    tools = Toolbox({sheet["table_name"]: sheet for sheet in sheets}, extra, emit=emit, cancel=cancel, company_id=company_id,
+                    request=latest, previous=strip_context(previous))
 
     def run(conversation: list[dict], effort: str, transcript: list | None = None) -> Reply:
         out = provider.run(conversation, instructions, tools, emit, effort, **({"transcript": transcript} if transcript else {}))
@@ -135,6 +149,8 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         return dataclasses.replace(reply, text=answer, complete=reply.complete and not is_fallback(answer))
 
     try:
+        if pending:
+            documents = f"{documents}\n\n{pending_text(pending)}" if documents else pending_text(pending)
         if combined is not None:
             documents = f"{documents}\n\n{combined()}" if documents else combined()
         # Data ready by the time the model asks for it; started after the documents so it does not slow them down.
@@ -175,6 +191,9 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         "calculations": tools.calculations,
         "formula_checks": tools.formula_checks,
         "analyses": tools.analyses,
+        "imports": tools.imports,
+        # Still to be added once the person says which register; nothing is pending after an answer that added a sheet.
+        "pending_registers": [] if tools.imports else pending,
         "verification": {**check, "corrected": corrected},
         "model": reply.model,
         "provider": provider.id,
@@ -182,7 +201,8 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
     }
     if cancel is not None and cancel.is_set():
         raise Cancelled()  # stopped as it finished: nobody saw this answer, so it is not kept either
-    if check["status"] != "unverified" and reply.complete:
+    # An answer that added to the books reports what that call did; asked again, the books must be asked again.
+    if check["status"] != "unverified" and reply.complete and not tools.added_to_books:
         with _ANSWERS_LOCK:
             _ANSWERS[key] = copy.deepcopy(result)
             while len(_ANSWERS) > _ANSWERS_MAX:

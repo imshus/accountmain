@@ -16,18 +16,19 @@ from __future__ import annotations
 
 import math
 import re
-
-from datetime import date
+from collections.abc import Callable
+from datetime import date, datetime, timezone
 
 import pandas as pd
 from sqlalchemy import and_, insert, select
+from sqlalchemy.exc import OperationalError
 
 from .. import gst, reports
 from ..books import _normalise
 from ..database import engine
 from ..editing import load_frame
 from . import chart, service
-from .db import bank_lines, ledgers, metal_lines, voucher_lines, vouchers
+from .db import bank_lines, ledgers, metal_lines, register_imports, voucher_lines, vouchers
 from .service import AccountsError, Line
 
 ROUND_OFF_LIMIT = 100  # paise
@@ -37,6 +38,41 @@ def _imported_sources(conn, company_id: int, prefix: str) -> set[str]:
     return set(conn.execute(select(vouchers.c.source).where(and_(
         vouchers.c.company_id == company_id, vouchers.c.source.like(f"{prefix}%"), vouchers.c.cancelled.is_(False),
     ))).scalars())
+
+
+def imported_tables(company_id: int, tables) -> set[str]:
+    """The sheets (table names) among ``tables`` already in the company's books: a live voucher came from one of their
+    rows (import_register and the jewellery import both mark it "import:<table>:<row>")."""
+    found = set()
+    with engine.connect() as conn:
+        for table in dict.fromkeys(tables):
+            if conn.execute(select(vouchers.c.id).where(and_(
+                    vouchers.c.company_id == company_id, vouchers.c.cancelled.is_(False),
+                    vouchers.c.source.startswith(f"import:{table}:", autoescape=True))).limit(1)).first():
+                found.add(table)
+    return found
+
+
+def answered_tables(company_id: int, tables) -> set[str]:
+    """The sheets among ``tables`` that a register import has run for in the company's books (the person said which
+    register they are), even one that posted nothing new: every row already in the books, or none could be posted."""
+    tables = list(dict.fromkeys(tables))
+    if not tables:
+        return set()
+    try:
+        with engine.connect() as conn:
+            return set(conn.execute(select(register_imports.c.table_name).where(and_(
+                register_imports.c.company_id == company_id, register_imports.c.table_name.in_(tables)))).scalars())
+    except OperationalError as exc:  # a database that could not be written at startup lacks the table: none yet
+        if "no such table" in str(exc):
+            return set()
+        raise
+
+
+def note_register(conn, company_id: int, table: str, register: str) -> None:
+    """Remember, in the import's transaction, that ``table`` was imported as ``register`` (see answered_tables)."""
+    conn.execute(insert(register_imports).prefix_with("OR REPLACE").values(
+        company_id=company_id, table_name=table, register=register, at=datetime.now(timezone.utc)))
 
 
 def financial_year(day: date) -> date:
@@ -360,16 +396,45 @@ def document_number(sales: bool, number: str, label: str, problems: list[str]) -
     return number, ""
 
 
-def import_register(company_id: int, sheet: dict, register: str) -> dict:
+def _item_columns(sheet: dict, found: dict[str, str]) -> tuple[str | None, str | None]:
+    """(item column, net-weight column) of a register that is not posted by weight. A bare "Net" is a weight only beside
+    other jewellery columns (purity, tunch, gross weight...); elsewhere it is usually the net amount in rupees."""
+    names = [c["name"] for c in sheet["profile"]["columns"]]
+    net = found.get("net")
+    if net == "net" and not any(reports._JEWELLERY_COLUMN.search(n) for n in names):
+        net = None
+    return reports.effective_mapping(sheet["profile"]).get("item") or found.get("item"), net
+
+
+_MAX_NET_MG = 10 ** 12  # a thousand tonnes: a larger "weight" is something else (a barcode pasted into the column)
+
+
+def _item_summary(row, item_col: str | None, net_col: str | None) -> tuple[str | None, int | None]:
+    """(item name, net weight in mg) of one register row, kept on its voucher so the list can show "Ring · 12 g"."""
+    name = _text(row[item_col]) if item_col else None
+    try:
+        net = abs(service.to_mg(row[net_col], "Net weight")) if net_col else 0
+    except (ArithmeticError, ValueError, TypeError):  # not a weight (AccountsError is a ValueError): posted without one
+        net = 0
+    return (" ".join(name.split())[:120] if name else None), (net if 0 < net <= _MAX_NET_MG else None)
+
+
+def import_register(company_id: int, sheet: dict, register: str, before_commit: Callable[[], None] | None = None) -> dict:
     """Post one sales or purchase register sheet. Returns counts and a list of problems.
-    Jewellery registers (fine weight / tunch columns) are posted by weight; see metal.import_jewellery."""
+    Jewellery registers (fine weight / tunch columns) are posted by weight; see metal.import_jewellery.
+    A row's item name and net weight, when the register has them, are kept on its voucher for the voucher list
+    (no metal lines: the rupees are all that is posted). ``before_commit`` is called last, inside the transaction: if
+    it raises (the chat that asked for the import was stopped), nothing is posted."""
     if register not in ("sales", "purchases"):
         raise AccountsError("Choose whether the sheet is a sales or a purchase register.")
     from . import metal  # metal imports this module
 
     if metal.detect_jewellery(sheet):
-        return metal.import_jewellery(company_id, sheet, register)
-    frame, notes, _ = _normalise({**sheet, "register": register})
+        return metal.import_jewellery(company_id, sheet, register, before_commit)
+    raw = load_frame(sheet)
+    frame, notes, _ = _normalise({**sheet, "register": register}, raw)
+    item_col, net_col = _item_columns(sheet, metal.register_columns(sheet))
+    raw = raw.set_index("_rowid")
     company = service.get_company(company_id)
     sales = register == "sales"
     states, problems = place_of_supply(sheet, sales)
@@ -418,15 +483,19 @@ def import_register(company_id: int, sheet: dict, register: str) -> dict:
             check_reported_state(company, vtype, row.party, heads, state, reported, label, problems)
             lines = posting_lines(conn, company_id, vtype, party_id, main_ledger, abs(value), taxable, heads, label, problems)
             number, reference = document_number(sales, row.invoice_no, label, problems)
+            item, net_mg = _item_summary(raw.loc[row.rowid], item_col, net_col)
             try:
                 with conn.begin_nested():
                     service.save_voucher(company_id, vtype, day, lines, number=number or None,
                                          reference=reference, narration=f"Imported from {sheet['sheet_name']}",
-                                         source=source, conn=conn)
+                                         source=source, conn=conn, items_text=item, net_mg=net_mg)
                 created += 1
                 note_bad_gstin(bad_gstins, row.gstin, label, used)
             except AccountsError as exc:
                 problems.append(number_clash(conn, in_books, vtype, number, day, label, str(exc)) or f"{label}: {exc}")
+        note_register(conn, company_id, sheet["table_name"], register)
+        if before_commit:
+            before_commit()
     return {"created": created, "skipped": skipped, "problems": problems + gstin_warnings(bad_gstins),
             "notes": duplicates_note(duplicates, not sales) + [n["message"] for n in notes]}
 

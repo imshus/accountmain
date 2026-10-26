@@ -34,6 +34,7 @@ from sqlalchemy import (
     event,
     func,
     insert,
+    null,
     select,
     update,
 )
@@ -71,6 +72,11 @@ datasets = Table(
     Column("filename", String(255), nullable=False),
     Column("size_bytes", Integer, nullable=False),
     Column("uploaded_at", DateTime(timezone=True), nullable=False),
+    # The register the upload is filed under, which is also its copy's folder in Supabase: "sales" | "purchases" |
+    # "unsorted" (NULL for uploads made before this was kept). register_added: a sheet of it was added to the books as
+    # that register, so it stays filed there (an upload with both registers stays under the first one added).
+    Column("register", String(20)),
+    Column("register_added", Boolean),
 )
 
 dataset_sheets = Table(
@@ -156,8 +162,42 @@ def storage_problem() -> str | None:
     return None
 
 
+# Columns of this version that the database file lacks, by table: none once init_db has added them. A database that
+# cannot be written keeps them (main.lifespan still starts, so the books can be read); whole rows are read through
+# columns_of, which reads NULL in their place.
+missing_columns: dict[str, set[str]] = {}
+
+
+def columns_of(table: Table) -> dict:
+    """Name -> the table's column, or NULL under that name for one the database lacks (missing_columns)."""
+    missing = missing_columns.get(table.name, set())
+    return {c.name: null().label(c.name) if c.name in missing else c for c in table.c}
+
+
+def _add_new_columns(conn) -> None:
+    """create_all makes missing tables but never changes existing ones: add the nullable columns that a table made by an
+    older version lacks (its rows get NULL). Nothing to do once they are there, so it runs at every start. They are noted
+    in missing_columns first, and stay there if the database cannot be written."""
+    missing_columns.clear()
+    new: dict[Table, list[Column]] = {}
+    for table in metadata.sorted_tables:  # every table first: the first ALTER fails on a database that cannot be written
+        have = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({quote_ident(table.name)})")}
+        lacking = [c for c in table.columns if have and c.name not in have and c.nullable and not c.primary_key]
+        if lacking:
+            missing_columns[table.name] = {c.name for c in lacking}
+            new[table] = lacking
+    for table, columns in new.items():
+        for column in columns:
+            conn.exec_driver_sql(f"ALTER TABLE {quote_ident(table.name)} ADD COLUMN {quote_ident(column.name)} "
+                                 f"{column.type.compile(dialect=conn.dialect)}")
+
+
 def init_db() -> None:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Columns first: a database that cannot be written has its missing ones noted before anything fails (a table this
+    # version adds cannot be made either; reading one finds it missing).
+    with engine.begin() as conn:
+        _add_new_columns(conn)
     metadata.create_all(engine)
     with engine.begin() as conn:
         tables = set(conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").scalars())
@@ -168,10 +208,12 @@ def init_db() -> None:
             conn.execute(insert(id_high_water).values(name="datasets", value=_highest_dataset_id(conn)))
         if conn.execute(select(id_high_water.c.value).where(id_high_water.c.name == "books")).first() is None:
             conn.execute(insert(id_high_water).values(name="books", value=_highest_book_id(conn)))
+    missing_columns.clear()
 
 
 # Places that still name an upload's tables (ds<id>_...) after the upload itself is deleted.
-_TABLE_REFERENCES = [("dataset_sheets", "table_name"), ("book_sheets", "table_name"), ("vouchers", "source"), ("bank_lines", "source")]
+_TABLE_REFERENCES = [("dataset_sheets", "table_name"), ("book_sheets", "table_name"), ("vouchers", "source"), ("bank_lines", "source"),
+                     ("register_imports", "table_name")]
 
 
 def _highest_dataset_id(conn) -> int:
@@ -245,8 +287,9 @@ def _frame_for_sql(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def save_dataset(filename: str, size_bytes: int, sheets: list[tuple[str, pd.DataFrame, dict]]) -> int:
-    """Write each (sheet name, frame, profile) to its own table and register the upload."""
+def save_dataset(filename: str, size_bytes: int, sheets: list[tuple[str, pd.DataFrame, dict]],
+                 register: str | None = None) -> int:
+    """Write each (sheet name, frame, profile) to its own table and register the upload, filed under ``register``."""
     with engine.begin() as conn:
         dataset_id = _next_dataset_id(conn)
         conn.execute(
@@ -255,6 +298,7 @@ def save_dataset(filename: str, size_bytes: int, sheets: list[tuple[str, pd.Data
                 filename=filename,
                 size_bytes=size_bytes,
                 uploaded_at=datetime.now(timezone.utc),
+                **({"register": register} if register else {}),
             )
         )
 
@@ -290,7 +334,7 @@ def _with_utc(row) -> dict:
 
 def list_datasets() -> list[dict]:
     with engine.connect() as conn:
-        rows = conn.execute(select(datasets).order_by(datasets.c.id.desc())).mappings().all()
+        rows = conn.execute(select(*columns_of(datasets).values()).order_by(datasets.c.id.desc())).mappings().all()
         sheets = conn.execute(select(dataset_sheets.c.dataset_id, dataset_sheets.c.row_count)).all()
     sheet_count: dict[int, int] = {}
     row_count: dict[int, int] = {}
@@ -309,7 +353,7 @@ def list_datasets() -> list[dict]:
 
 def get_dataset(dataset_id: int) -> dict | None:
     with engine.connect() as conn:
-        row = conn.execute(select(datasets).where(datasets.c.id == dataset_id)).mappings().first()
+        row = conn.execute(select(*columns_of(datasets).values()).where(datasets.c.id == dataset_id)).mappings().first()
         if row is None:
             return None
         sheets = (

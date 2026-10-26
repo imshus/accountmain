@@ -3,7 +3,8 @@
 Evidence is scored, not guessed from one word, and every point comes with a plain reason the person
 can check: the voucher-type values in the rows (S / Sales / P / Purchase), column headers (customer vs
 supplier, output vs input GST), invoice-number patterns (S/0071 vs PB-046), and the file and sheet
-names. The result says how sure it is; when the evidence is thin it says so instead of guessing.
+names in English, Hinglish or Hindi (a clear file name counts more than a column hint). The result says
+how sure it is; when the evidence is thin it says so instead of guessing.
 """
 
 from __future__ import annotations
@@ -20,13 +21,25 @@ KINDS = {
     "other": "Other data",
 }
 
-# (pattern on lower-cased text, kind, points, reason template)
+_LETTER = r"[\u0900-\u0963\u0971-\u097f]"  # a Devanagari letter or vowel sign, not a digit or the danda
+_PURCHASE_WORDS = (r"purchase|(?<![a-z])pur(?:c|ch)?(?![a-z])|inward|gstr[-_ ]?2"
+                   r"|(?<![a-z])(?:kha(?:ri|ree)d(?:a|i|e|ari)?|bought|buy(?:s|ing)?)(?![a-z])"
+                   rf"|(?<!{_LETTER})(?:[\u0916\u0959]\u093c?रीद(?:ा|ी|े|ारी)?|पर\u094d?चे[\u091c\u095b\u0938]\u093c?)(?!{_LETTER})")
+_PURCHASE_HINTS = r"\bbills?\b|supplier|vendor"
+# (words that name the kind, hints that only point to it, kind, points) on the plain file or sheet name. English, Hinglish
+# and Hindi words, matched whole where a longer word means something else ("unsold", "resale", "buyer", "seller", खरीदार):
+# kharid oct.xlsx, बिक्री बही, sold items. Only the words earn the file-name bonus: "bills", "customer" or "statement"
+# are on many kinds of file. An invoice register is the sales one unless the name says purchase anywhere.
 _NAME_SIGNS = [
-    (r"purchase|purch\b|\bbills?\b|inward|gstr[-_ ]?2|supplier|vendor", "purchases", 3, 'the {where} says "{hit}"'),
-    (r"(?<![a-z])sales?(?![a-z])|outward|gstr[-_ ]?1|customer|debtor", "sales", 3, 'the {where} says "{hit}"'),
-    (r"bank|statement|passbook|\bstmt\b|hdfc|icici|\bsbi\b|axis|kotak", "bank", 3, 'the {where} says "{hit}"'),
-    (r"ledger|day ?book|trial ?balance|journal", "ledger", 2, 'the {where} says "{hit}"'),
+    (_PURCHASE_WORDS, _PURCHASE_HINTS, "purchases", 3),
+    (r"(?<![a-z])(?:sales?|sold|sell(?:s|ing)?|bik(?:ri|ree)|vik(?:ray|ri))(?![a-z])|outward|gstr[-_ ]?1"
+     rf"|^(?!.*(?:{_PURCHASE_WORDS}|{_PURCHASE_HINTS})).*?(?P<word>invoice[ _-]?register)"
+     rf"|(?<!{_LETTER})(?:बिक\u094d?री|बेच(?:ा|ी|े)?|सेल(?:\u094d\u0938)?)(?!{_LETTER})", r"customer|debtor", "sales", 3),
+    (r"bank|passbook|hdfc|icici|\bsbi\b|axis|kotak", r"statement|\bstmt\b", "bank", 3),
+    (r"ledger|day ?book|trial ?balance|journal", None, "ledger", 2),
 ]
+_NAME_MEANS = {"purchases": "purchase", "sales": "sales", "bank": "bank statement", "ledger": "ledger"}
+_FILE_NAME_BONUS = 1  # the person's own label for the file: a clear hit outweighs a column hint
 _HEADER_SIGNS = [
     (r"(^|_)(customer|buyer|consignee|bill_to|billed_to|ship_to|debtor|recipient)(_|$)", "sales", 2, 'it has a "{label}" column'),
     (r"(^|_)(supplier|vendor|seller|creditor|supplier_invoice|supplier_bill|party_bill)(_|$)", "purchases", 2, 'it has a "{label}" column'),
@@ -48,13 +61,27 @@ _NUMBER_SIGNS = [
 ]
 
 
+def _plain(text: str) -> str:
+    """Text as the name signs read it: camelCase split into words (SalesRegister, SBIStatement -> sales register, sbi
+    statement), without the invisible joiners some Hindi keyboards put after a virama, lower case."""
+    return re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", text).replace("\u200c", "").replace("\u200d", "").lower()
+
+
+def registers_named(text: str) -> set[str]:
+    """The registers (sales, purchases) a text names in so many words, e.g. the AI's question which one to use."""
+    plain = _plain(text)
+    return {kind for words, _hints, kind, _points in _NAME_SIGNS if kind in ("sales", "purchases") and re.search(words, plain)}
+
+
 def _top_values(column: dict) -> list[tuple[str, int]]:
     stats = column.get("stats") or {}
     return [(str(t["value"]), int(t["count"])) for t in stats.get("top", [])] if isinstance(stats, dict) else []
 
 
 def classify(sheet: dict, filename: str) -> dict:
-    """{"kind", "label", "confidence": high | medium | low, "reasons": [...], "jewellery": bool} for one sheet."""
+    """{"kind", "label", "confidence": high | medium | low, "reasons": [...], "against": [...], "against_register":
+    [...], "jewellery": bool} for one sheet. "against" is the evidence for any other kind, "against_register" only that
+    for the other register (purchases for a sales register and vice versa)."""
     profile = sheet["profile"]
     columns = profile["columns"]
     rows = max(int(sheet.get("row_count") or 0), 1)
@@ -66,11 +93,15 @@ def classify(sheet: dict, filename: str) -> dict:
         if reason not in reasons[kind]:
             reasons[kind].append(reason)
 
-    for where, text in (("file name", filename), ("sheet name", sheet.get("sheet_name") or "")):
-        for pattern, kind, points, template in _NAME_SIGNS:
-            hit = re.search(pattern, text.lower())
+    for where, text, bonus in (("file name", filename, _FILE_NAME_BONUS), ("sheet name", sheet.get("sheet_name") or "", 0)):
+        name = _plain(text)
+        for words, hints, kind, points in _NAME_SIGNS:
+            hit = re.search(words, name)
+            extra = bonus if hit else 0
+            hit = hit or (hints and re.search(hints, name))
             if hit:
-                add(kind, points, template.format(where=where, hit=text if len(text) < 60 else hit.group(0)))
+                shown = text if len(text) < 60 else f"…{hit.groupdict().get('word') or hit.group(0)}…"
+                add(kind, points + extra, f"the {where} '{shown}' says {_NAME_MEANS[kind]}")
 
     for col in columns:
         name = col["name"]
@@ -116,8 +147,23 @@ def classify(sheet: dict, filename: str) -> dict:
     if best in ("sales", "purchases") and jewellery:
         reasons[best].append("it is a jewellery register (gross / net / fine weights and tunch)")
     contrary = [r for k, rs in reasons.items() if k != best for r in rs]
+    other = {"sales": "purchases", "purchases": "sales"}.get(best)
     return {"kind": best, "label": KINDS[best], "confidence": confidence, "reasons": reasons.get(best, []),
-            "against": contrary, "jewellery": jewellery}
+            "against": contrary, "against_register": reasons[other] if other else [], "jewellery": jewellery}
+
+
+def upload_register(sheets: list[dict], filename: str) -> str:
+    """The register a new upload is filed under (its copy's folder in Supabase): sales or purchases when a sheet is
+    clearly that register (high confidence, no evidence for the other one) and no sheet may be the other; else
+    "unsorted", until a sheet of it is added to the books."""
+    clear, maybe = set(), set()
+    for sheet in sheets:
+        found = classify(sheet, filename)
+        if found["kind"] in ("sales", "purchases"):
+            maybe.add(found["kind"])
+            if found["confidence"] == "high" and not found["against_register"]:
+                clear.add(found["kind"])
+    return clear.pop() if len(clear) == 1 and maybe == clear else "unsorted"
 
 
 def describe_documents(datasets: list[dict]) -> tuple[str, list[dict]]:

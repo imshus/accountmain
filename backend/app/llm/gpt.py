@@ -20,6 +20,7 @@ from .. import analysis, config
 from .common import (
     ANALYSE_PARAMS,
     ANALYSE_TOOL_DESCRIPTION,
+    BOOKS_TOOL_DESCRIPTION,
     CALC_EXPRESSION_DESCRIPTION,
     CALC_TOOL_DESCRIPTION,
     CUT_OFF_NOTE,
@@ -35,6 +36,7 @@ from .common import (
     LLMError,
     Reply,
     Toolbox,
+    books_tool_schema,
     closing_on_cancel,
     tool_error,
 )
@@ -98,6 +100,14 @@ TOOLS = [
 _QUOTA_CODES = {"insufficient_quota", "credit_balance_exhausted", "organization_usage_limit_exceeded"}
 
 
+def _tools(tools: Toolbox) -> list[dict]:
+    """TOOLS, plus add_to_books (limited to the shared tables) when the chat may post them to a company's books."""
+    if not tools.can_add_to_books:
+        return TOOLS
+    return [*TOOLS, {"type": "function", "name": "add_to_books", "description": BOOKS_TOOL_DESCRIPTION,
+                     "parameters": books_tool_schema(tools.sheets), "strict": True}]
+
+
 def _run_call(tools: Toolbox, call) -> str:
     try:
         args = json.loads(call.arguments)
@@ -109,6 +119,8 @@ def _run_call(tools: Toolbox, call) -> str:
             return tools.calculate(args["expression"])
         if call.name == "check_formula":
             return tools.check_formula(args["table"], args["target_column"], args["expression"], float(args["tolerance"]))
+        if call.name == "add_to_books":
+            return tools.add_to_books(args["table"], args.get("register"))  # null: the detected register
     except Exception as exc:  # noqa: BLE001 - the real reason goes back to the model, which fixes its call
         return tool_error(exc)
     return f"Error: unknown tool {call.name}."
@@ -221,7 +233,7 @@ def chat(messages: list[dict], instructions: str, tools: Toolbox, emit=None, eff
                 model=model,
                 instructions=instructions,
                 input=items,
-                tools=TOOLS,
+                tools=_tools(tools),
                 reasoning={"effort": effort or config.OPENAI_REASONING_EFFORT},
                 max_output_tokens=MAX_OUTPUT_TOKENS,
                 prompt_cache_key=tools.cache_key,

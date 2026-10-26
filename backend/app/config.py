@@ -10,6 +10,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+# MONGODB_URI set to "" by whatever starts the backend (a test, a script) turns the MongoDB copy off, even when
+# backend/.env names an address under another name. Read before .env is loaded: an empty line there does not count.
+_MONGODB_OFF = os.environ.get("MONGODB_URI") == ""
 load_dotenv(BASE_DIR / ".env")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
@@ -120,7 +123,24 @@ def _mongodb_uri(raw: str) -> str:
     return uri
 
 
-MONGODB_URI = _mongodb_uri(os.getenv("MONGODB_URI", ""))
+def _mongodb_setting() -> str:
+    """MONGODB_URI, or the same address under another common name (MONGO_DB_URL, MONGODB_URL, MONGO_URI, MONGO_URL). When
+    the address has no user:password of its own, MONGO_DB_USER / MONGODB_USER and MONGO_DB_PASSWORD / MONGODB_PASSWORD
+    are put in, percent-encoded, so a password with @ : / + % in it works as typed."""
+    if _MONGODB_OFF:
+        return ""
+    names = ("MONGODB_URI", "MONGO_DB_URL", "MONGODB_URL", "MONGO_URI", "MONGO_URL")
+    raw = next((value.strip() for value in map(os.getenv, names) if value and value.strip()), "")
+    user = (os.getenv("MONGODB_USER") or os.getenv("MONGO_DB_USER") or "").strip()
+    password = os.getenv("MONGODB_PASSWORD") or os.getenv("MONGO_DB_PASSWORD") or ""
+    if raw and user and "://" in raw:
+        scheme, rest = raw.split("://", 1)
+        if "@" not in rest.split("/", 1)[0].split("?", 1)[0]:
+            raw = f"{scheme}://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{rest}"
+    return raw
+
+
+MONGODB_URI = _mongodb_uri(_mongodb_setting())
 MONGODB_DB = os.getenv("MONGODB_DB", "").strip() or "accountsai"
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))

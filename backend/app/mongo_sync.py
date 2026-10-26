@@ -1,7 +1,7 @@
 """A live copy of the app's records in MongoDB (optional).
 
-When MONGODB_URI is set, every upload (file name, size, and each sheet's statistics, notes and report setup, plus the
-state of its Supabase copy) and every chat conversation is also kept in MongoDB, in the collections "uploads" and
+When MONGODB_URI is set, every upload (file name, size, the register it is filed under, and each sheet's statistics,
+notes and report setup, plus the state of its Supabase copy) and every chat conversation is also kept in MongoDB, in the collections "uploads" and
 "chats" of MONGODB_DB (MongoDB Atlas or a server of your own). SQLite stays the main copy; the books, the vouchers and
 the sheets' rows are not copied. A change only marks the record in memory, and one background thread writes the
 record's state as it is then (or deletes it once it is gone), so MongoDB never slows a request down or makes it fail,
@@ -169,7 +169,7 @@ def _upload_document(dataset_id: int) -> dict | None:
                        "row_count": sheet["row_count"], "profile": profile, "notes": notes, "setup": setup})
     copy = cloud.status_of(dataset_id)
     return {"_id": dataset_id, "filename": dataset["filename"], "size_bytes": dataset["size_bytes"],
-            "uploaded_at": dataset["uploaded_at"], "sheets": sheets,
+            "uploaded_at": dataset["uploaded_at"], "register": dataset.get("register") or "unsorted", "sheets": sheets,
             "cloud": {k: copy[k] for k in ("status", "bucket", "path", "updated_at")} if copy else None}
 
 

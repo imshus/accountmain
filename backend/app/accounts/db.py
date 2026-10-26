@@ -46,6 +46,10 @@ vouchers = Table(
     Column("cancelled", Boolean, nullable=False, default=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    # What an imported register row sold or bought, for the voucher list when no metal line describes the items:
+    # item names (one per line) and net weight in mg. NULL elsewhere (added to older databases by database.init_db).
+    Column("items_text", Text),
+    Column("net_mg", Integer),
 )
 
 voucher_lines = Table(
@@ -136,4 +140,16 @@ metal_openings = Table(
     Column("metal", String(10), nullable=False),
     Column("opening_mg", Integer, nullable=False, default=0),  # + = Dr (owes us metal / metal in hand), as at fy_start
     UniqueConstraint("ledger_id", "metal", name="uq_metal_opening"),
+)
+
+# The shared sheets (upload tables) a register import has run for, and as which register: the company's books know what
+# they are, even when the import posted nothing new (every row was already in the books, as when the same Excel is
+# shared again, or no row could be posted), so the chat does not ask again.
+register_imports = Table(
+    "register_imports",
+    metadata,
+    Column("company_id", Integer, ForeignKey("companies.id", ondelete="CASCADE"), primary_key=True),
+    Column("table_name", String(120), primary_key=True),
+    Column("register", String(20), nullable=False),  # sales | purchases
+    Column("at", DateTime(timezone=True), nullable=False),
 )

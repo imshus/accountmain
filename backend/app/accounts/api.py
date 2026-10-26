@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, select
 
-from .. import database, gst
+from .. import cloud, database, gst
 from ..database import engine
 from . import chart, imports, metal, reports, service
 from .db import bill_allocations, voucher_lines, vouchers
@@ -459,7 +459,10 @@ def _sheet(dataset_id: int, table_name: str) -> dict:
 @router.post("/companies/{company_id}/import/register")
 def import_register(company_id: int, body: RegisterImport):
     _company(company_id)
-    return _guard(imports.import_register, company_id, _sheet(body.dataset_id, body.table_name), body.register_type)
+    result = _guard(imports.import_register, company_id, _sheet(body.dataset_id, body.table_name), body.register_type)
+    if result["created"] or result["skipped"]:  # in the books now: the upload is filed under this register
+        cloud.set_register(body.dataset_id, body.register_type)
+    return result
 
 
 @router.post("/companies/{company_id}/import/book")
