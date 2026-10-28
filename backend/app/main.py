@@ -192,8 +192,46 @@ class _ChatBodyLimit:
         await self.app(scope, counted, send)
 
 
+_COMPANY_PATH = re.compile(r"/api/companies/(\d+)(?=/|$)")
+_COMPANY_SEEN_SECONDS = 60  # a company seen this recently is not looked up again
+_companies_seen: dict[int, float] = {}  # company id -> when it was last seen to exist
+
+
+def _company_for(company_id: int | None) -> int:
+    """The company a request is served by: the one asked for when it exists, else the default one
+    (accounts_service.company_or_default). Asked for on 2026-10-28: a missing company is bypassed, not an error."""
+    seen = _companies_seen.get(company_id) if company_id is not None else None
+    if seen is not None and time.monotonic() - seen < _COMPANY_SEEN_SECONDS:
+        return company_id
+    found = accounts_service.company_or_default(company_id)
+    _companies_seen[found] = time.monotonic()
+    return found
+
+
+class _MissingCompany:
+    """A request for a company that no longer exists (the app still holds one a fresh start deleted) is served by the
+    default company: the path's company id is replaced before routing, so every books route answers instead of failing
+    with "Company not found."."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        found = _COMPANY_PATH.match(scope["path"]) if scope["type"] == "http" else None
+        if found and config.DATABASE_URL:
+            wanted = int(found.group(1))
+            served = await asyncio.to_thread(_company_for, wanted)  # a database lookup: off the event loop
+            if served != wanted:
+                prefix = f"/api/companies/{wanted}"
+                raw = scope.get("raw_path") or scope["path"].encode()
+                scope = dict(scope, path=f"/api/companies/{served}{scope['path'][len(prefix):]}",
+                             raw_path=f"/api/companies/{served}".encode() + raw[len(prefix.encode()):])
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="Accounts.ai API", version="0.1.0", lifespan=lifespan)
-app.add_middleware(_ErrorsAsJson)  # added first, so it runs inside CORSMiddleware
+app.add_middleware(_MissingCompany)  # innermost, so a database error while it looks up the company is a JSON 500 too
+app.add_middleware(_ErrorsAsJson)  # added before CORSMiddleware, so it runs inside it
 app.add_middleware(_ChatBodyLimit)  # inside CORSMiddleware too, so the app can read its 413
 app.add_middleware(
     CORSMiddleware,
@@ -728,15 +766,11 @@ def documents(body: DocumentsRequest):
 
 
 def _books_company(company_id: int | None, sheets: list[dict]) -> int | None:
-    """The company whose books the chat may add a shared sheet to: one that exists, and only when files are shared.
-    A company deleted meanwhile is not an error: the chat still answers, without that tool."""
-    if company_id is None or not sheets:
+    """The company whose books the chat may add a shared sheet to, only when files are shared: the one the app chose,
+    or the default company when that one is gone (or none was sent), as for every books route (_MissingCompany)."""
+    if not sheets:
         return None
-    try:
-        accounts_service.get_company(company_id)
-    except accounts_service.AccountsError:
-        return None
-    return company_id
+    return _company_for(company_id)
 
 
 def _pending_registers(found: list[dict], company_id: int | None, messages: list[dict]) -> list[dict]:

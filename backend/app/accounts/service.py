@@ -222,16 +222,40 @@ def create_company(name: str, gstin: str | None, fy_start: date) -> int:
     if gstin and gst.gstin_problem(gstin):
         raise AccountsError(f"GSTIN {gstin}: {gst.gstin_problem(gstin)}.")
     with engine.begin() as conn:
-        company_id = conn.execute(insert(companies).values(
-            name=name.strip(), gstin=gstin, state_code=gstin[:2] if gstin else None,
-            fy_start=fy_start, created_at=_now(),
-        )).inserted_primary_key[0]
-        # One statement for the whole chart: each statement is a trip to the database.
-        conn.execute(insert(ledgers), [{"company_id": company_id, "name": ledger, "group_name": group, "opening_paise": 0,
-                                        "tax_kind": tax_kind, "created_at": _now()}
-                                       for ledger, (group, tax_kind) in chart.DEFAULT_LEDGERS.items()])
-        _audit(conn, company_id, "create", "company", company_id, after={"name": name, "gstin": gstin, "fy_start": fy_start})
+        return _create_company(conn, name, gstin, fy_start)
+
+
+def _create_company(conn, name: str, gstin: str | None, fy_start: date) -> int:
+    company_id = conn.execute(insert(companies).values(
+        name=name.strip(), gstin=gstin, state_code=gstin[:2] if gstin else None,
+        fy_start=fy_start, created_at=_now(),
+    )).inserted_primary_key[0]
+    # One statement for the whole chart: each statement is a trip to the database.
+    conn.execute(insert(ledgers), [{"company_id": company_id, "name": ledger, "group_name": group, "opening_paise": 0,
+                                    "tax_kind": tax_kind, "created_at": _now()}
+                                   for ledger, (group, tax_kind) in chart.DEFAULT_LEDGERS.items()])
+    _audit(conn, company_id, "create", "company", company_id, after={"name": name, "gstin": gstin, "fy_start": fy_start})
     return company_id
+
+
+DEFAULT_COMPANY_NAME = "My Business"  # the name the app gives the first company (frontend/src/session.tsx)
+
+
+def company_or_default(company_id: int | None) -> int:
+    """The company asked for when it exists, else the default one: the newest company (the one the app picks first),
+    or a new "My Business" when there is none, made as the app makes its first. So a device still holding a company
+    that is gone (deleted by a fresh start) keeps working instead of failing with "Company not found."."""
+    if company_id is not None:
+        with engine.connect() as conn:
+            if conn.execute(select(companies.c.id).where(companies.c.id == company_id)).first() is not None:
+                return company_id
+    with engine.begin() as conn:
+        # One default company even when several requests arrive at once with none there yet.
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('accountsai-default-company'))"))
+        newest = conn.execute(select(func.max(companies.c.id))).scalar()
+        if newest is not None:
+            return newest
+        return _create_company(conn, DEFAULT_COMPANY_NAME, None, fy_of(date.today())[0])
 
 
 def list_companies() -> list[dict]:

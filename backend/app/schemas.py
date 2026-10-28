@@ -275,7 +275,8 @@ class ChatRequest(BaseModel):
 class FilesChatRequest(ChatRequest):
     """A chat over files shared in the conversation (the main chat screen)."""
     dataset_ids: list[int] = Field(default=[], max_length=10)  # none yet: general accounting questions
-    # The company whose books the AI may add a shared file to (as its sales or purchase register); None: it may not.
+    # The company whose books the AI may add a shared file to (as its sales or purchase register); None, or a company
+    # that is gone: the default company (main._company_for).
     company_id: int | None = None
 
 
