@@ -20,7 +20,7 @@ export function metalsInUse(dashboard: Report | null): ("gold" | "silver")[] {
   return (["gold", "silver"] as const).filter((metal) => labels.some((l) => l.startsWith(`${metal} stock`)));
 }
 
-/** A karat sold beyond what came in, and the stock report's own warnings. The Stock screen lists them too. */
+/** A karat sold beyond what came in, and the stock report's own warnings: the bell lists them (the Stock screen does not). */
 export function stockWarnings(metal: "gold" | "silver", report: Report | null): BookWarning[] {
   if (!report) return [];
   const name = metal === "gold" ? "Gold" : "Silver";

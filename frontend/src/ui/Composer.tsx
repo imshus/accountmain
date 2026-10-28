@@ -6,7 +6,7 @@ import "./Composer.css";
 type Props = {
   value: string;
   onChange: (value: string) => void;
-  /** Enter (without Shift) or the send button. Not called while `busy`. */
+  /** The send button, or Enter (without Shift) on a physical keyboard. Not called while `busy`. */
   onSubmit: () => void;
   placeholder?: string;
   /** Accessible name of the text box. */
@@ -29,6 +29,9 @@ type Props = {
   /** Grow up to this many pixels before scrolling. */
   maxHeight?: number;
 };
+
+/** A phone or tablet (touch screen, no mouse): its on-screen keyboard's Enter key types a new line. */
+const TOUCH = typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
 
 /**
  * The floating ask box: + (attach menu), the text, and mic / send / stop. Put it in <AppShell composer={...}>, which
@@ -115,14 +118,15 @@ export function Composer({
             placeholder={placeholder}
             aria-label={label}
             disabled={disabled}
-            enterKeyHint="send"
+            enterKeyHint={TOUCH ? "enter" : "send"}
             onChange={(event) => onChange(event.target.value)}
             onPaste={onPaste}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-                event.preventDefault();
-                if (!busy && !empty && !disabled) onSubmit();
-              }
+              // On a phone the keyboard's Enter key starts a new line (entries are often typed line by line) and only the
+              // send button sends; with a physical keyboard Enter sends and Shift+Enter starts a new line.
+              if (TOUCH || event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+              event.preventDefault();
+              if (!busy && !empty && !disabled) onSubmit();
             }}
           />
           {busy && onStop ? (

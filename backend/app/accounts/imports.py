@@ -21,11 +21,11 @@ from datetime import date, datetime, timezone
 
 import pandas as pd
 from sqlalchemy import and_, insert, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DataError, IntegrityError
 
 from .. import gst, reports
 from ..books import _normalise
-from ..database import engine
+from ..database import _safe_reason, engine, upsert
 from ..editing import load_frame
 from . import chart, service
 from .db import bank_lines, ledgers, metal_lines, register_imports, voucher_lines, vouchers
@@ -35,8 +35,9 @@ ROUND_OFF_LIMIT = 100  # paise
 
 
 def _imported_sources(conn, company_id: int, prefix: str) -> set[str]:
+    # startswith with autoescape: the "_" in a table name is a wildcard to LIKE (ds1_a_b would match ds1_aab's rows).
     return set(conn.execute(select(vouchers.c.source).where(and_(
-        vouchers.c.company_id == company_id, vouchers.c.source.like(f"{prefix}%"), vouchers.c.cancelled.is_(False),
+        vouchers.c.company_id == company_id, vouchers.c.source.startswith(prefix, autoescape=True), vouchers.c.cancelled.is_(False),
     ))).scalars())
 
 
@@ -59,20 +60,18 @@ def answered_tables(company_id: int, tables) -> set[str]:
     tables = list(dict.fromkeys(tables))
     if not tables:
         return set()
-    try:
-        with engine.connect() as conn:
-            return set(conn.execute(select(register_imports.c.table_name).where(and_(
-                register_imports.c.company_id == company_id, register_imports.c.table_name.in_(tables)))).scalars())
-    except OperationalError as exc:  # a database that could not be written at startup lacks the table: none yet
-        if "no such table" in str(exc):
-            return set()
-        raise
+    with engine.connect() as conn:
+        return set(conn.execute(select(register_imports.c.table_name).where(and_(
+            register_imports.c.company_id == company_id, register_imports.c.table_name.in_(tables)))).scalars())
 
 
 def note_register(conn, company_id: int, table: str, register: str) -> None:
-    """Remember, in the import's transaction, that ``table`` was imported as ``register`` (see answered_tables)."""
-    conn.execute(insert(register_imports).prefix_with("OR REPLACE").values(
-        company_id=company_id, table_name=table, register=register, at=datetime.now(timezone.utc)))
+    """Remember, in the import's transaction, that ``table`` was imported as ``register`` (see answered_tables); a
+    later import of the sheet replaces the note."""
+    statement = upsert(register_imports).values(company_id=company_id, table_name=table, register=register,
+                                                at=datetime.now(timezone.utc))
+    conn.execute(statement.on_conflict_do_update(index_elements=[register_imports.c.company_id, register_imports.c.table_name],
+                                                 set_={"register": statement.excluded.register, "at": statement.excluded.at}))
 
 
 def financial_year(day: date) -> date:
@@ -91,20 +90,21 @@ def existing_documents(conn, company_id: int, skip_prefix: str) -> dict[tuple[st
     voucher with its date, its ledgers (rupees on each) and its party ledgers' GSTINs.
     Vouchers whose source starts with ``skip_prefix`` (this upload's own rows) are left to the per-row guard."""
     v = vouchers
-    rows = conn.execute(select(v.c.id, v.c.vtype, v.c.number, v.c.reference, v.c.date, v.c.source).where(and_(
-        v.c.company_id == company_id, v.c.cancelled.is_(False),
-        v.c.vtype.in_(("Sales", "Credit Note", "Purchase", "Debit Note"))))).all()
+    invoices = and_(v.c.company_id == company_id, v.c.cancelled.is_(False),
+                    v.c.vtype.in_(("Sales", "Credit Note", "Purchase", "Debit Note")))
+    rows = conn.execute(select(v.c.id, v.c.vtype, v.c.number, v.c.reference, v.c.date, v.c.source).where(invoices)).all()
     rows = [r for r in rows if not (r.source or "").startswith(skip_prefix)]
-    ids = [r.id for r in rows]
+    ids = {r.id for r in rows}
     # Every ledger on the voucher, not only Sundry Debtors / Creditors: a register's party "Cash" is the
-    # Cash-in-Hand ledger, and a sale by weight has metal lines only.
+    # Cash-in-Hand ledger, and a sale by weight has metal lines only. One joined read per table, not batches of ids.
     amounts: dict[int, dict[int, int]] = {}
     for table, rupees in ((voucher_lines, True), (metal_lines, False)):
-        for start in range(0, len(ids), 500):
-            cols = (table.c.voucher_id, table.c.ledger_id) + ((table.c.dr_paise, table.c.cr_paise) if rupees else ())
-            for vid, lid, *money in conn.execute(select(*cols).where(table.c.voucher_id.in_(ids[start:start + 500]))).all():
-                on_voucher = amounts.setdefault(vid, {})
-                on_voucher[lid] = on_voucher.get(lid, 0) + sum(money)
+        cols = (table.c.voucher_id, table.c.ledger_id) + ((table.c.dr_paise, table.c.cr_paise) if rupees else ())
+        for vid, lid, *money in conn.execute(select(*cols).join(v, v.c.id == table.c.voucher_id).where(invoices)).all():
+            if vid not in ids:
+                continue
+            on_voucher = amounts.setdefault(vid, {})
+            on_voucher[lid] = on_voucher.get(lid, 0) + sum(money)
     # A renamed or differently spelt party is a new ledger, but its GSTIN is the same registration.
     party_gstins = {lid: g for lid, group, text in conn.execute(select(ledgers.c.id, ledgers.c.group_name, ledgers.c.gstin)
                     .where(ledgers.c.company_id == company_id)).all()
@@ -127,7 +127,7 @@ def already_in_books(index: dict, vtype: str, number: str, day: date, party_id: 
     """True when this party already has this invoice / bill number in this financial year (not cancelled).
     The party is the same ledger or the same valid GSTIN. A register's party "Cash" (not a party ledger) is
     shared by many suppliers, so there the date and invoice value must match too, as a re-upload repeats them."""
-    number = (number or "").strip().lower()
+    number = _as_reference(number).lower()  # as a voucher keeps it
     gstins = {g for g in map(_valid_gstin, gstins) if g}
     for entry in index.get((vtype, number, financial_year(day)), []) if number else []:
         if gstins & entry["gstins"]:
@@ -355,10 +355,21 @@ def split_unsplit_gst(company: dict, gstin: str, heads: dict[str, int], unsplit:
         heads["sgst"] += unsplit - unsplit // 2
 
 
+def remembered_ledger(known: dict | None, key, find: Callable[[], int]) -> int:
+    """A ledger id found (or made) once per import, kept in ``known`` by ``key``. Only for ledgers looked up outside the
+    rows' savepoints, so a row that is rolled back cannot take a remembered ledger with it."""
+    if known is None:
+        return find()
+    if key not in known:
+        known[key] = find()
+    return known[key]
+
+
 def posting_lines(conn, company_id: int, vtype: str, party_id: int, main_ledger: int, total: int, taxable: int,
-                  heads: dict[str, int], label: str, problems: list[str]) -> list[Line]:
+                  heads: dict[str, int], label: str, problems: list[str], known: dict | None = None) -> list[Line]:
     """Party, Sales/Purchase and GST lines of one imported invoice (positive paise; GST already split by head).
-    The invoice value must equal taxable value + GST: up to Rs 1 goes to Round Off, more to Suspense A/c (reported)."""
+    The invoice value must equal taxable value + GST: up to Rs 1 goes to Round Off, more to Suspense A/c (reported).
+    ``known``: the import's ledger ids (remembered_ledger), so each tax ledger is looked up once, not once per row."""
     difference = total - taxable - sum(heads.values())
     # Party on the side that matches the document: customers owe on sales, we owe suppliers on purchases.
     party_dr = vtype in ("Sales", "Debit Note")
@@ -368,13 +379,14 @@ def posting_lines(conn, company_id: int, vtype: str, party_id: int, main_ledger:
         lines.append(Line(main_ledger, dr=0 if party_dr else taxable, cr=taxable if party_dr else 0))
     for head, amount in heads.items():
         if amount:
-            lid = service._tax_ledger(conn, company_id, f"{side}_{head}")
+            kind = f"{side}_{head}"
+            lid = remembered_ledger(known, ("tax", kind), lambda: service._tax_ledger(conn, company_id, kind))
             lines.append(Line(lid, dr=0 if party_dr else amount, cr=amount if party_dr else 0))
     if difference:
         if abs(difference) <= ROUND_OFF_LIMIT:
-            lid = service.ensure_ledger(conn, company_id, "Round Off", "Indirect Expenses")
+            lid = remembered_ledger(known, "Round Off", lambda: service.ensure_ledger(conn, company_id, "Round Off", "Indirect Expenses"))
         else:
-            lid = service.ensure_ledger(conn, company_id, "Suspense A/c", "Suspense A/c")
+            lid = remembered_ledger(known, "Suspense A/c", lambda: service.ensure_ledger(conn, company_id, "Suspense A/c", "Suspense A/c"))
             problems.append(f"{label}: invoice value differs from taxable value + GST by {difference / 100:,.2f}; "
                             "the difference was posted to Suspense A/c.")
         # On the income/tax side of the voucher: a positive difference is more to receive (Cr on sales).
@@ -383,16 +395,22 @@ def posting_lines(conn, company_id: int, vtype: str, party_id: int, main_ledger:
     return lines
 
 
+def _as_reference(number) -> str:
+    """A register's invoice / bill number as a voucher keeps it for reference: at most the column's 60 characters (a
+    longer cell is text pasted there, not a bill number: Postgres refuses it whole, where SQLite kept it), and no NULs."""
+    return (number or "").replace("\x00", "").strip()[:service.REFERENCE_LENGTH].strip()
+
+
 def document_number(sales: bool, number: str, label: str, problems: list[str]) -> tuple[str, str]:
     """(our voucher number, reference). Purchases use our own series with the supplier's bill no as reference;
     a sales number that is not a valid GST document number is replaced and kept as reference."""
     number = (number or "").strip()
     if not sales:
-        return "", number
+        return "", _as_reference(number)
     if number and (len(number) > 16 or not re.fullmatch(r"[A-Za-z0-9/-]+", number)):
         problems.append(f"{label}: invoice number {number!r} is not a valid GST document number (Rule 46); "
                         "a new number was given and the original kept as reference.")
-        return "", number
+        return "", _as_reference(number)
     return number, ""
 
 
@@ -435,15 +453,20 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
     frame, notes, _ = _normalise({**sheet, "register": register}, raw)
     item_col, net_col = _item_columns(sheet, metal.register_columns(sheet))
     raw = raw.set_index("_rowid")
-    company = service.get_company(company_id)
+    service.get_company(company_id)  # "Company not found." before any work
     sales = register == "sales"
     states, problems = place_of_supply(sheet, sales)
     created, skipped, duplicates, bad_gstins = 0, 0, [], {}
     with engine.begin() as conn:
+        # First of all: an import of the same sheet running meanwhile (a double tap, the chat and the Books screen) is
+        # waited for, and its rows are then found in `done` below instead of being posted again.
+        service.lock_books(conn, company_id)
+        company = service.get_company(company_id, conn)
         done = _imported_sources(conn, company_id, f"import:{sheet['table_name']}:")
         in_books = existing_documents(conn, company_id, f"import:{sheet['table_name']}:")
         main_ledger = service.ensure_ledger(conn, company_id, "Sales" if sales else "Purchase",
                                             "Sales Accounts" if sales else "Purchase Accounts")
+        known: dict = {}  # ledger ids looked up once per import (remembered_ledger)
         for row in frame.itertuples(index=False):
             source = f"import:{sheet['table_name']}:{row.rowid}"
             label = f"row {row.rowid}" + (f" ({row.invoice_no})" if row.invoice_no else "")
@@ -481,18 +504,20 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
             state, reported, used = party_state(conn, company, party_id, row.gstin, states.get(int(row.rowid)), label, problems)
             split_unsplit_gst(company, row.gstin, heads, sign * int(row.gst_unsplit), state)
             check_reported_state(company, vtype, row.party, heads, state, reported, label, problems)
-            lines = posting_lines(conn, company_id, vtype, party_id, main_ledger, abs(value), taxable, heads, label, problems)
+            lines = posting_lines(conn, company_id, vtype, party_id, main_ledger, abs(value), taxable, heads, label, problems, known)
             number, reference = document_number(sales, row.invoice_no, label, problems)
             item, net_mg = _item_summary(raw.loc[row.rowid], item_col, net_col)
             try:
                 with conn.begin_nested():
                     service.save_voucher(company_id, vtype, day, lines, number=number or None,
                                          reference=reference, narration=f"Imported from {sheet['sheet_name']}",
-                                         source=source, conn=conn, items_text=item, net_mg=net_mg)
+                                         source=source, conn=conn, items_text=item, net_mg=net_mg, company=company)
                 created += 1
                 note_bad_gstin(bad_gstins, row.gstin, label, used)
             except AccountsError as exc:
                 problems.append(number_clash(conn, in_books, vtype, number, day, label, str(exc)) or f"{label}: {exc}")
+            except (DataError, IntegrityError) as exc:  # only the row's savepoint is rolled back; the import goes on
+                problems.append(refused(label, exc))
         note_register(conn, company_id, sheet["table_name"], register)
         if before_commit:
             before_commit()
@@ -500,6 +525,13 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
             "notes": duplicates_note(duplicates, not sales) + [n["message"] for n in notes]}
 
 
+def refused(label: str, exc: Exception) -> str:
+    """Problem text for a row the database refused (a figure too large to store, say): Postgres, unlike SQLite, checks
+    every value, and the import reports the row and goes on with the next one rather than failing as a whole."""
+    return f"{label}: the database could not store it ({_safe_reason(exc)}). Not posted."
+
+
+_BANK_REFERENCE_LENGTH = 80  # bank_lines.reference
 _BALANCE = re.compile(r"(^|_)(balance|bal|closing_balance|running_balance)(_|$)")
 _REF = re.compile(r"(^|_)(chq|cheque|ref|reference|utr|txn_id|transaction_id)(_|$)")
 
@@ -509,7 +541,7 @@ def _text(value) -> str | None:
         return None
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
-    text = str(value).strip()
+    text = str(value).replace("\x00", "").strip()  # Postgres cannot store NUL characters
     return text or None
 
 
@@ -535,10 +567,12 @@ def import_bank_statement(company_id: int, bank_ledger_id: int, sheet: dict) -> 
     ref_col = mapping.get("voucher_no") or next(
         (c["name"] for c in sheet["profile"]["columns"] if _REF.search(c["name"])), None)
     refs = frame[ref_col] if ref_col else None
-    created, skipped, problems = 0, 0, []
+    created, skipped, problems, rows = 0, 0, [], []
     with engine.begin() as conn:
+        service.lock_books(conn, company_id)  # the same statement imported twice at once is added once
         done = set(conn.execute(select(bank_lines.c.source).where(and_(
-            bank_lines.c.company_id == company_id, bank_lines.c.source.like(f"bank:{sheet['table_name']}:%")))).scalars())
+            bank_lines.c.company_id == company_id,
+            bank_lines.c.source.startswith(f"bank:{sheet['table_name']}:", autoescape=True)))).scalars())
         for i, rowid in enumerate(frame["_rowid"]):
             source = f"bank:{sheet['table_name']}:{rowid}"
             if source in done:
@@ -551,13 +585,16 @@ def import_bank_statement(company_id: int, bank_ledger_id: int, sheet: dict) -> 
             if not w and not d:
                 continue
             bal = frame[balance_col].iloc[i] if balance_col else None
-            conn.execute(insert(bank_lines).values(
+            reference = _text(refs.iloc[i]) if refs is not None else None
+            rows.append(dict(
                 company_id=company_id, bank_ledger_id=bank_ledger_id, date=dates.iloc[i].date(),
                 narration=_text(narration.iloc[i]) if narration is not None else None,
-                reference=_text(refs.iloc[i]) if refs is not None else None,
+                reference=reference[:_BANK_REFERENCE_LENGTH] if reference else None,
                 withdrawal_paise=w, deposit_paise=d,
                 balance_paise=None if bal is None or (isinstance(bal, float) and math.isnan(bal)) or pd.isna(bal) else int(round(float(bal) * 100)),
                 source=source,
             ))
             created += 1
+        if rows:  # the whole statement in one insert: each statement is a trip to the database
+            conn.execute(insert(bank_lines), rows)
     return {"created": created, "skipped": skipped, "problems": problems, "notes": []}

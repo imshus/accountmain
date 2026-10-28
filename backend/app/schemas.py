@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-ProviderId = Literal["openai", "anthropic"]
+ProviderId = Literal["openai"]
 
 
 class ProviderStatus(BaseModel):
@@ -57,7 +57,7 @@ class Health(BaseModel):
     default_provider: ProviderId
     cloud: CloudSummary | None = None
     mongo: MongoSummary | None = None
-    storage_problem: str | None = None  # set when the backend cannot write its data folder
+    storage_problem: str | None = None  # set when the backend cannot reach, read or write its database
 
 
 class DatasetSummary(BaseModel):
@@ -297,11 +297,12 @@ CHAT_ID = r"^[A-Za-z0-9_-]{1,64}$"
 MAX_CHAT_TURNS = 40
 
 
-def chat_time(value: int | float) -> int | float:
-    """Milliseconds since 1970: finite, from 0 up to the largest whole number JavaScript holds exactly."""
+def chat_time(value: int | float) -> int:
+    """Milliseconds since 1970: finite, from 0 up to the largest whole number JavaScript holds exactly. Whole
+    milliseconds, as the database keeps them: a fraction is rounded up, so a newer copy never turns older."""
     if not math.isfinite(value) or not 0 <= value <= 2**53 - 1:
         raise ValueError("must be a time in milliseconds since 1970")
-    return int(value) if float(value).is_integer() else value
+    return math.ceil(value)
 
 
 class Conversation(BaseModel):

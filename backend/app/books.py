@@ -17,8 +17,7 @@ import pandas as pd
 
 from . import reports
 from .compat import to_datetime
-from .duck import cached, sheet_key
-from .editing import load_frame
+from .duck import cached, sheet_frame, sheet_key
 from .formatting import indian
 from .reports import AGEING_BUCKETS, ROLES, _col, _fmt, _half_up, _paise, _paise_of, _report, _rupees, _sub_paisa
 
@@ -50,10 +49,11 @@ def _raw_total(values: pd.Series) -> str:
 
 
 def _normalise(sheet: dict, frame: pd.DataFrame | None = None) -> tuple[pd.DataFrame, list[dict], dict[str, tuple[str, pd.Series]]]:
-    """(standard frame, notes, other number columns) for one register sheet; `frame` is its loaded table, if at hand."""
+    """(standard frame, notes, other number columns) for one register sheet; `frame` is its loaded table, if at hand
+    (else it is read once per version of the sheet: duck.sheet_frame)."""
     profile = sheet["profile"]
     mapping = reports.effective_mapping(profile)
-    frame = load_frame(sheet) if frame is None else frame
+    frame = sheet_frame(sheet) if frame is None else frame
     name = f'{REGISTERS[sheet["register"]]} · {sheet["sheet_name"]}'
     notes: list[dict] = []
     out = pd.DataFrame({"register": sheet["register"], "source": sheet["sheet_name"], "rowid": frame["_rowid"].to_numpy()})
@@ -130,7 +130,7 @@ class Books:
         for sheet in book["sheets"]:
             if sheet["register"] not in REGISTERS:
                 continue
-            table = load_frame(sheet)
+            table = sheet_frame(sheet)  # read once per version of the sheet, shared with the reports and the chat
             self.loaded.append((sheet, table))
             frame, notes, others = _normalise(sheet, table)
             frames.append(frame)

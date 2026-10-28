@@ -13,8 +13,7 @@ import threading
 from collections import OrderedDict
 
 from .. import config
-from ..database import quote_ident, run_select
-from ..duck import sheet_key
+from ..duck import sheet_frame, sheet_key
 from . import PROVIDERS, default_provider, gpt
 from .common import _Memo, reply_language, strip_context
 
@@ -47,7 +46,6 @@ PROMPT = """You suggest follow-up questions in Accounts.ai, an accounting app wh
 </tables>"""
 
 NO_TABLES = "No files are shared: suggest general accounting questions that follow from the conversation."
-JSON_ONLY = '\n\nReply with only this JSON: {"suggestions": ["...", "...", "..."]}'
 
 SCHEMA = {
     "type": "object",
@@ -69,7 +67,7 @@ _NUMBER = re.compile(r"(?<!\w)(\d+(?:[.,]\d+)*)(?:st|nd|rd|th)?(?!\w)")
 _CACHE: OrderedDict[tuple, list[str]] = OrderedDict()
 _CACHE_MAX = 200
 _CACHE_LOCK = threading.Lock()
-# The distinct dates and months of each date column, read once per version of the sheet.
+# The distinct dates and months of each date column, worked out once per version of the sheet.
 _DATES = _Memo(64)
 
 
@@ -78,15 +76,15 @@ def _cut(text: str, limit: int) -> str:
 
 
 def _dates(sheet: dict, column: str) -> tuple[list[str], list[str]]:
-    """The distinct dates (YYYY-MM-DD) and months (YYYY-MM) of a date column; either list is empty when it would be
-    longer than _DATES_LISTED."""
+    """The distinct dates (YYYY-MM-DD) and months (YYYY-MM) of a date column, in order; either list is empty when it
+    would be longer than _DATES_LISTED. From the sheet's table already in memory (duck.sheet_frame), so it needs no
+    query and does not depend on how the database stores dates."""
     def read() -> tuple[list[str], list[str]]:
-        table, col = sheet["table_name"], quote_ident(column)
+        days = sheet_frame(sheet)[column].dropna().dt.normalize().drop_duplicates()
         lists = []
-        for width in (10, 7):  # dates are stored as ISO text
-            result = run_select(f"SELECT DISTINCT substr({col}, 1, {width}) FROM {quote_ident(table)} "
-                                f"WHERE {col} IS NOT NULL ORDER BY 1", {table}, limit=_DATES_LISTED)
-            lists.append([] if result.truncated else [row[0] for row in result.rows])
+        for fmt in ("%Y-%m-%d", "%Y-%m"):
+            values = sorted(set(days.dt.strftime(fmt)))
+            lists.append(values if len(values) <= _DATES_LISTED else [])
         return lists[0], lists[1]
 
     return _DATES.get((*sheet_key(sheet), column), read)
@@ -242,22 +240,7 @@ def _openai(instructions: str, conversation: str) -> list:
     return json.loads(response.output_text)["suggestions"]
 
 
-def _anthropic(instructions: str, conversation: str) -> list:
-    import anthropic  # loaded on first use, as in claude.py
-
-    client = anthropic.Anthropic(timeout=TIMEOUT_SECONDS, max_retries=0)
-    message = client.messages.create(
-        model=config.ANTHROPIC_MODEL,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        system=instructions + JSON_ONLY,
-        messages=[{"role": "user", "content": conversation}],
-        output_config={"effort": "low"},
-    )
-    text = "".join(block.text for block in message.content if block.type == "text")
-    return json.loads(text[text.find("{"):text.rfind("}") + 1])["suggestions"]
-
-
-_CALLS = {"openai": _openai, "anthropic": _anthropic}
+_CALLS = {"openai": _openai}
 
 
 def suggest(messages: list[dict], sheets: list[dict], extra: dict | None = None,

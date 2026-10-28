@@ -23,7 +23,8 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import and_, select
+from sqlalchemy import BigInteger, and_, cast, exists, func, select
+from sqlalchemy.exc import DataError, IntegrityError
 
 from .. import reports
 from ..compat import to_datetime
@@ -32,7 +33,7 @@ from ..editing import load_frame
 from ..reports import _col, _report
 from . import chart, service
 from .db import ledgers, metal_lines, metal_openings, vouchers
-from .service import AccountsError, Line, MetalLine, fine_of, half_up, net_of, to_bp, to_mct, to_mg, to_paise
+from .service import AccountsError, Line, MetalLine, connect, fine_of, half_up, net_of, one_view, remembered, to_bp, to_mct, to_mg, to_paise
 
 
 def grams(mg) -> float:
@@ -76,8 +77,9 @@ def karat_of(purity: str | None, tunch_bp: int | None = None) -> str:
 # --- One item -----------------------------------------------------------------------------------------
 
 
-def item_weights(item: dict) -> dict:
+def item_weights(item: dict, fine_optional: bool = False) -> dict:
     """Normalise an item given in grams / carats / percent. Net and fine are computed when not given.
+    ``fine_optional``: an item whose purity is not known gets fine 0 instead of an error (see purity_unknown_invoice).
 
     Returns the stored details (mg, mct, bp) plus 'fine_mg'."""
     gross = to_mg(item.get("gross"), "Gross weight")
@@ -91,17 +93,22 @@ def item_weights(item: dict) -> dict:
         fine = to_mg(item.get("fine"), "Fine weight")
     elif tunch is not None and net:
         fine = fine_of(net, tunch)
+    elif fine_optional and (net or gross):
+        fine = 0
     else:
         raise AccountsError("Give each item a fine weight, or its net weight and tunch.")
-    if fine <= 0:
+    if fine <= 0 and not (fine_optional and fine == 0):
         raise AccountsError("Fine weight must be more than zero.")
     if net and fine > net:
         raise AccountsError(f"Fine weight {_g(fine)} cannot be more than the net weight {_g(net)}.")
     pieces = item.get("pieces")
+    text = lambda key, most: (str(item.get(key) or "")).strip()[:most] or None  # noqa: E731
     return {
         "item": (item.get("item") or "").strip()[:120] or None, "purity": (item.get("purity") or "").strip()[:20] or None,
         "tunch_bp": tunch, "gross_mg": gross or None, "net_mg": net or None, "dia_mct": dia or None, "stn_mct": stn or None,
         "pieces": int(pieces) if pieces not in (None, "") else None, "tag_no": (item.get("tag_no") or "").strip()[:40] or None,
+        "huid": (text("huid", 40) or "").upper() or None, "colour": (text("colour", 20) or "").upper() or None,
+        "clarity": (text("clarity", 20) or "").upper() or None,
         "fine_mg": fine,
     }
 
@@ -144,7 +151,11 @@ def jewellery_invoice(conn, company: dict, vtype: str, party_id: int, metal: str
             fine_rs += fine
         else:
             fine_wt += fine
-        taxable += metal_value + to_paise(item.get("diamond_value"), "Diamond value") + to_paise(item.get("stone_value"), "Stone value") + labour
+        diamond_value, stone_value = to_paise(item.get("diamond_value"), "Diamond value"), to_paise(item.get("stone_value"), "Stone value")
+        taxable += metal_value + diamond_value + stone_value + labour
+        # What this item was billed at, kept on its line so the bill's details can show it.
+        details.update(labour_paise=labour or None, dia_paise=diamond_value or None, stn_paise=stone_value or None,
+                       metal_paise=metal_value or None)
         metal_out.append(MetalLine(stock, metal, dr=0 if out else fine, cr=fine if out else 0, details=details))
     # The other side of the metal: the party (by weight) or Sales/Purchase (sold or bought for rupees).
     for ledger_id, fine in ((party_id, fine_wt), (main, fine_rs)):
@@ -155,6 +166,39 @@ def jewellery_invoice(conn, company: dict, vtype: str, party_id: int, metal: str
         lines, summary = service.gst_invoice_lines(conn, company, vtype, party_id,
                                                    [{"ledger_id": main, "taxable": taxable, "rate": gst_rate}], round_off)
     return lines, metal_out, {**summary, "fine_by_weight_mg": fine_wt, "fine_in_rupees_mg": fine_rs, "items": len(items)}
+
+
+def purity_unknown_invoice(conn, company: dict, vtype: str, party_id: int, metal: str,
+                           items: list[dict]) -> tuple[list[Line], list[MetalLine], dict]:
+    """A Sales / Purchase of items whose purity was not given (a tag typed in the chat): each item keeps its weights,
+    diamonds, tag and grading on a stock line with no fine weight, so the bill list and the stock by item count its net
+    weight, while the fine gold is left out rather than guessed. A zero line on the party names it on the bill. Labour,
+    diamond and stone amounts, when given, are billed as on any bill (no GST)."""
+    if vtype not in ("Sales", "Purchase"):
+        raise AccountsError("Choose Sales or Purchase.")
+    if not items:
+        raise AccountsError("Add at least one item.")
+    _party(conn, company["id"], party_id)
+    sales_side = vtype == "Sales"
+    main = service.ensure_ledger(conn, company["id"], "Sales" if sales_side else "Purchase",
+                                 "Sales Accounts" if sales_side else "Purchase Accounts")
+    stock = stock_ledger(conn, company["id"], metal)
+    taxable, metal_out = 0, []
+    for item in items:
+        details = item_weights({**item, "tunch": None, "fine": None}, fine_optional=True)
+        details.pop("fine_mg")
+        labour = to_paise(item.get("labour_value"), "Labour") if item.get("labour_value") not in (None, "") else \
+            half_up((details["net_mg"] or 0) * to_paise(item.get("labour_rate"), "Labour rate"), 1000)
+        diamond_value, stone_value = to_paise(item.get("diamond_value"), "Diamond value"), to_paise(item.get("stone_value"), "Stone value")
+        taxable += diamond_value + stone_value + labour
+        details.update(labour_paise=labour or None, dia_paise=diamond_value or None, stn_paise=stone_value or None, metal_paise=None)
+        metal_out.append(MetalLine(stock, metal, dr=0, cr=0, details=details))
+    metal_out.append(MetalLine(party_id, metal, dr=0, cr=0))
+    lines, summary = ([], {"taxable": 0, "total": 0})
+    if taxable:
+        lines, summary = service.gst_invoice_lines(conn, company, vtype, party_id,
+                                                   [{"ledger_id": main, "taxable": taxable, "rate": 0}], True)
+    return lines, metal_out, {**summary, "fine_by_weight_mg": 0, "fine_in_rupees_mg": 0, "items": len(items)}
 
 
 def metal_transfer(conn, company_id: int, vtype: str, party_id: int, metal: str, items: list[dict]) -> list[MetalLine]:
@@ -179,11 +223,12 @@ def metal_transfer(conn, company_id: int, vtype: str, party_id: int, metal: str,
 def party_metal(conn, company_id: int, ledger_id: int, metal: str, until: date | None = None) -> int:
     """Metal balance of one ledger in fine mg (+ = Dr: owes us / in hand)."""
     m, v = metal_lines, vouchers
-    query = (select(m.c.dr_mg, m.c.cr_mg).join(v, v.c.id == m.c.voucher_id)
+    # Summed by the database (not every line sent here); SUM of a BIGINT is NUMERIC, so it is cast back to whole mg.
+    query = (select(cast(func.coalesce(func.sum(m.c.dr_mg - m.c.cr_mg), 0), BigInteger)).select_from(m).join(v, v.c.id == m.c.voucher_id)
              .where(and_(m.c.ledger_id == ledger_id, m.c.metal == metal, v.c.cancelled.is_(False))))
     if until:
         query = query.where(v.c.date <= until)
-    moved = sum(dr - cr for dr, cr in conn.execute(query).all())
+    moved = int(conn.execute(query).scalar())
     opening = conn.execute(select(metal_openings.c.opening_mg).where(and_(
         metal_openings.c.ledger_id == ledger_id, metal_openings.c.metal == metal))).scalar() or 0
     return opening + moved
@@ -194,6 +239,7 @@ def rate_cut(conn, company: dict, party_id: int, metal: str, fine_mg: int, rate_
     """Convert metal a party owes (or we owe it) into rupees at an agreed rate per fine gram.
 
     Party owes us metal -> we sell it the metal: a Sales voucher. We owe the party metal -> we buy it: a Purchase."""
+    service.lock_books(conn, company["id"])  # two rate cuts cannot both convert the same balance
     party = _party(conn, company["id"], party_id)
     if fine_mg <= 0 or rate_paise <= 0:
         raise AccountsError("Give the fine weight and the rate per gram.")
@@ -293,6 +339,11 @@ def _money_without_totals(sheet: dict, mapping: dict[str, str], parts: list[str]
     return out
 
 
+def _cell_text(value) -> str:
+    """A register cell as text, without NUL characters (Postgres cannot store them)."""
+    return str(value).replace("\x00", "")
+
+
 def _value(row, column: str | None):
     if not column:
         return None
@@ -309,7 +360,7 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
     from ..books import _normalise  # rupee columns: taxable value, GST, invoice value, party, GSTIN
     from .imports import (_imported_sources, already_in_books, check_reported_state, document_number, duplicates_note,
                           existing_documents, gstin_warnings, ledger_facts, note_bad_gstin, note_register, number_clash,
-                          party_state, place_of_supply, posting_lines, split_unsplit_gst)
+                          party_state, place_of_supply, posting_lines, refused, remembered_ledger, split_unsplit_gst)
 
     cols = detect_jewellery(sheet)
     if cols is None:
@@ -329,7 +380,7 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
     money = money.set_index("rowid")
     states, problems = place_of_supply(sheet, register == "sales")
     raw = load_frame(sheet).set_index("_rowid")
-    company = service.get_company(company_id)
+    service.get_company(company_id)  # "Company not found." before any work
     default_vtype = "Sales" if register == "sales" else "Purchase"
     created, skipped, duplicates, bad_gstins, moved = 0, 0, [], {}, {"gold": 0, "silver": 0}
     checked = {"net": 0, "fine": 0, "total": 0}
@@ -348,8 +399,11 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
             groups.append((key, [rowid]))
 
     with engine.begin() as conn:
+        service.lock_books(conn, company_id)  # as in imports.import_register: the same sheet imported at once waits
+        company = service.get_company(company_id, conn)
         done = _imported_sources(conn, company_id, f"import:{sheet['table_name']}:")
         in_books = existing_documents(conn, company_id, f"import:{sheet['table_name']}:")
+        known: dict = {}  # ledger ids looked up once per import (imports.remembered_ledger)
         for (day, number, party, doc), rowids in groups:
             source = f"import:{sheet['table_name']}:{rowids[0]}"
             label = f"rows {rowids[0]}–{rowids[-1]}" if len(rowids) > 1 else f"row {rowids[0]}"
@@ -383,8 +437,8 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
                 skipped += 1
                 duplicates.append(label)
                 continue
-            main = service.ensure_ledger(conn, company_id, "Sales" if sales_side else "Purchase",
-                                         "Sales Accounts" if sales_side else "Purchase Accounts")
+            main = remembered_ledger(known, "Sales" if sales_side else "Purchase", lambda: service.ensure_ledger(
+                conn, company_id, "Sales" if sales_side else "Purchase", "Sales Accounts" if sales_side else "Purchase Accounts"))
             out = vtype in SALE_LIKE
             returning = vtype in ("Credit Note", "Debit Note")
             place = next((states[int(rowid)] for rowid in rowids if int(rowid) in states), None)
@@ -443,20 +497,29 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
                 settle = str(_value(r, cols.get("settle")) or "").strip().lower()
                 by_weight = settle.startswith("w") if settle else not (_value(r, cols.get("met_val")) or 0)
                 purity = _value(r, cols.get("purity"))
-                details = {"item": _value(r, cols.get("item")), "purity": str(purity) if purity is not None else None, "tunch_bp": tunch,
+                details = {"item": _value(r, cols.get("item")), "purity": _cell_text(purity)[:20] if purity is not None else None, "tunch_bp": tunch,
                            "gross_mg": gross or None, "net_mg": net or None, "dia_mct": dia or None, "stn_mct": stn or None,
                            "pieces": int(_value(r, cols.get("pieces")) or 0) or None, "tag_no": _value(r, cols.get("tag"))}
+                # The register's own values for the item (metal, diamonds, stones, labour), when it has those columns.
+                for key, col in (("metal_paise", "met_val"), ("dia_paise", "dia_val"), ("stn_paise", "stn_val"), ("labour_paise", "lbr_val")):
+                    value = _value(r, cols.get(col))
+                    details[key] = (abs(to_paise(value)) or None) if value is not None else None
                 if details["tag_no"] is not None:
-                    details["tag_no"] = str(details["tag_no"])[:40]
+                    details["tag_no"] = _cell_text(details["tag_no"])[:40]
                 if details["item"] is not None:
-                    details["item"] = str(details["item"])[:120]
+                    details["item"] = _cell_text(details["item"])[:120]
                     item = " ".join(details["item"].split())
                     if item and item not in names:
                         names.append(item)
                 weight += net
+                carried = False  # a row with gold and silver fine: its amounts go on its first line only
                 for name, fine in fines.items():
                     if fine:
-                        metal.append(MetalLine(stock_ledger(conn, company_id, name), name, dr=0 if out else fine, cr=fine if out else 0, details=details))
+                        line_details = details if not carried else {**details, "metal_paise": None, "dia_paise": None,
+                                                                   "stn_paise": None, "labour_paise": None}
+                        carried = True
+                        stock = remembered_ledger(known, ("stock", name), lambda: stock_ledger(conn, company_id, name))
+                        metal.append(MetalLine(stock, name, dr=0 if out else fine, cr=fine if out else 0, details=line_details))
                         key = (party_id if by_weight else main, name)
                         other_side[key] = other_side.get(key, 0) + fine
                 total += int(m.invoice_value)
@@ -483,14 +546,14 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
                 problems.append(f"{label}: negative value on a {vtype}. Give a return the type SR (sales return) or "
                                 "PR (purchase return) in the Type column, or correct the figures. Not posted.")
                 continue
-            lines = posting_lines(conn, company_id, vtype, party_id, main, total, taxable, heads, label, problems) if total or taxable else []
+            lines = posting_lines(conn, company_id, vtype, party_id, main, total, taxable, heads, label, problems, known) if total or taxable else []
             num, reference = document_number(sales_side, str(number) if not str(number).startswith("row") else "", label, problems)
             try:
                 with conn.begin_nested():
                     service.save_voucher(company_id, vtype, pd.Timestamp(day).date(), lines, number=num or None, reference=reference,
                                          narration=f"Imported from {sheet['sheet_name']} ({len(rowids)} item{'s' if len(rowids) != 1 else ''})",
                                          source=source, conn=conn, metal=metal, items_text="\n".join(names) or None,
-                                         net_mg=weight or None)
+                                         net_mg=weight or None, company=company)
                 created += 1
                 note_bad_gstin(bad_gstins, first.gstin, label, used)
                 for line in metal:
@@ -498,6 +561,8 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
                         moved[line.metal] += line.dr + line.cr
             except AccountsError as exc:
                 problems.append(number_clash(conn, in_books, vtype, num, on_day, label, str(exc)) or f"{label}: {exc}")
+            except (DataError, IntegrityError) as exc:  # only this invoice's savepoint is rolled back; the import goes on
+                problems.append(refused(label, exc))
         note_register(conn, company_id, sheet["table_name"], register)
         if before_commit:
             before_commit()
@@ -526,17 +591,29 @@ def metal_entries(company_id: int, metal: str, until: date | None = None) -> pd.
     """Every metal line of every live voucher (fine mg), with its voucher's details."""
     m, v = metal_lines, vouchers
     query = (select(v.c.id.label("voucher_id"), v.c.vtype, v.c.number, v.c.date, v.c.narration, m.c.position, m.c.ledger_id,
-                    m.c.dr_mg.label("dr"), m.c.cr_mg.label("cr"), *(m.c[k] for k in service.METAL_DETAILS))
+                    m.c.dr_mg.label("dr"), m.c.cr_mg.label("cr"), *(columns_of(m)[k] for k in service.METAL_DETAILS))
              .join(v, v.c.id == m.c.voucher_id)
              .where(and_(v.c.company_id == company_id, v.c.cancelled.is_(False), m.c.metal == metal)))
     if until:
         query = query.where(v.c.date <= until)
-    with engine.connect() as conn:
-        frame = pd.read_sql(query, conn)
-    frame["date"] = to_datetime(frame["date"]).dt.date
-    for col in ("dr", "cr"):
-        frame[col] = frame[col].astype("int64")
-    return frame
+
+    def load() -> pd.DataFrame:
+        with connect() as conn:
+            frame = pd.read_sql(query, conn)
+        frame["date"] = to_datetime(frame["date"]).dt.date
+        for col in ("dr", "cr"):
+            frame[col] = frame[col].astype("int64")
+        return frame
+
+    return remembered(("metal_entries", company_id, metal, until), load)
+
+
+def item_key(name: str) -> str:
+    """One item however it is typed: capitals, spaces and a plural s do not matter ("Dia Gents Rings" = "DIA GENTS RING")."""
+    words = re.sub(r"[\s\-_/.,;:()\[\]'\"]+", " ", str(name)).upper().split()  # \w would split Hindi at its vowel signs
+    if words and len(words[-1]) > 3 and words[-1].endswith("S") and not words[-1].endswith("SS"):
+        words[-1] = words[-1][:-1]
+    return " ".join(words) or "(NO NAME)"
 
 
 def stored_items(company_id: int, start: date, end: date) -> pd.DataFrame:
@@ -546,29 +623,41 @@ def stored_items(company_id: int, start: date, end: date) -> pd.DataFrame:
     'out': the metal left stock (a sale, or a purchase return)."""
     m, v = metal_lines, vouchers
     head = columns_of(v)  # NULL for a database that could not be given the columns: no bill then
-    described = select(m.c.voucher_id).where(m.c.item.isnot(None) | m.c.net_mg.isnot(None))
+    # NOT EXISTS for this voucher's own lines (NOT IN over every company's lines can make Postgres rescan them per bill).
+    described = exists().where(and_(m.c.voucher_id == v.c.id, m.c.item.isnot(None) | m.c.net_mg.isnot(None)))
     query = (select(v.c.vtype, head["items_text"], head["net_mg"])
              .where(and_(v.c.company_id == company_id, v.c.cancelled.is_(False), v.c.date >= start, v.c.date <= end,
                          v.c.vtype.in_(("Sales", "Purchase", "Credit Note", "Debit Note")), head["net_mg"] > 0,
-                         v.c.id.notin_(described))))
-    with engine.connect() as conn:
+                         ~described)))
+    with connect() as conn:
         frame = pd.read_sql(query, conn)
     names = [[n for n in text.split("\n") if n.strip()] if isinstance(text, str) else [] for text in frame["items_text"]]
     return pd.DataFrame({"item": [n[0] if len(n) == 1 else "Mixed items" if n else "(no name)" for n in names],
                          "net_mg": frame["net_mg"].astype("int64"), "out": frame["vtype"].isin(SALE_LIKE)})
 
 
+def opening_metal(company_id: int) -> dict[tuple[int, str], int]:
+    """service.metal_opening_map, read once per reading()."""
+    def load():
+        with connect() as conn:
+            return service.metal_opening_map(conn, company_id)
+
+    return remembered(("metal_openings", company_id), load)
+
+
 def _openings(company_id: int, metal: str) -> pd.Series:
-    with engine.connect() as conn:
-        rows = service.metal_opening_map(conn, company_id)
+    rows = opening_metal(company_id)
     return pd.Series({lid: mg for (lid, name), mg in rows.items() if name == metal}, dtype="int64")
 
 
 def metals_in_use(company_id: int) -> list[str]:
     m, v = metal_lines, vouchers
-    with engine.connect() as conn:
-        used = set(conn.execute(select(m.c.metal).join(v, v.c.id == m.c.voucher_id).where(v.c.company_id == company_id).distinct()).scalars())
-        used |= {name for (_, name) in service.metal_opening_map(conn, company_id)}
+
+    def load() -> set[str]:
+        with connect() as conn:
+            return set(conn.execute(select(m.c.metal).join(v, v.c.id == m.c.voucher_id).where(v.c.company_id == company_id).distinct()).scalars())
+
+    used = remembered(("metals_moved", company_id), load) | {name for (_, name) in opening_metal(company_id)}
     return [name for name in chart.METALS if name in used]
 
 
@@ -584,6 +673,7 @@ def _wcol(key: str, label: str, fmt: str = "weight") -> dict:
     return _col(key, label, fmt)
 
 
+@one_view
 def metal_balances(company: dict, metal: str, as_of: date | None, rate: float | None) -> dict:
     """Who owes metal to whom, the metal in hand, and the net metal position."""
     from .reports import balances, ledger_frame  # rupee balances beside the metal ones
@@ -667,6 +757,7 @@ def _particulars(group: pd.DataFrame) -> str:
     return text
 
 
+@one_view
 def metal_ledger(company: dict, ledger_id: int | None, metal: str, start: date | None, end: date | None) -> dict:
     """Running fine-weight balance of one party (or the stock ledger)."""
     metal = metal or "gold"
@@ -716,6 +807,7 @@ def metal_ledger(company: dict, ledger_id: int | None, metal: str, start: date |
     return report
 
 
+@one_view
 def stock_grams(company: dict, metal: str, start: date | None, end: date | None) -> dict:
     """Metal stock in grams: what came in and went out, by karat and by item."""
     metal = metal or "gold"
@@ -762,21 +854,32 @@ def stock_grams(company: dict, metal: str, start: date | None, end: date | None)
                           "fine": grams(g.cr.sum()), "dia": int(g.dia_mct.sum()) / 1000, "stn": int(g.stn_mct.sum()) / 1000})
     item_rows.sort(key=lambda r: -r["fine"])
 
-    # Stock of each item: what came in less what went out, all karats together.
-    moves: dict[str, list[int]] = {}  # item -> [net in mg, net out mg, fine in - out mg, diamonds in - out mct]
+    # Stock of each item: what came in less what went out, all karats together. A purchase typed "Dia Gents Rings" and a
+    # sale "DIA GENTS RING" are the same item (item_key), shown under the name it was first seen with.
+    moves: dict[str, list[int]] = {}  # item key -> [net in mg, net out mg, fine in - out mg, diamonds in - out mct]
+    shown: dict[str, str] = {}
     for item, g in inside.groupby(inside.item.fillna("(no name)")):
-        i, o = g[g.dr > 0], g[g.cr > 0]
-        moves[item] = [int(i.net_mg.sum()), int(o.net_mg.sum()), int(g.dr.sum()) - int(g.cr.sum()),
-                       int(i.dia_mct.sum()) - int(o.dia_mct.sum())]
+        # An item whose purity was not given has no fine weight (both 0): its bill type says in or out.
+        unknown = (g.dr == 0) & (g.cr == 0)
+        i = g[(g.dr > 0) | (unknown & ~g.vtype.isin(SALE_LIKE))]
+        o = g[(g.cr > 0) | (unknown & g.vtype.isin(SALE_LIKE))]
+        key = item_key(item)
+        shown.setdefault(key, item)
+        move = moves.setdefault(key, [0, 0, 0, 0])
+        for n, value in enumerate([int(i.net_mg.sum()), int(o.net_mg.sum()), int(g.dr.sum()) - int(g.cr.sum()),
+                                   int(i.dia_mct.sum()) - int(o.dia_mct.sum())]):
+            move[n] += value
     # Bills with no metal lines (a plain register, added here or from the chat) move their net weight too. Their metal is
     # not known: they go in the report of the first metal in use (gold when none), so each counts once. Their fine and
     # diamonds are not known either, so they add none, and the fine cards count metal lines only.
     in_use = metals_in_use(company["id"])
     if metal == (in_use or ["gold"])[0]:
         for item, net_mg, out in stored_items(company["id"], start, end).itertuples(index=False):
-            moves.setdefault(item, [0, 0, 0, 0])[1 if out else 0] += int(net_mg)
-    stock_rows = [{"item": item, "net_in": grams(net_in), "net_out": grams(net_out), "net": grams(net_in - net_out),
-                   "fine": grams(fine), "dia": dia / 1000} for item, (net_in, net_out, fine, dia) in moves.items()]
+            key = item_key(item)
+            shown.setdefault(key, item)
+            moves.setdefault(key, [0, 0, 0, 0])[1 if out else 0] += int(net_mg)
+    stock_rows = [{"item": shown[key], "net_in": grams(net_in), "net_out": grams(net_out), "net": grams(net_in - net_out),
+                   "fine": grams(fine), "dia": dia / 1000} for key, (net_in, net_out, fine, dia) in moves.items()]
     stock_rows.sort(key=lambda r: (-abs(r["fine"]), -abs(r["net"]), r["item"]))
     w = _wcol
     report = _report(f"{metal.title()} stock in grams", {}, cards=[

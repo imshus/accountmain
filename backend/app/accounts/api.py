@@ -99,15 +99,16 @@ class LedgerIn(BaseModel):
 @router.get("/companies/{company_id}/ledgers")
 def list_ledgers(company_id: int):
     company = _company(company_id)
-    # Balance-sheet ledgers close with everything to date; income and expense ledgers with the latest financial
-    # year only (as the trial balance shows them), their earlier years being in Capital as "Profit & Loss A/c".
-    year_start = reports._fy_period(company, None, None)[0]
-    bal = reports.balances(company, year_start, date(2100, 12, 31))
-    with engine.connect() as conn:
-        openings = service.metal_opening_map(conn, company_id)
-    closings = {name: metal.metal_closing(company, name) for name in metal.metals_in_use(company_id)}
+    with service.reading():  # one connection and one snapshot; the ledgers and lines are each read once
+        # Balance-sheet ledgers close with everything to date; income and expense ledgers with the latest financial
+        # year only (as the trial balance shows them), their earlier years being in Capital as "Profit & Loss A/c".
+        year_start = reports._fy_period(company, None, None)[0]
+        bal = reports.balances(company, year_start, date(2100, 12, 31))
+        openings = metal.opening_metal(company_id)
+        closings = {name: metal.metal_closing(company, name) for name in metal.metals_in_use(company_id)}
+        chart_of_ledgers = service.list_ledgers(company_id)
     out = []
-    for r in service.list_ledgers(company_id):
+    for r in chart_of_ledgers:
         metals = {name: {"opening_mg": openings.get((r["id"], name), 0), "closing_mg": int(closing.get(r["id"], 0))}
                   for name, closing in closings.items() if openings.get((r["id"], name)) or closing.get(r["id"])}
         pl = chart.statement(r["group_name"]) == "pl"
@@ -134,9 +135,11 @@ def update_ledger(company_id: int, ledger_id: int, body: LedgerIn):
 # --- Vouchers -----------------------------------------------------------------------------------------
 
 
+# Text limits are the columns' (vouchers.number 40, reference and bill_ref 60): a longer text is a 422 here, not a
+# database error.
 class BillIn(BaseModel):
     kind: Literal["new", "against", "advance", "on_account"]
-    bill_ref: str | None = None
+    bill_ref: str | None = Field(default=None, max_length=60)
     amount: str | float  # rupees on the same side as the line
 
 
@@ -228,7 +231,7 @@ class InvoiceIn(BaseModel):
     cess: str | float | None = None
     round_off: bool = True
     narration: str = ""
-    reference: str = ""
+    reference: str = Field(default="", max_length=60)
 
 
 @router.post("/companies/{company_id}/vouchers/invoice", status_code=201)
@@ -250,7 +253,7 @@ def create_invoice(company_id: int, body: InvoiceIn):
 
 
 class AgainstIn(BaseModel):
-    bill_ref: str
+    bill_ref: str = Field(max_length=60)
     amount: str | float
 
 
@@ -262,9 +265,9 @@ class SettlementIn(BaseModel):
     amount: str | float
     against: list[AgainstIn] = []
     tds: str | float | None = None
-    number: str | None = None
+    number: str | None = Field(default=None, max_length=40)
     narration: str = ""
-    reference: str = ""
+    reference: str = Field(default="", max_length=60)
 
 
 @router.post("/companies/{company_id}/vouchers/settlement", status_code=201)
@@ -291,7 +294,7 @@ class JewelItemIn(BaseModel):
     stone_ct: str | float | None = None
     net: str | float | None = None  # grams; default gross - (diamond + stone ct) x 0.2
     fine: str | float | None = None  # grams; default net x tunch / 100
-    pieces: int | None = Field(default=None, ge=0)
+    pieces: int | None = Field(default=None, ge=0, le=1_000_000_000)
     tag_no: str | None = None
     diamond_value: str | float | None = None
     stone_value: str | float | None = None
@@ -299,6 +302,9 @@ class JewelItemIn(BaseModel):
     labour_value: str | float | None = None
     metal_value: str | float | None = None
     settle: Literal["Wt", "Rs"] = "Wt"
+    huid: str | None = Field(default=None, max_length=40)  # hallmark id
+    colour: str | None = Field(default=None, max_length=20)  # diamond colour, e.g. GH
+    clarity: str | None = Field(default=None, max_length=20)  # diamond clarity, e.g. SI
 
 
 class JewelleryInvoiceIn(BaseModel):
@@ -312,7 +318,7 @@ class JewelleryInvoiceIn(BaseModel):
     metal_rate: str | float | None = None  # rupees per fine gram, for items settled in rupees
     round_off: bool = True
     narration: str = ""
-    reference: str = ""
+    reference: str = Field(default="", max_length=60)
 
 
 @router.post("/companies/{company_id}/vouchers/jewellery", status_code=201)
@@ -349,7 +355,7 @@ class MetalMoveIn(BaseModel):
     metal: Metal = "gold"
     items: list[MetalItemIn] = Field(min_length=1)
     narration: str = ""
-    reference: str = ""
+    reference: str = Field(default="", max_length=60)
 
 
 @router.post("/companies/{company_id}/vouchers/metal", status_code=201)

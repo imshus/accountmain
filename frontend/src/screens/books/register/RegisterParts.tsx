@@ -1,6 +1,7 @@
 import { memo } from "react";
 import type { VoucherRow, VoucherType } from "../../../types";
 import { voucherRupees, weightShort } from "../figures";
+import { billSummary } from "../txn/billDetails";
 import "./register.css";
 
 // A return takes its bill off the register's totals: a credit note in Sales, a debit note in Purchase.
@@ -43,14 +44,17 @@ export function RegisterStats({ paise, mg }: { paise: number; mg: number | null 
   );
 }
 
-/** One bill in its day's card: party, "items · weight", amount. Tap: the bill's details. */
+/** One bill in its day's card: party, "items · weight", then purity, fine and diamonds, and the amount. Tap: the whole
+ * bill (every item's tag, weights, purity, HUID, labour and diamond amounts). */
 export const RegisterRow = memo(function RegisterRow({ bill, party, onOpen }: { bill: VoucherRow; party: string; onOpen: (bill: VoucherRow) => void }) {
+  const summary = billSummary(bill);
   return (
     <li className="reg-row">
       <button type="button" className="reg-row__btn" onClick={() => onOpen(bill)}>
         <span className="reg-row__text">
           <strong className="reg-row__party">{party}</strong>
           <span className="reg-row__sub">{billLine(bill)}</span>
+          {summary ? <span className="reg-row__meta">{summary}</span> : null}
         </span>
         <strong className="reg-row__amt">{voucherRupees(bill.amount, isReturn(bill) && bill.amount ? "−" : "")}</strong>
       </button>

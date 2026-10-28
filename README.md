@@ -1,11 +1,11 @@
 # Accounts.ai
 
 Upload an Excel sheet, get checked accounting summaries and reports, keep proper double-entry books (vouchers,
-ledgers, GST returns, bank reconciliation), and chat with your data in plain English using GPT-6 Luna (or Claude).
+ledgers, GST returns, bank reconciliation), and chat with your data in plain English using GPT-6 Luna.
 
 ```
 Accounts.ai/
-├── backend/        The server: Python API (FastAPI, pandas, NumPy, SQLAlchemy/SQLite, GPT-6 Luna / Claude)
+├── backend/        The server: Python API (FastAPI, pandas, NumPy, SQLAlchemy/PostgreSQL, GPT-6 Luna)
 ├── frontend/       The client: React + TypeScript web app, also packaged as the Android app (frontend/android)
 ├── sample-data/    sample_ledger.xlsx, sample_sales_register.xlsx, sample_purchase_register.xlsx
 └── reports/        research reports behind the accuracy and accounting design
@@ -27,7 +27,7 @@ README with its run and build steps.
 | **Sales + Purchases** | **Comparison** (totals and GST side by side, margin, month by month, columns in both files such as quantity/weight, item-wise purchased vs sold, parties who are both customer and supplier), **GST** (output vs input credit, cash payable per head in the Rule 88A order, data checks for both registers), **Gross profit** (trading account with opening/closing stock, GST excluded), **Customers & suppliers**, **Party ledger** (sales Dr, purchases Cr, running balance), **Ageing** (receivables and payables), **Day book**, **Analyse** (also on both registers as one table, e.g. taxable value by month, sales vs purchases side by side), **Ask AI** across both registers, **Sheets in this set** (mark sheets as sales/purchases) |
 | **Overview** | Data checks, totals, month-by-month, top categories, column statistics, data preview, notes for the AI |
 | **Analyse** | No SQL needed: pick what to show (total, number of rows, average, lowest, highest, number of different), group by up to two columns (dates by month, quarter, financial year or year), add conditions, sort and keep the top N; see a bar chart and a table with totals, or spread the second column across (a pivot table); download CSV. Groups beyond the top N become one "All others" row so the column still adds up, and every result proves its groups add up to the overall total. |
-| **Ask AI** | Ask GPT-6 Luna or Claude; follow-up questions; the AI uses the same Analyse engine (or SQL when needed), and every answer shows its analyses, queries, calculations and formula checks plus a verification badge. "Open in Analyse" loads what the AI did. A read-only SQL box is under **Advanced: SQL**. |
+| **Ask AI** | Ask GPT-6 Luna; follow-up questions; the AI uses the same Analyse engine (or SQL when needed), and every answer shows its analyses, queries, calculations and formula checks plus a verification badge. "Open in Analyse" loads what the AI did. A read-only SQL box is under **Advanced: SQL**. |
 | **Reports** | Ledger with running Dr/Cr balance, day book, trial balance (editable account groups), profit & loss (with opening/closing stock), balance sheet, receivables/payables ageing, GST summary with data checks, net GST payable (Rule 88A credit order). CSV download. |
 | **Entries** | Browse and search entries, add an entry, delete an entry. All totals and reports are recalculated. |
 | **Calculator** | Exact decimal calculator (add, subtract, multiply, divide, %), column formulas such as `credit - debit` or `taxable_value + cgst + sgst`, "does this formula match every row?" checks, save a result as a new column |
@@ -90,9 +90,16 @@ cd backend
 python -m venv .venv
 .venv\Scripts\activate            # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-copy .env.example .env            # macOS/Linux: cp .env.example .env  — then add your OPENAI_API_KEY
+copy .env.example .env            # macOS/Linux: cp .env.example .env  — then add DATABASE_URL and your OPENAI_API_KEY
 uvicorn app.main:app --reload --port 8000
 ```
+
+The backend keeps everything (books, uploads, chats) in a PostgreSQL database and nothing on the computer's disk.
+`DATABASE_URL` is that database's address: on Supabase, your project → **Connect** → **Session pooler** (port 5432),
+the URI with the database password in it (if the password has characters such as `@ : / % # ? +`, leave
+`[YOUR-PASSWORD]` in the address and put the password in `DATABASE_PASSWORD`). The tables are made at the first start,
+in their own schema (`DATABASE_SCHEMA`, default `accountsai`). For development use a separate Supabase project or a
+PostgreSQL on your PC, never the server's database: it is the only copy of the books.
 
 **Frontend** (http://localhost:5173):
 
@@ -105,8 +112,7 @@ npm run dev
 Open http://localhost:5173 and drop `sample-data/sample_sales_register.xlsx` and
 `sample-data/sample_purchase_register.xlsx` into the chat (they include a 12% rate used after 22 Sept 2025, a tax
 amount that doesn't match its rate, and a mistyped GSTIN, so you can see the checks work). Without an API key
-everything works except the chat. The chat uses `LLM_PROVIDER` (GPT-6 Luna by default); there is no model picker
-on screen.
+everything works except the chat. The chat uses GPT-6 Luna (`OPENAI_MODEL`); there is no model picker on screen.
 
 ## Hosting on a server (Hostinger VPS, AWS EC2, any Linux VPS) with Docker
 
@@ -117,7 +123,7 @@ template already has Docker; on another VPS install it with `curl -fsSL https://
 
 ```bash
 git clone https://github.com/imshus/accountmain.git && cd accountmain
-cp backend/.env.example backend/.env    # then edit backend/.env and set OPENAI_API_KEY
+cp backend/.env.example backend/.env    # then edit backend/.env and set DATABASE_URL and OPENAI_API_KEY
 docker compose up -d --build            # first build takes a few minutes
 ```
 
@@ -127,8 +133,8 @@ Allow port 80 in the VPS firewall (Hostinger hPanel → VPS → Firewall, or `uf
 
 - Update after a new push: `git pull && docker compose up -d --build`
 - Logs: `docker compose logs -f backend`
-- The books live in the `accounts-data` Docker volume (kept across updates). Back it up with
-  `docker compose cp backend:/data ./backup`.
+- The books, uploads and chats live in the database (`DATABASE_URL`), not on the server: there is no Docker volume,
+  and a rebuild or a new server finds everything there. Back-ups: Supabase → Database → Backups.
 - **The app has no login.** On a public server anyone who knows the address can see your books and use
   your OpenAI key. Turn on the optional password in `frontend/nginx.conf` (instructions inside), or limit
   port 80 to your office IP in the firewall. Use a domain with HTTPS before real use.
@@ -140,7 +146,7 @@ Amazon Linux 2023's own Python 3.9 works. Use the venv's Python for pip so it in
 ```bash
 cd backend && python3 -m venv venv && venv/bin/python -m pip install --upgrade pip
 venv/bin/python -m pip install -r requirements.txt
-cp .env.example .env   # then put your OPENAI_API_KEY in it; .env is not in git
+cp .env.example .env   # then put DATABASE_URL and your OPENAI_API_KEY in it; .env is not in git
 pm2 start venv/bin/python --name backend-app --interpreter none -- -m uvicorn app.main:app --host 0.0.0.0 --port 2000
 ```
 
@@ -169,7 +175,7 @@ should use HTTPS.
 With `SUPABASE_URL` and `SUPABASE_SECRET_KEY` in `backend/.env`, every file uploaded from any client (web, the
 Android app, the Expo app) is also stored unchanged in a **private** Supabase Storage bucket (a public bucket is
 refused, so documents can never be downloaded without the key). The copy is made in the background, so uploads are
-not slower and never fail because of it. Until Supabase confirms a copy, the file waits in `DATA_DIR/cloud_outbox`;
+not slower and never fail because of it. Until Supabase confirms a copy, the file waits in the database (table `cloud_outbox`);
 passing failures (Supabase or the network down) keep it waiting and it is tried again every 15 minutes and at the
 next start; only problems retrying cannot fix (wrong key, public bucket, refused file) mark it failed, and
 `POST /api/cloud/retry` sends those again after you fix them. The key is only ever sent over https and never
@@ -187,7 +193,7 @@ of its Supabase copy), and collection **chats**, one document per conversation (
 files, turns). Each change (an upload, an entry added or deleted, a calculated column, notes, setup, a chat saved, the
 Supabase copy's state) is sent within seconds, and a deleted upload or conversation is deleted there too (deleting an
 upload or a set also deletes its conversations). Not copied: the sheets' rows, the company books and vouchers, and the
-uploaded files themselves (see Supabase above). SQLite stays the main copy, so MongoDB never slows a request down or
+uploaded files themselves (see Supabase above). The database stays the main copy, so MongoDB never slows a request down or
 makes it fail: while it cannot be reached, records wait in the `mongo_sync` table and are retried. A pass at startup and
 every 5 minutes sends every record that changed since MongoDB last confirmed it, every record when `MONGODB_DB` or the
 cluster changed, and every record MongoDB no longer holds (a collection emptied in Atlas), so uploads and chats made
@@ -262,21 +268,20 @@ MongoDB Atlas:
 
 | Variable | Default | |
 | --- | --- | --- |
+| `DATABASE_URL` | — | Required: the PostgreSQL database that holds the books, uploads and chats (nothing is kept on the server's disk). Supabase → Connect → **Session pooler** (port 5432, not the transaction pooler on 6543); `sslmode=require` is added for you. Never printed: messages name only the host |
+| `DATABASE_PASSWORD` | — | The database password, when it has characters such as `@ : / % # ? +`: leave `[YOUR-PASSWORD]` in `DATABASE_URL` |
+| `DATABASE_SCHEMA` | `accountsai` | Schema for the app's tables (not `public`, which Supabase's web API exposes) |
+| `DATABASE_POOL_SIZE` | `5` | Connections kept open to the database (as many more are opened when busy) |
 | `OPENAI_API_KEY` | — | Enables GPT-6 Luna in the chat |
 | `OPENAI_MODEL` | `gpt-6-luna` | OpenAI model used for chat |
 | `OPENAI_REASONING_EFFORT` | `low` | Effort for the first answer, `none` … `max`; low answers about twice as fast as high, and every figure is still checked |
 | `OPENAI_REPAIR_EFFORT` | `medium` | Effort for the correction round, used only when a figure fails the check |
 | `OPENAI_FOLLOWUP_EFFORT` | `low` | Effort for the suggested next questions shown under an answer |
 | `OPENAI_SERVICE_TIER` | — | Set `priority` for faster processing from OpenAI at a higher price per token |
-| `ANTHROPIC_API_KEY` | — | Enables Claude as a second option in the chat |
-| `ANTHROPIC_MODEL` | `claude-opus-5-5` | Claude model used for chat |
-| `ANTHROPIC_EFFORT` / `ANTHROPIC_REPAIR_EFFORT` | `low` / `medium` | Same, for Claude |
-| `LLM_PROVIDER` | `openai` | Model selected first when both keys are set |
 | `MAX_UPLOAD_MB` | `25` | Upload size limit |
 | `SUPABASE_URL` / `SUPABASE_SECRET_KEY` | — | Optional: also store every uploaded document in Supabase Storage (the https:// Project URL, and a secret key `sb_secret_…` from Supabase → Project Settings → API Keys; a legacy service_role key also works; `SUPABASE_SERVICE_KEY` is accepted as the name too) |
 | `SUPABASE_BUCKET` / `SUPABASE_FOLDER` | `documents` / `uploads` | Private bucket (created if missing; a public one is refused) and folder: `<folder>/<YYYY-MM>/<upload id>-<content fingerprint>-<file name>` |
 | `MONGODB_URI` / `MONGODB_DB` | — / `accountsai` | Optional: a live copy of the uploads (sheet statistics, notes, setup) and chat conversations in MongoDB; the `mongodb+srv://` string from Atlas (TLS with certificate checks is required for any host but this machine) |
-| `DATA_DIR` | `backend/data` | Where `accounts.db` is stored |
 
 ## Limits to know
 
@@ -311,9 +316,9 @@ MongoDB Atlas:
 | `backend/app/classify.py` / `gst.py` | Tally account groups; GSTIN validation, state codes, GST 2.0 rates |
 | `backend/app/calc.py` | Safe exact calculator and column formulas |
 | `backend/app/editing.py` | Add/delete entries, calculated columns, formula checks, notes, report setup |
-| `backend/app/database.py` | SQLAlchemy storage (SQLite) |
+| `backend/app/database.py` | SQLAlchemy storage (PostgreSQL: the one store; schema, sequences, audit triggers) |
 | `backend/app/duck.py` | DuckDB query engine: sheets loaded with pandas, exact DECIMAL columns, locked-down sessions |
 | `backend/app/analysis.py` | Analyse: request → parameterised DuckDB query → pandas (averages, top N + "All others", pivot, proof checks) |
 | `backend/app/detect.py` | Which shared file is a sales register, purchase register, bank statement or ledger, with the evidence |
-| `backend/app/llm/` | Chat: prompt, data dictionary and tools (`common.py`), answer verification (`verify.py`), GPT-6 Luna (`gpt.py`), Claude (`claude.py`) |
+| `backend/app/llm/` | Chat: prompt, data dictionary and tools (`common.py`), answer verification (`verify.py`), GPT-6 Luna (`gpt.py`) |
 | `frontend/src/components/` | `UploadPanel` + `BooksUpload`, `DatasetView`, `BooksView`, `AnalysePanel`, `ChatPanel`, `ReportsPanel`, `EntriesPanel`, `CalculatorPanel`; `accounts/` holds the company books screens (`CompanyView`, `VoucherEntry`, `VouchersPanel`, `LedgersPanel`, `AccountsReports`, `AccountsImport`) |

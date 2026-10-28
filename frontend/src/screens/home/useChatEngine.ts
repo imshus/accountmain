@@ -48,7 +48,7 @@ type RunOptions = {
 /** Delta text not yet shown: flushed to the store at most once per animation frame. */
 type StreamBuffer = { turnId: number; text: string; frame: number };
 
-/** The steps worth keeping after the answer: what was done, not "Reading the question…". */
+/** The steps worth keeping after the answer: what was done, not "Reading your entries…". */
 function keptSteps(steps: string[]): string[] {
   const done = steps.map((s) => s.replace(/…$/, "")).filter((s) => !/^(Reading|Uploading|Thinking)\b/.test(s));
   return [...new Set(done)].slice(-12);

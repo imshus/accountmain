@@ -2,11 +2,10 @@ import { useEffect, useMemo } from "react";
 import { navigate, type StockMetal } from "../router";
 import { useCompany } from "../session";
 import type { Report } from "../types";
-import { Button, CheckList, EmptyState, Notice, Page, Segmented, Skeleton } from "../ui";
+import { Button, EmptyState, Notice, Page, Segmented, Skeleton } from "../ui";
 import { cardValue } from "./books/figures";
 import { ItemCard, StockTotal, stockItems } from "./books/stock/StockParts";
 import { useBooksReport } from "./books/useBooksReport";
-import { stockWarnings } from "./books/useBookWarnings";
 
 export type StockScreenProps = { metal: StockMetal };
 
@@ -23,8 +22,7 @@ export default function StockScreen({ metal }: StockScreenProps) {
   const company = useCompany();
   const { report, loading, error, reload } = useBooksReport("stock_grams", { metal });
   const items = useMemo(() => stockItems(report), [report]);
-  // The bell's stock warnings ("Gold 22K: −4.350 g fine …") open this screen, so they are listed here too.
-  const warnings = useMemo(() => stockWarnings(metal, report), [metal, report]);
+  // Stock warnings ("Gold 22K: −4.350 g fine …") are shown in the bell's notifications only, not here (the owner's wish).
   // No entries at all, not only none by item (opening stock has no items; an older server lists only items that went out).
   const noStock = report !== null && ["Opening", "Came in", "Closing"].every((label) => Math.abs(cardValue(report, label)) < 0.0005);
   useEffect(() => {
@@ -74,8 +72,6 @@ export default function StockScreen({ metal }: StockScreenProps) {
             <Skeleton height={72} radius={14} />
           </div>
         ) : null}
-
-        <CheckList items={warnings} />
 
         {report && items.length === 0 && !noStock ? (
           <Notice>

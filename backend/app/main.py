@@ -18,7 +18,9 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeout
+from starlette.formparsers import MultiPartParser
 
 from datetime import date
 
@@ -32,6 +34,7 @@ from .calc import CalcError, evaluate_number, format_decimal
 from .duck import Session, cached, sheet_key
 from .excel_loader import UploadError, read_workbook
 from .llm import followups
+from .llm.books_data import books_tables
 from .llm.common import describe_tables, says_register, warm_tables
 from .schemas import (
     AddRowRequest,
@@ -74,6 +77,45 @@ from .schemas import (
 
 # Older turns beyond this are dropped; the table context is resent every turn anyway.
 MAX_CHAT_MESSAGES = 20
+# Nothing is written to the server's disk: an uploaded file stays in memory up to the upload limit (Starlette would put
+# anything over 1 MB in a temporary file). Only a body over the limit, which is refused, can still reach one.
+MultiPartParser.spool_max_size = (config.MAX_UPLOAD_MB + 1) * 1024 * 1024
+_DATABASE_RETRY_SECONDS = 30  # how often making the tables is tried again while the database does not answer
+
+
+def _database_error(exc: Exception) -> str | None:
+    """What to tell the app about a database error, never its SQL, values, address or password; None for another error."""
+    if isinstance(exc, PoolTimeout):
+        return "The server is busy: every connection to its database is in use. Try again in a moment."
+    if not isinstance(exc, DBAPIError):
+        return None
+    state = getattr(exc.orig, "sqlstate", None) or ""
+    if state == "25006":  # a read-only transaction: Supabase turns the database read-only when its disk is full
+        return database.storage_problem() or "The server cannot save: its database is read-only for the backend's user."
+    if cloud.passing(exc) or state.startswith("28"):  # unreachable, restarting, or the password refused
+        return database.storage_problem() or "The server lost its connection to the database; try again in a moment."
+    if state == "42501":
+        return "The server cannot do this: its database user lacks a permission it needs (use the database's owner)."
+    return f"The server hit an error: {type(exc).__name__}: {database._safe_reason(exc)}"[:330]
+
+
+def _init_database(report: bool) -> bool:
+    """Make the tables, columns and triggers this version needs (init_db); False while the database cannot be reached
+    or refuses, with the reason printed when ``report``."""
+    try:
+        database.init_db()
+        return True
+    except DBAPIError as exc:
+        if report:
+            print(f"The database's tables are not ready yet: {_database_error(exc)}")
+        return False
+
+
+def _init_database_later() -> None:
+    """The database did not answer at startup (not up yet, paused, the network down): make its tables once it does."""
+    while not _init_database(report=False):
+        time.sleep(_DATABASE_RETRY_SECONDS)
+    print("The database answers now: its tables are ready.")
 
 
 @asynccontextmanager
@@ -81,15 +123,14 @@ async def lifespan(_app: FastAPI):
     problem = database.storage_problem()
     if problem:
         print(problem)
+    if config.DATABASE_URL and not _init_database(report=not problem):
+        # Still start, so /api/health and every request can say what is wrong (the books can be read from a read-only
+        # database); the tables are made as soon as the database answers.
+        threading.Thread(target=_init_database_later, name="database-init", daemon=True).start()
     try:
-        database.init_db()
-    except OperationalError as exc:
-        # A read-only data folder: still start, so the books can be read and every save explains how to fix it.
-        if "readonly database" not in str(exc):
-            raise
-        if not problem:
-            print(f"The database is read-only, so nothing can be saved until that is fixed: {exc}")
-    cloud.resume()  # copies to Supabase that were still waiting when the backend stopped
+        cloud.resume()  # copies to Supabase that were still waiting when the backend stopped
+    except Exception as exc:  # noqa: BLE001 - its sweep tries again every 15 minutes
+        print(f"Supabase copies still waiting are not resumed yet ({type(exc).__name__}); they are tried again later.")
     mongo_sync.start()  # the live copy of the records in MongoDB, when set up
     if config.openai_configured():
         threading.Thread(target=llm.gpt.warm_up, daemon=True).start()  # the first question skips the handshake
@@ -119,10 +160,9 @@ class _ErrorsAsJson:
             logging.getLogger("uvicorn.error").exception("%s %s failed", scope.get("method"), scope.get("path"))
             if started:  # part of the answer is already out (a streamed chat): nothing else can be sent
                 raise
-            if "readonly database" in str(exc):
-                detail = database.storage_problem() or "The server cannot save: its database is read-only for the backend's user."
-            else:
-                detail = f"The server hit an error: {type(exc).__name__}: {exc}"[:330]
+            # On a thread: telling why the database fails may wait for it (up to its connect timeout).
+            detail = await asyncio.to_thread(_database_error, exc)
+            detail = detail or f"The server hit an error: {type(exc).__name__}: {exc}"[:330]
             await JSONResponse({"detail": detail}, status_code=500)(scope, receive, send)
 
 
@@ -200,15 +240,46 @@ def _detail(dataset: dict) -> dict:
             "cloud": cloud.status_of(dataset["id"])}
 
 
+# /api/health answers within this many seconds even when the database does not (the app's own check waits 5); one check
+# of the database runs at a time, and requests meanwhile share its answer.
+_HEALTH_WAIT = 4
+_health_lock = threading.Lock()
+_health_check: Future | None = None
+_HEALTH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="health")
+
+
+def _database_health() -> tuple[str | None, dict | None, dict | None]:
+    """(what stops the backend reading or saving, or None; the Supabase copies' counts; the MongoDB copy's counts). The
+    counts are None while the database cannot be read."""
+    problem = database.storage_problem()
+    if problem:
+        return problem, None, None
+    try:
+        return None, cloud.summary(), mongo_sync.summary()
+    except (DBAPIError, PoolTimeout) as exc:
+        return _database_error(exc), None, None
+
+
 @app.get("/api/health", response_model=Health)
 def health():
+    global _health_check
+    with _health_lock:
+        if _health_check is None or _health_check.done():
+            _health_check = _HEALTH_POOL.submit(_database_health)
+        check = _health_check
+    try:
+        problem, copies, records = check.result(timeout=_HEALTH_WAIT)
+    except FutureTimeout:
+        problem, copies, records = (f"The backend cannot reach its database at {config.database_host()}: no answer within "
+                                    f"{_HEALTH_WAIT} seconds."), None, None
     return {"status": "ok", "providers": llm.provider_status(), "default_provider": llm.default_provider(),
-            "cloud": cloud.summary(), "mongo": mongo_sync.summary(), "storage_problem": database.storage_problem()}
+            "cloud": copies, "mongo": records, "storage_problem": problem}
 
 
 @app.post("/api/upload", response_model=DatasetDetail, status_code=201)
 def upload(file: UploadFile = File(...)):
-    filename = Path(file.filename or "upload").name
+    # Without NUL characters, which the database cannot store in text (a crafted name could hold them).
+    filename = Path((file.filename or "upload").replace("\x00", "")).name or "upload"
     if Path(filename).suffix.lower() not in config.ALLOWED_EXTENSIONS:
         allowed = ", ".join(sorted(config.ALLOWED_EXTENSIONS))
         raise HTTPException(status_code=400, detail=f"Unsupported file type. Upload one of: {allowed}.")
@@ -619,7 +690,7 @@ def _prefetch(sheets: list[dict], registers: list[dict]) -> None:
     jobs = _register_jobs(registers) if registers else None
 
     def warm():
-        describe_tables(sheets)  # mostly SQLite queries, which overlap well with the comparison
+        describe_tables(sheets)  # mostly database queries, which overlap well with the comparison
         stacked = jobs[0].result() if jobs else None
         if jobs:
             jobs[1].result()
@@ -689,20 +760,24 @@ def files_chat_stream(body: FilesChatRequest):
     sheets, registers, documents_text, found = _shared_files(body.dataset_ids)
     messages = _chat_messages(body)
     company_id = _books_company(body.company_id, sheets)
-    pending = _pending_registers(found, company_id, messages)
+    # The company's books are readable in every chat, with or without files shared.
+    books_company = _books_company(body.company_id, [{}])
 
     def answer(emit, cancel):
+        pending = _pending_registers(found, company_id, messages)
+        books = books_tables(books_company) if books_company is not None else {}
         if not registers:
-            return llm.chat(body.provider, messages, sheets, emit=emit, fresh=body.fresh, documents=documents_text,
-                            cancel=cancel, company_id=company_id, pending=pending)
+            return llm.chat(body.provider, messages, sheets, books or None, emit=emit, fresh=body.fresh,
+                            documents=documents_text, cancel=cancel, company_id=company_id, pending=pending,
+                            bill_company_id=books_company)
         table, comparison = _register_jobs(registers)
         wait = _waiter(emit, cancel)
         stacked = wait(table)
-        extra = {"registers": stacked} if stacked else {}
+        extra = {**books, **({"registers": stacked} if stacked else {})}
         # The app's exact comparison of the two registers, read only when the answer is not remembered.
         return llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh, documents=documents_text,
                         combined=(lambda: wait(comparison)) if stacked else None, cancel=cancel, company_id=company_id,
-                        pending=pending)
+                        pending=pending, bill_company_id=books_company)
 
     return _stream_chat(answer)
 

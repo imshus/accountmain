@@ -49,7 +49,8 @@ export const FIELD_ORDER: FieldKey[] = [
   "stoneCt", "stoneRate", "labourRate", "gst",
 ];
 
-export const GST_DEFAULT = "3";
+// No GST on the form (the owner's design): the bill is the labour and diamond amounts.
+export const GST_DEFAULT = "0";
 export const PURITY_DEFAULT = "91.6";
 /** Offered in the Item list until the shop adds its own. */
 export const DEFAULT_ITEMS = ["Bangle", "Chain", "Ring", "Necklace", "Earrings", "Pendant"];
@@ -63,8 +64,8 @@ export function emptyForm(): EntryForm {
 
 /** After a save: a fresh bill for the next customer, keeping the choices that usually repeat. */
 export function nextForm(prev: EntryForm): EntryForm {
-  return { ...emptyForm(), date: prev.date, agent: prev.agent, metal: prev.metal, settle: prev.settle, purity: prev.purity,
-    labourRate: prev.labourRate, metalRate: prev.metalRate, gst: prev.gst };
+  // The metal, settlement and GST rate have no fields on the form (the design's), so they stay at their defaults.
+  return { ...emptyForm(), date: prev.date, agent: prev.agent, purity: prev.purity, labourRate: prev.labourRate };
 }
 
 // An unsaved bill survives an accidental Back (or the Android back button) for a while.
@@ -79,7 +80,9 @@ export function loadDraft(companyId: number): { kind: EntryKind; form: EntryForm
     if (!draft || draft.companyId !== companyId || Date.now() - draft.at > DRAFT_HOURS * 3600_000) return null;
     // A bill date carried over from an earlier day would be easy to miss: the date restarts at today.
     const sameDay = new Date(draft.at).toDateString() === new Date().toDateString();
-    return { kind: draft.kind, form: { ...emptyForm(), ...draft.form, ...(sameDay ? {} : { date: todayISO() }) } };
+    // Fields the form no longer shows (metal, settlement, stones, GST) restart at their defaults, never hidden values.
+    const { metal: _m, settle: _s, stoneCt: _sc, stoneRate: _sr, metalRate: _mr, gst: _g, ...shown } = draft.form;
+    return { kind: draft.kind, form: { ...emptyForm(), ...shown, ...(sameDay ? {} : { date: todayISO() }) } };
   } catch {
     return null;
   }

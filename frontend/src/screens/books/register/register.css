@@ -113,10 +113,18 @@
 }
 
 .reg-row__party,
-.reg-row__sub {
+.reg-row__sub,
+.reg-row__meta {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+/* Purity · fine · diamonds: the bill's key figures, quieter than the items line. */
+.reg-row__meta {
+  font-size: 11.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
 }
 
 .reg-row__party {

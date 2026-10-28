@@ -20,6 +20,7 @@ from .. import analysis, config
 from .common import (
     ANALYSE_PARAMS,
     ANALYSE_TOOL_DESCRIPTION,
+    BILL_TOOL_DESCRIPTION,
     BOOKS_TOOL_DESCRIPTION,
     CALC_EXPRESSION_DESCRIPTION,
     CALC_TOOL_DESCRIPTION,
@@ -36,6 +37,7 @@ from .common import (
     LLMError,
     Reply,
     Toolbox,
+    bill_tool_schema,
     books_tool_schema,
     closing_on_cancel,
     tool_error,
@@ -101,11 +103,16 @@ _QUOTA_CODES = {"insufficient_quota", "credit_balance_exhausted", "organization_
 
 
 def _tools(tools: Toolbox) -> list[dict]:
-    """TOOLS, plus add_to_books (limited to the shared tables) when the chat may post them to a company's books."""
-    if not tools.can_add_to_books:
-        return TOOLS
-    return [*TOOLS, {"type": "function", "name": "add_to_books", "description": BOOKS_TOOL_DESCRIPTION,
-                     "parameters": books_tool_schema(tools.sheets), "strict": True}]
+    """TOOLS, plus add_to_books (limited to the shared tables) when the chat may post them to a company's books, and
+    add_bill when a company is chosen."""
+    extra = []
+    if tools.can_add_to_books:
+        extra.append({"type": "function", "name": "add_to_books", "description": BOOKS_TOOL_DESCRIPTION,
+                      "parameters": books_tool_schema(tools.sheets), "strict": True})
+    if tools.can_add_bill:
+        extra.append({"type": "function", "name": "add_bill", "description": BILL_TOOL_DESCRIPTION,
+                      "parameters": bill_tool_schema(), "strict": True})
+    return [*TOOLS, *extra] if extra else TOOLS
 
 
 def _run_call(tools: Toolbox, call) -> str:
@@ -121,6 +128,8 @@ def _run_call(tools: Toolbox, call) -> str:
             return tools.check_formula(args["table"], args["target_column"], args["expression"], float(args["tolerance"]))
         if call.name == "add_to_books":
             return tools.add_to_books(args["table"], args.get("register"))  # null: the detected register
+        if call.name == "add_bill":
+            return tools.add_bill(**args)
     except Exception as exc:  # noqa: BLE001 - the real reason goes back to the model, which fixes its call
         return tool_error(exc)
     return f"Error: unknown tool {call.name}."

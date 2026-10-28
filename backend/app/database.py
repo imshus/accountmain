@@ -1,29 +1,31 @@
-"""SQLite storage through SQLAlchemy.
+"""PostgreSQL storage (Supabase) through SQLAlchemy: the one store of the uploads, books and chats. Nothing is kept on
+this machine's disk; every read goes to the database (the in-process caches are keyed by data versions).
 
-Every uploaded sheet becomes its own table (``ds<id>_<sheet>``). Two registry tables
-record which tables belong to which upload, plus the statistics computed at upload time.
-User and LLM queries go through ``run_select``, which opens the database read-only and
-uses SQLite's authorizer so a statement can only SELECT from the tables of one upload.
+All tables live in their own schema (config.DATABASE_SCHEMA, set as each connection's search_path), which Supabase's web
+API does not expose. Every uploaded sheet becomes its own table (``ds<id>_<sheet>``) with an explicit ``_rowid`` column
+(1, 2, 3... in the sheet's order, as SQLite's rowid was). Two registry tables record which tables belong to which upload,
+plus the statistics computed at upload time.
 """
 
 from __future__ import annotations
 
-import getpass
 import json
 import math
-import os
 import re
-import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import pandas as pd
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
+    Identity,
+    Index,
     Integer,
     MetaData,
     String,
@@ -34,43 +36,51 @@ from sqlalchemy import (
     event,
     func,
     insert,
+    inspect,
     null,
     select,
+    text,
     update,
 )
-from sqlalchemy.dialects.sqlite import insert as upsert
+from sqlalchemy.dialects.postgresql import insert as upsert
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.pool import NullPool
 
 from . import config
 
-engine = create_engine(f"sqlite:///{config.DB_PATH}")
+# Without DATABASE_URL the engine points nowhere: every request then fails with storage_problem()'s message, and the
+# app still starts so /api/health can say what to set.
+engine = create_engine(
+    config.DATABASE_URL or "postgresql+psycopg://database-url-not-set.invalid/none",
+    pool_pre_ping=True,  # a connection the pooler or the network dropped is replaced, not handed out
+    pool_recycle=300,
+    pool_size=config.DATABASE_POOL_SIZE,
+    max_overflow=config.DATABASE_POOL_SIZE,
+    pool_timeout=30,
+    connect_args={"connect_timeout": 10, "application_name": "accounts-ai"},
+)
 
 
 @event.listens_for(engine, "connect")
-def _enable_foreign_keys(dbapi_connection, _record):
-    dbapi_connection.execute("PRAGMA foreign_keys = ON")
+def _session_settings(dbapi_connection, _record):
+    """Every connection works in the app's schema, in UTC. Set once per connection (the session pooler keeps it)."""
+    with dbapi_connection.cursor() as cur:
+        try:
+            cur.execute("SET TIME ZONE 'UTC'")
+        except Exception:  # noqa: BLE001 - a server without time zone names (some local builds): a zero offset is UTC
+            dbapi_connection.rollback()
+            cur.execute("SET TIME ZONE 0")
+        cur.execute(f"SET search_path TO {quote_ident(config.DATABASE_SCHEMA)}, public")
+    dbapi_connection.commit()
 
-
-def _connect_readonly() -> sqlite3.Connection:
-    conn = sqlite3.connect(f"{config.DB_PATH.as_uri()}?mode=ro", uri=True, check_same_thread=False)
-    if hasattr(sqlite3, "SQLITE_DBCONFIG_DQS_DML"):  # Python 3.12+
-        # Without this, SQLite reads a misspelled "column" as the text 'column' and the
-        # query quietly returns wrong numbers instead of failing.
-        conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
-    return conn
-
-
-readonly_engine = create_engine("sqlite://", creator=_connect_readonly, poolclass=NullPool)
 
 metadata = MetaData()
 
 datasets = Table(
     "datasets",
     metadata,
-    Column("id", Integer, primary_key=True),
-    Column("filename", String(255), nullable=False),
-    Column("size_bytes", Integer, nullable=False),
+    Column("id", Integer, primary_key=True, autoincrement=False),  # from the dataset_ids sequence
+    Column("filename", Text, nullable=False),
+    Column("size_bytes", BigInteger, nullable=False),
     Column("uploaded_at", DateTime(timezone=True), nullable=False),
     # The register the upload is filed under, which is also its copy's folder in Supabase: "sales" | "purchases" |
     # "unsorted" (NULL for uploads made before this was kept). register_added: a sheet of it was added to the books as
@@ -85,7 +95,7 @@ dataset_sheets = Table(
     Column("id", Integer, primary_key=True),
     Column("dataset_id", Integer, ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, index=True),
     Column("position", Integer, nullable=False),
-    Column("sheet_name", String(255), nullable=False),
+    Column("sheet_name", Text, nullable=False),
     Column("table_name", String(255), nullable=False, unique=True),
     Column("row_count", Integer, nullable=False),
     Column("profile_json", Text, nullable=False),
@@ -96,8 +106,8 @@ dataset_sheets = Table(
 books = Table(
     "books",
     metadata,
-    Column("id", Integer, primary_key=True),
-    Column("name", String(255), nullable=False),
+    Column("id", Integer, primary_key=True, autoincrement=False),  # from the book_ids sequence
+    Column("name", Text, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
 )
 
@@ -110,16 +120,10 @@ book_sheets = Table(
     Column("register", String(20), nullable=False),  # "sales" | "purchases" | "unused"
 )
 
-# The highest upload id ever handed out. SQLite reuses the largest id once that row is deleted, and a
-# corrected re-upload would then get the deleted file's table names, so cached tables, cached answers,
-# books and "already imported" voucher marks would all point at the new file as if it were the old one.
-# The same for set ids ("books"): a new set must not get a deleted set's conversations ("book-<id>").
-id_high_water = Table(
-    "id_high_water",
-    metadata,
-    Column("name", String(50), primary_key=True),
-    Column("value", Integer, nullable=False),
-)
+# Upload and set ids come from sequences, which never hand out a number twice (a deleted upload's id, and so its table
+# names, cached tables, answers and "already imported" marks, can never be reused by a new upload; the same for set ids
+# and their conversations, "book-<id>").
+_SEQUENCES = {"dataset_ids": "datasets", "book_ids": "books"}
 
 # Chat conversations as the app stores them, per scope ("home", "ds-<upload id>" or "book-<set id>"), so every device
 # sees the same history. A deleted conversation stays as a tombstone (deleted, no data), so a device that still has
@@ -129,42 +133,59 @@ chats = Table(
     metadata,
     Column("scope", String(40), primary_key=True),
     Column("chat_id", String(64), primary_key=True),
-    Column("updated", Integer, nullable=False),  # ms since epoch, set by the app on every change
+    Column("updated", BigInteger, nullable=False),  # ms since epoch, set by the app on every change
     Column("deleted", Boolean, nullable=False),
     Column("data", Text),  # the conversation's JSON; NULL for a tombstone
+    Index("ix_chats_scope_live_updated", "scope", "deleted", "updated"),
 )
 
 
 # Audit trail guarantees enforced by the database itself (Companies (Accounts) Rules, Rule 3(1)):
 # the log can only grow, and vouchers can be cancelled but never deleted.
-_TRIGGERS = [
-    "CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log "
-    "BEGIN SELECT RAISE(ABORT, 'The audit log cannot be changed.'); END",
-    "CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log "
-    "BEGIN SELECT RAISE(ABORT, 'The audit log cannot be deleted.'); END",
-    "CREATE TRIGGER IF NOT EXISTS vouchers_no_delete BEFORE DELETE ON vouchers "
-    "BEGIN SELECT RAISE(ABORT, 'Vouchers cannot be deleted; cancel them instead.'); END",
+_FORBID_FUNCTION = ("CREATE OR REPLACE FUNCTION books_forbid() RETURNS trigger LANGUAGE plpgsql AS "
+                    "$$ BEGIN RAISE EXCEPTION '%%', TG_ARGV[0] USING ERRCODE = 'integrity_constraint_violation'; END $$")  # %% : the driver's escape
+_TRIGGERS = [  # (table, trigger name, event, message)
+    ("audit_log", "audit_log_no_update", "UPDATE", "The audit log cannot be changed."),
+    ("audit_log", "audit_log_no_delete", "DELETE", "The audit log cannot be deleted."),
+    ("vouchers", "vouchers_no_delete", "DELETE", "Vouchers cannot be deleted; cancel them instead."),
 ]
 
 
 def storage_problem() -> str | None:
-    """Why this process cannot save, or None. A data folder or database file it may not write (typically made by a
-    command run with sudo) makes SQLite fail every save with "attempt to write a readonly database"."""
-    files = [config.DB_PATH.with_name(config.DB_PATH.name + suffix) for suffix in ("", "-wal", "-shm", "-journal")]
-    for path in (config.DATA_DIR, *files):
-        if path.exists() and not os.access(path, os.W_OK):
-            try:
-                user = getpass.getuser()
-            except Exception:  # noqa: BLE001 - no user name in the environment
-                user = "the backend's user"
-            return (f"The server cannot save: {path} is read-only for the user running the backend ({user}). "
-                    f"On the server run: sudo chown -R {user} {config.DATA_DIR}  and restart the backend.")
+    """Why this process cannot read or save, or None: no DATABASE_URL, a transaction-mode pooler address, or a database
+    that cannot be reached or written. The message names only the host, never the address or password."""
+    if not config.DATABASE_URL:
+        return ("The backend has no database: set DATABASE_URL in backend/.env to the Supabase database's connection "
+                "string (Supabase > Connect > Session pooler, port 5432) and restart the backend.")
+    host = config.database_host()
+    if host.endswith(":6543"):
+        return (f"DATABASE_URL points at Supabase's transaction pooler ({host}). Use the Session pooler address "
+                "(port 5432) instead: the app keeps its schema setting per connection.")
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SET LOCAL statement_timeout = 5000")
+            if conn.exec_driver_sql("SELECT current_setting('transaction_read_only')").scalar() == "on":
+                return f"The database at {host} is read-only for the backend's user; it cannot save."
+    except DBAPIError as exc:
+        reason = _safe_reason(exc)
+        return f"The backend cannot reach its database at {host}: {reason}"
     return None
 
 
-# Columns of this version that the database file lacks, by table: none once init_db has added them. A database that
-# cannot be written keeps them (main.lifespan still starts, so the books can be read); whole rows are read through
-# columns_of, which reads NULL in their place.
+def _safe_reason(exc: DBAPIError) -> str:
+    """A database error's first line without the connection address or password."""
+    message = str(getattr(exc, "orig", exc)).strip().splitlines()[0] if str(getattr(exc, "orig", exc)).strip() else type(exc).__name__
+    if config.DATABASE_URL:
+        authority = config.DATABASE_URL.partition("://")[2].partition("/")[0]
+        password = authority.rpartition("@")[0].partition(":")[2]
+        for secret in (config.DATABASE_URL, authority, password):
+            if secret and len(secret) >= 4:
+                message = message.replace(secret, "***")
+    return re.sub(r"(postgres(?:ql)?(?:\+\w+)?://)[^\s/]*@", r"\1***@", message)[:300]
+
+
+# Columns of this version that the database lacks, by table: always empty on Postgres (init_db adds them); kept so
+# callers can keep reading whole rows through columns_of.
 missing_columns: dict[str, set[str]] = {}
 
 
@@ -176,39 +197,55 @@ def columns_of(table: Table) -> dict:
 
 def _add_new_columns(conn) -> None:
     """create_all makes missing tables but never changes existing ones: add the nullable columns that a table made by an
-    older version lacks (its rows get NULL). Nothing to do once they are there, so it runs at every start. They are noted
-    in missing_columns first, and stay there if the database cannot be written."""
-    missing_columns.clear()
-    new: dict[Table, list[Column]] = {}
-    for table in metadata.sorted_tables:  # every table first: the first ALTER fails on a database that cannot be written
-        have = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({quote_ident(table.name)})")}
-        lacking = [c for c in table.columns if have and c.name not in have and c.nullable and not c.primary_key]
-        if lacking:
-            missing_columns[table.name] = {c.name for c in lacking}
-            new[table] = lacking
-    for table, columns in new.items():
-        for column in columns:
-            conn.exec_driver_sql(f"ALTER TABLE {quote_ident(table.name)} ADD COLUMN {quote_ident(column.name)} "
-                                 f"{column.type.compile(dialect=conn.dialect)}")
+    older version lacks (its rows get NULL). Nothing to do once they are there."""
+    have: dict[str, set[str]] = {}
+    for name, column in conn.execute(text(
+            "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = :schema"),
+            {"schema": config.DATABASE_SCHEMA}):
+        have.setdefault(name, set()).add(column)
+    for table in metadata.sorted_tables:
+        if table.name not in have:
+            continue  # create_all makes it whole
+        for column in table.columns:
+            if column.name not in have[table.name] and column.nullable and not column.primary_key:
+                conn.exec_driver_sql(f"ALTER TABLE {quote_ident(table.name)} ADD COLUMN IF NOT EXISTS "
+                                     f"{quote_ident(column.name)} {column.type.compile(dialect=conn.dialect)}")
+
+
+def app_tables(conn) -> set[str]:
+    """Every table in the app's schema (registry, books and the uploads' sheet tables)."""
+    return set(conn.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema = :schema"),
+                            {"schema": config.DATABASE_SCHEMA}).scalars())
 
 
 def init_db() -> None:
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    # Columns first: a database that cannot be written has its missing ones noted before anything fails (a table this
-    # version adds cannot be made either; reading one finds it missing).
+    """Make the schema, tables, columns, sequences and audit triggers this version needs. One transaction under an
+    advisory lock, so two backends starting together do not race (Postgres DDL is transactional)."""
     with engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('accountsai-init'))"))
+        conn.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(config.DATABASE_SCHEMA)}")
+        conn.exec_driver_sql(f"SET LOCAL search_path TO {quote_ident(config.DATABASE_SCHEMA)}, public")
         _add_new_columns(conn)
-    metadata.create_all(engine)
-    with engine.begin() as conn:
-        tables = set(conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").scalars())
-        for trigger in _TRIGGERS:
-            if trigger.split(" ON ")[1].split()[0] in tables:
-                conn.exec_driver_sql(trigger)
-        if conn.execute(select(id_high_water.c.value).where(id_high_water.c.name == "datasets")).first() is None:
-            conn.execute(insert(id_high_water).values(name="datasets", value=_highest_dataset_id(conn)))
-        if conn.execute(select(id_high_water.c.value).where(id_high_water.c.name == "books")).first() is None:
-            conn.execute(insert(id_high_water).values(name="books", value=_highest_book_id(conn)))
-    missing_columns.clear()
+        metadata.create_all(conn)
+        tables = app_tables(conn)
+        conn.exec_driver_sql(_FORBID_FUNCTION)
+        for table, name, action, message in _TRIGGERS:
+            if table in tables:
+                conn.exec_driver_sql(
+                    f"CREATE OR REPLACE TRIGGER {name} BEFORE {action} ON {quote_ident(table)} FOR EACH ROW "
+                    f"EXECUTE FUNCTION books_forbid('{message}')")
+        for sequence, table in _SEQUENCES.items():
+            conn.exec_driver_sql(f"CREATE SEQUENCE IF NOT EXISTS {sequence}")
+            highest = _highest_dataset_id(conn, tables) if table == "datasets" else _highest_book_id(conn)
+            _raise_sequence(conn, sequence, highest)
+
+
+def _raise_sequence(conn, sequence: str, highest: int) -> None:
+    """Make the sequence's next number larger than ``highest`` (an id in use or still referred to)."""
+    last, called = conn.exec_driver_sql(f"SELECT last_value, is_called FROM {sequence}").one()
+    used = last if called else last - 1
+    if highest > used:
+        conn.execute(text("SELECT setval(:sequence, :value, true)"), {"sequence": sequence, "value": highest})
 
 
 # Places that still name an upload's tables (ds<id>_...) after the upload itself is deleted.
@@ -216,15 +253,15 @@ _TABLE_REFERENCES = [("dataset_sheets", "table_name"), ("book_sheets", "table_na
                      ("register_imports", "table_name")]
 
 
-def _highest_dataset_id(conn) -> int:
-    """The largest upload id in use or still referred to; databases made before id_high_water start from it."""
-    tables = set(conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").scalars())
+def _highest_dataset_id(conn, tables: set[str] | None = None) -> int:
+    """The largest upload id in use or still referred to (by a sheet table's name, a set, a voucher's source...)."""
+    tables = app_tables(conn) if tables is None else tables
     highest = conn.exec_driver_sql("SELECT COALESCE(MAX(id), 0) FROM datasets").scalar()
     names = [t for t in tables if t.startswith("ds")]
     for table, column in _TABLE_REFERENCES:
         if table in tables:
             names += conn.exec_driver_sql(
-                f"SELECT DISTINCT {quote_ident(column)} FROM {quote_ident(table)} WHERE {quote_ident(column)} LIKE '%ds%'"
+                f"SELECT DISTINCT {quote_ident(column)} FROM {quote_ident(table)} WHERE {quote_ident(column)} LIKE '%%ds%%'"
             ).scalars()
     for name in names:
         found = re.match(r"(?:\w+:)?ds(\d+)_", name or "")
@@ -233,51 +270,36 @@ def _highest_dataset_id(conn) -> int:
     return highest
 
 
-def _next_dataset_id(conn) -> int:
-    """A new upload id, never one used before (call inside the upload's transaction)."""
-    # Also above any id already in the table, should an older copy of the app have added uploads.
-    row = conn.exec_driver_sql(
-        "UPDATE id_high_water SET value = max(value, (SELECT COALESCE(MAX(id), 0) FROM datasets)) + 1 "
-        "WHERE name = 'datasets' RETURNING value"
-    ).first()
-    if row is not None:
-        return row[0]
-    value = _highest_dataset_id(conn) + 1
-    conn.execute(insert(id_high_water).values(name="datasets", value=value))
-    return value
-
-
 def _highest_book_id(conn) -> int:
-    """The largest set id in use or named by a conversation ("book-<id>"); databases made before sets were tracked in
-    id_high_water start from it."""
+    """The largest set id in use or named by a conversation ("book-<id>")."""
     scopes = conn.execute(select(chats.c.scope).where(chats.c.scope.like("book-%")).distinct()).scalars()
     highest = conn.exec_driver_sql("SELECT COALESCE(MAX(id), 0) FROM books").scalar()
     return max([highest, *(int(scope[5:]) for scope in scopes if scope[5:].isdigit())])
 
 
+def _next_dataset_id(conn) -> int:
+    """A new upload id, never one used before (no lock: a sequence)."""
+    return int(conn.exec_driver_sql("SELECT nextval('dataset_ids')").scalar())
+
+
 def _next_book_id(conn) -> int:
-    """A new set id, never one used before (call inside the transaction that adds the set)."""
-    row = conn.exec_driver_sql(
-        "UPDATE id_high_water SET value = max(value, (SELECT COALESCE(MAX(id), 0) FROM books)) + 1 "
-        "WHERE name = 'books' RETURNING value"
-    ).first()
-    if row is not None:
-        return row[0]
-    value = _highest_book_id(conn) + 1
-    conn.execute(insert(id_high_water).values(name="books", value=value))
-    return value
+    """A new set id, never one used before."""
+    return int(conn.exec_driver_sql("SELECT nextval('book_ids')").scalar())
 
 
 def quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def _slug(text: str) -> str:
-    return re.sub(r"[^0-9a-z]+", "_", text.lower()).strip("_")[:40] or "sheet"
+def _slug(text_: str) -> str:
+    return re.sub(r"[^0-9a-z]+", "_", text_.lower()).strip("_")[:40] or "sheet"
+
+
+ROWID = "_rowid"  # each sheet table's row number: 1, 2, 3... in the sheet's order (editing.ROWID is the same name)
 
 
 def _frame_for_sql(frame: pd.DataFrame) -> pd.DataFrame:
-    """Store dates as ISO text so SQLite's date functions work on them."""
+    """Store dates as ISO text (as before: the app reads them back by the profile's column kinds)."""
     out = frame.copy()
     for col in out.columns:
         if pd.api.types.is_datetime64_any_dtype(out[col]):
@@ -285,6 +307,48 @@ def _frame_for_sql(frame: pd.DataFrame) -> pd.DataFrame:
             date_only = bool(((values.dt.normalize() == values) | values.isna()).all())
             out[col] = values.dt.strftime("%Y-%m-%d" if date_only else "%Y-%m-%d %H:%M:%S")
     return out
+
+
+def _sheet_column_type(series: pd.Series):
+    """The SQL type of a sheet column: whole numbers as BIGINT, other numbers as DOUBLE PRECISION, true/false as
+    BOOLEAN, everything else (text, and dates as ISO text) as TEXT."""
+    if pd.api.types.is_bool_dtype(series):
+        return Boolean
+    if pd.api.types.is_integer_dtype(series):
+        return BigInteger
+    if pd.api.types.is_numeric_dtype(series):
+        return Float(53)
+    return Text
+
+
+def _cell(value):
+    """A frame value as the database driver takes it: NaN / NaT / pd.NA -> NULL, numpy numbers -> Python."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):  # a list or other non-scalar: kept as it is
+        return value
+    return value.item() if hasattr(value, "item") else value
+
+
+def create_sheet_table(conn, table_name: str, frame: pd.DataFrame) -> None:
+    """Make the sheet's table (an explicit "_rowid" identity column, then the sheet's columns) and load its rows in
+    order with COPY, so "_rowid" is 1..n as SQLite's rowid was."""
+    sql_frame = _frame_for_sql(frame)
+    table = Table(table_name, MetaData(),
+                  Column(ROWID, BigInteger, Identity(always=False, start=1), primary_key=True),
+                  *(Column(str(name), _sheet_column_type(sql_frame[name])) for name in sql_frame.columns))
+    table.create(conn)
+    if sql_frame.empty:
+        return
+    columns = ", ".join(quote_ident(str(c)) for c in sql_frame.columns)
+    raw = conn.connection.driver_connection  # psycopg: the same transaction as conn
+    with raw.cursor() as cur:
+        with cur.copy(f"COPY {quote_ident(table_name)} ({columns}) FROM STDIN") as copy:
+            for row in sql_frame.itertuples(index=False, name=None):
+                copy.write_row([_cell(v) for v in row])
 
 
 def save_dataset(filename: str, size_bytes: int, sheets: list[tuple[str, pd.DataFrame, dict]],
@@ -310,7 +374,7 @@ def save_dataset(filename: str, size_bytes: int, sheets: list[tuple[str, pd.Data
                 table_name, n = f"{base}_{n}", n + 1
             used.add(table_name)
 
-            _frame_for_sql(frame).to_sql(table_name, conn, index=False, if_exists="fail", chunksize=1000)
+            create_sheet_table(conn, table_name, frame)
             conn.execute(
                 insert(dataset_sheets).values(
                     dataset_id=dataset_id,
@@ -325,7 +389,7 @@ def save_dataset(filename: str, size_bytes: int, sheets: list[tuple[str, pd.Data
 
 
 def _with_utc(row) -> dict:
-    """SQLite drops the timezone; uploaded_at is always stored in UTC."""
+    """uploaded_at is always UTC (naive values from older stores are taken as UTC)."""
     data = dict(row)
     if data["uploaded_at"].tzinfo is None:
         data["uploaded_at"] = data["uploaded_at"].replace(tzinfo=timezone.utc)
@@ -383,8 +447,8 @@ def create_book(name: str, registers: list[tuple[str, str]]) -> int:
     with engine.begin() as conn:
         book_id = _next_book_id(conn)
         conn.execute(insert(books).values(id=book_id, name=name, created_at=datetime.now(timezone.utc)))
-        for table_name, register in registers:
-            conn.execute(insert(book_sheets).values(book_id=book_id, table_name=table_name, register=register))
+        if registers:
+            conn.execute(insert(book_sheets), [{"book_id": book_id, "table_name": t, "register": r} for t, r in registers])
     return book_id
 
 
@@ -463,23 +527,27 @@ def _with_time(row) -> dict:
 
 
 def delete_dataset(dataset_id: int) -> bool:
-    dataset = get_dataset(dataset_id)
-    if dataset is None:
-        return False
     with engine.begin() as conn:
-        for sheet in dataset["sheets"]:
-            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {quote_ident(sheet['table_name'])}")
+        # Read the sheets under the upload's row lock, so a delete racing another request sees one state.
+        if conn.execute(select(datasets.c.id).where(datasets.c.id == dataset_id).with_for_update()).first() is None:
+            return False
+        names = conn.execute(select(dataset_sheets.c.table_name).where(dataset_sheets.c.dataset_id == dataset_id)).scalars().all()
+        for name in names:
+            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {quote_ident(name)}")
         conn.execute(delete(dataset_sheets).where(dataset_sheets.c.dataset_id == dataset_id))
         conn.execute(delete(datasets).where(datasets.c.id == dataset_id))
     from .duck import forget  # duck imports this module
 
-    forget(sheet["table_name"] for sheet in dataset["sheets"])  # its prepared tables free their memory now
+    forget(names)  # its prepared tables free their memory now
     return True
 
 
 def read_preview(table_name: str, limit: int) -> pd.DataFrame:
+    """The sheet's first ``limit`` rows in sheet order, without the row-number column."""
     with engine.connect() as conn:
-        return pd.read_sql_query(f"SELECT * FROM {quote_ident(table_name)} LIMIT {int(limit)}", conn)
+        frame = pd.read_sql_query(
+            f"SELECT * FROM {quote_ident(table_name)} ORDER BY {quote_ident(ROWID)} LIMIT {int(limit)}", conn)
+    return frame.drop(columns=[ROWID], errors="ignore")
 
 
 # --- Chat history ------------------------------------------------------------------------
@@ -488,6 +556,11 @@ def read_preview(table_name: str, limit: int) -> pd.DataFrame:
 # At most this many deletions (the newest) go out with a scope's list, so the list stays bounded. All of them stay
 # stored: a device still holding an older one is answered with its deletion when it sends that conversation.
 MAX_TOMBSTONES = 500
+
+
+def _lock_scope(conn, scope: str) -> None:
+    """Saves, trims and deletes of one scope take turns (Postgres lets writers run side by side; SQLite did not)."""
+    conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": f"chats:{scope}"})
 
 
 def chat_scope_exists(scope: str) -> bool:
@@ -504,8 +577,8 @@ def list_chats(scope: str, limit: int | None = None) -> tuple[list[dict], list[d
     """The scope's conversations (the ``limit`` newest, newest first) and its newest tombstones ({"id", "updated"})."""
     live = (chats.c.scope == scope) & ~chats.c.deleted
     with engine.connect() as conn:
-        kept = conn.execute(select(chats.c.data).where(live).order_by(chats.c.updated.desc(), chats.c.chat_id)
-                            .limit(limit)).scalars().all()
+        kept = conn.execute(select(chats.c.data).where(live)
+                            .order_by(chats.c.updated.desc(), chats.c.chat_id.collate("C")).limit(limit)).scalars().all()
         gone = conn.execute(select(chats.c.chat_id, chats.c.updated).where((chats.c.scope == scope) & chats.c.deleted)
                             .order_by(chats.c.updated.desc()).limit(MAX_TOMBSTONES)).all()
     return [json.loads(data) for data in kept], [{"id": chat_id, "updated": updated} for chat_id, updated in gone]
@@ -515,8 +588,9 @@ def trim_chats(scope: str, keep: int) -> list[tuple[str, int | float]]:
     """Turn every conversation of the scope but the ``keep`` newest into a tombstone at its own time (a device that
     still has that copy drops it; a later edit revives it). Returns their (id, updated)."""
     live = (chats.c.scope == scope) & ~chats.c.deleted
-    newest = select(chats.c.chat_id).where(live).order_by(chats.c.updated.desc(), chats.c.chat_id).limit(keep)
-    with engine.begin() as conn:  # one statement: a conversation saved meanwhile is never the one dropped
+    newest = select(chats.c.chat_id).where(live).order_by(chats.c.updated.desc(), chats.c.chat_id.collate("C")).limit(keep)
+    with engine.begin() as conn:  # under the scope's lock: a conversation saved meanwhile is never the one dropped
+        _lock_scope(conn, scope)
         return [tuple(row) for row in conn.execute(update(chats).where(live & chats.c.chat_id.not_in(newest))
                                                    .values(deleted=True, data=None)
                                                    .returning(chats.c.chat_id, chats.c.updated))]
@@ -527,8 +601,9 @@ def delete_scope_chats(scope: str) -> list[str]:
     own time, should a device's clock be ahead), so a device that still has it drops it. Returns their ids."""
     now = int(time.time() * 1000)
     with engine.begin() as conn:
+        _lock_scope(conn, scope)
         return conn.execute(update(chats).where((chats.c.scope == scope) & ~chats.c.deleted)
-                            .values(deleted=True, data=None, updated=func.max(chats.c.updated, now))
+                            .values(deleted=True, data=None, updated=func.greatest(chats.c.updated, now))
                             .returning(chats.c.chat_id)).scalars().all()
 
 
@@ -540,26 +615,34 @@ def _kept_chat(row) -> dict:
 
 def _keep_newer(scope: str, chat_id: str, values: dict, wins) -> dict:
     """Store ``values`` only where ``wins`` (a comparison of the new row with the stored one) holds, and return what is
-    kept. One statement decides and writes, so two devices saving at the same moment cannot lose the newer copy."""
+    kept. One statement decides and writes, under the scope's lock, so two devices saving at the same moment cannot
+    lose the newer copy; the conflicting row stays locked to the end of the transaction, so the row read back is the
+    one kept."""
     statement = upsert(chats).values(scope=scope, chat_id=chat_id, **values)
     statement = statement.on_conflict_do_update(
         index_elements=[chats.c.scope, chats.c.chat_id], set_=values, where=wins(statement.excluded))
     with engine.begin() as conn:
-        conn.execute(statement)  # the transaction now holds the write lock, so the row read back is the one kept
+        _lock_scope(conn, scope)
+        conn.execute(statement)
         row = conn.execute(select(chats).where((chats.c.scope == scope) & (chats.c.chat_id == chat_id))).mappings().one()
     return _kept_chat(row)
+
+
+def _ms(updated: int | float) -> int:
+    """A chat time as whole milliseconds (the column is BIGINT; a fraction is rounded up, so "newer" never flips)."""
+    return int(math.ceil(updated))
 
 
 def save_chat(scope: str, chat_id: str, updated: int | float, data: str) -> dict:
     """Keep the conversation (JSON ``data``) unless the stored copy or tombstone is as new or newer. Returns
     {"chat": the conversation kept, "deleted": None}, or {"chat": None, "deleted": {"id", "updated"}}."""
-    return _keep_newer(scope, chat_id, {"updated": updated, "deleted": False, "data": data},
+    return _keep_newer(scope, chat_id, {"updated": _ms(updated), "deleted": False, "data": data},
                        lambda new: new.updated > chats.c.updated)
 
 
 def delete_chat(scope: str, chat_id: str, updated: int | float) -> dict:
     """Leave a tombstone at ``updated`` unless the stored conversation is newer."""
-    return _keep_newer(scope, chat_id, {"updated": updated, "deleted": True, "data": None},
+    return _keep_newer(scope, chat_id, {"updated": _ms(updated), "deleted": True, "data": None},
                        lambda new: new.updated >= chats.c.updated)
 
 
@@ -587,64 +670,50 @@ class QueryResult:
         }
 
 
-_ALLOWED_ACTIONS = {
-    sqlite3.SQLITE_SELECT,
-    sqlite3.SQLITE_READ,
-    sqlite3.SQLITE_FUNCTION,
-    getattr(sqlite3, "SQLITE_RECURSIVE", 33),
-}
-
-
-def _authorizer(allowed_tables: set[str]):
-    allowed = {t.lower() for t in allowed_tables}
-
-    def check(action, arg1, _arg2, _db_name, _trigger):
-        if action == sqlite3.SQLITE_READ:
-            return sqlite3.SQLITE_OK if (arg1 or "").lower() in allowed else sqlite3.SQLITE_DENY
-        return sqlite3.SQLITE_OK if action in _ALLOWED_ACTIONS else sqlite3.SQLITE_DENY
-
-    return check
-
-
 def _json_value(value):
     if isinstance(value, float):
         # Drop binary noise such as 342357.66000000003 so sums read exactly as the books do.
         return round(value, 8) if math.isfinite(value) else None
     if isinstance(value, bytes):
         return value.hex()
+    if hasattr(value, "is_finite") and hasattr(value, "as_tuple"):  # Decimal
+        return float(value) if value.is_finite() else None
     return value
 
 
+_TABLE_NAME = re.compile(r'"((?:[^"]|"")+)"|\b(ds\d+_\w+)\b', re.IGNORECASE)
+
+
 def run_select(sql: str, allowed_tables: set[str], limit: int = config.SQL_RESULT_LIMIT) -> QueryResult:
-    """Run one SELECT statement that may only read ``allowed_tables``."""
+    """Run one SELECT the app built itself over ``allowed_tables`` (people's and the AI's queries run in DuckDB over
+    copies: duck.Session). A read-only transaction with a time limit; any sheet table it names must be allowed."""
     statement = sql.strip().rstrip(";").strip()
     if not statement:
         raise QueryError("The query is empty.")
+    if ";" in statement:
+        raise QueryError("Only one SELECT statement is allowed.")
+    allowed = {t.lower() for t in allowed_tables}
+    for quoted, bare in _TABLE_NAME.findall(statement):
+        name = (quoted.replace('""', '"') or bare).lower()
+        if name.startswith("ds") and re.match(r"ds\d+_", name) and name not in allowed:
+            raise QueryError(f"Only this upload's tables can be queried ({name}).")
 
     started = time.monotonic()
-    deadline = started + config.SQL_TIMEOUT_SECONDS
-    with readonly_engine.connect() as conn:
-        raw = conn.connection.driver_connection
-        raw.set_authorizer(_authorizer(allowed_tables))
-        raw.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
-        try:
-            result = conn.exec_driver_sql(statement)
-            if not result.returns_rows:
-                raise QueryError("Only SELECT queries are allowed.")
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SET TRANSACTION READ ONLY")
+            conn.exec_driver_sql(f"SET LOCAL statement_timeout = {int(config.SQL_TIMEOUT_SECONDS * 1000)}")
+            result = conn.exec_driver_sql(f"SELECT * FROM ({statement}) AS q LIMIT {int(limit) + 1}")
             columns = list(result.keys())
-            fetched = result.fetchmany(limit + 1)
-        except DBAPIError as exc:
-            message = str(exc.orig)
-            if "not authorized" in message:
-                message = "Only SELECT queries on this upload's tables are allowed."
-            elif "prohibited" in message:
-                message = f"Only this upload's tables can be queried ({message})."
-            elif "interrupted" in message:
-                message = f"The query took longer than {config.SQL_TIMEOUT_SECONDS} seconds and was stopped."
-            raise QueryError(message) from exc
-        finally:
-            raw.set_authorizer(None)
-            raw.set_progress_handler(None, 0)
+            fetched = result.fetchall()
+            conn.rollback()
+    except DBAPIError as exc:
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if sqlstate == "57014":
+            raise QueryError(f"The query took longer than {config.SQL_TIMEOUT_SECONDS} seconds and was stopped.") from exc
+        if sqlstate == "25006":
+            raise QueryError("Only SELECT queries are allowed.") from exc
+        raise QueryError(_safe_reason(exc)) from exc
 
     return QueryResult(
         columns=columns,
@@ -652,3 +721,7 @@ def run_select(sql: str, allowed_tables: set[str], limit: int = config.SQL_RESUL
         truncated=len(fetched) > limit,
         elapsed_ms=round((time.monotonic() - started) * 1000, 1),
     )
+
+
+__all__ = ["ROWID", "QueryError", "QueryResult", "app_tables", "columns_of", "create_sheet_table", "engine", "init_db",
+           "inspect", "metadata", "quote_ident", "run_select", "storage_problem", "upsert"]

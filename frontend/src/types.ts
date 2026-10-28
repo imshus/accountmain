@@ -1,6 +1,6 @@
 // Shapes returned by the FastAPI backend (see backend/app/schemas.py and analytics.py).
 
-export type ProviderId = "openai" | "anthropic";
+export type ProviderId = "openai";
 
 export type ProviderStatus = {
   id: ProviderId;
@@ -338,6 +338,12 @@ export type VoucherRow = {
   items?: string[];
   /** The bill's total net weight in milligrams; null when no line has a weight (absent from older servers). */
   net_mg?: number | null;
+  /** The bill's diamonds in thousandths of a carat, item lines, purity codes and tunch (hundredths of a %): the card's
+   * summary (absent from older servers). */
+  dia_mct?: number | null;
+  item_count?: number;
+  purities?: string[];
+  tunch_bps?: number[];
 };
 
 export type MetalLineDetail = {
@@ -356,6 +362,14 @@ export type MetalLineDetail = {
   stn_mct: number | null;
   pieces: number | null;
   tag_no: string | null;
+  /** What the item was billed at, in paise, and its hallmark and diamond grading (absent from older servers and bills). */
+  labour_paise?: number | null;
+  dia_paise?: number | null;
+  stn_paise?: number | null;
+  metal_paise?: number | null;
+  huid?: string | null;
+  colour?: string | null;
+  clarity?: string | null;
 };
 
 export type VoucherDetail = Omit<VoucherRow, "amount" | "ledgers" | "fine_mg" | "items" | "net_mg"> & {

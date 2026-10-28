@@ -1,6 +1,9 @@
-"""Tables for the double-entry books. Money is stored as whole paise (INTEGER), never floats."""
+"""Tables for the double-entry books. Money is stored as whole paise, never floats.
 
-from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint
+Amounts, weights and counts are BIGINT: Postgres INTEGER stops at 2,147,483,647, which is only Rs 2.14 crore in paise
+or 2,147 kg in milligrams (SQLite's INTEGER was 64-bit, so a bullion bill or a capital opening fitted)."""
+
+from sqlalchemy import BigInteger, Boolean, Column, Date, DateTime, ForeignKey, Integer, String, Table, Text, UniqueConstraint
 
 from ..database import metadata
 
@@ -23,7 +26,7 @@ ledgers = Table(
     Column("company_id", Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True),
     Column("name", String(200), nullable=False),
     Column("group_name", String(60), nullable=False),
-    Column("opening_paise", Integer, nullable=False, default=0),  # + = Dr, - = Cr, as at fy_start
+    Column("opening_paise", BigInteger, nullable=False, default=0),  # + = Dr, - = Cr, as at fy_start
     Column("tax_kind", String(20)),  # output_cgst, input_igst, tds_payable... for GST/TDS reports
     Column("gstin", String(15)),
     Column("state_code", String(2)),
@@ -49,7 +52,7 @@ vouchers = Table(
     # What an imported register row sold or bought, for the voucher list when no metal line describes the items:
     # item names (one per line) and net weight in mg. NULL elsewhere (added to older databases by database.init_db).
     Column("items_text", Text),
-    Column("net_mg", Integer),
+    Column("net_mg", BigInteger),
 )
 
 voucher_lines = Table(
@@ -59,8 +62,8 @@ voucher_lines = Table(
     Column("voucher_id", Integer, ForeignKey("vouchers.id", ondelete="CASCADE"), nullable=False, index=True),
     Column("position", Integer, nullable=False),
     Column("ledger_id", Integer, ForeignKey("ledgers.id"), nullable=False, index=True),
-    Column("dr_paise", Integer, nullable=False, default=0),
-    Column("cr_paise", Integer, nullable=False, default=0),
+    Column("dr_paise", BigInteger, nullable=False, default=0),
+    Column("cr_paise", BigInteger, nullable=False, default=0),
 )
 
 # Bill-wise details on party lines (Tally: New Ref / Agst Ref / Advance / On Account).
@@ -72,7 +75,7 @@ bill_allocations = Table(
     Column("ledger_id", Integer, ForeignKey("ledgers.id"), nullable=False, index=True),
     Column("kind", String(12), nullable=False),  # new | against | advance | on_account
     Column("bill_ref", String(60)),
-    Column("amount_paise", Integer, nullable=False),  # + = Dr, - = Cr
+    Column("amount_paise", BigInteger, nullable=False),  # + = Dr, - = Cr
     Column("bill_date", Date),
     Column("due_date", Date),
 )
@@ -86,9 +89,9 @@ bank_lines = Table(
     Column("date", Date, nullable=False),
     Column("narration", Text),
     Column("reference", String(80)),
-    Column("withdrawal_paise", Integer, nullable=False, default=0),
-    Column("deposit_paise", Integer, nullable=False, default=0),
-    Column("balance_paise", Integer),
+    Column("withdrawal_paise", BigInteger, nullable=False, default=0),
+    Column("deposit_paise", BigInteger, nullable=False, default=0),
+    Column("balance_paise", BigInteger),
     Column("source", String(120)),
     Column("matched_line_id", Integer, ForeignKey("voucher_lines.id", ondelete="SET NULL")),
     Column("match_note", String(120)),
@@ -118,18 +121,27 @@ metal_lines = Table(
     Column("position", Integer, nullable=False),
     Column("ledger_id", Integer, ForeignKey("ledgers.id"), nullable=False, index=True),
     Column("metal", String(10), nullable=False),  # gold | silver
-    Column("dr_mg", Integer, nullable=False, default=0),
-    Column("cr_mg", Integer, nullable=False, default=0),
+    Column("dr_mg", BigInteger, nullable=False, default=0),
+    Column("cr_mg", BigInteger, nullable=False, default=0),
     # Item details on stock lines: weights in mg, stones in thousandths of a carat, tunch in hundredths of a percent.
     Column("item", String(120)),
     Column("purity", String(20)),
-    Column("tunch_bp", Integer),
-    Column("gross_mg", Integer),
-    Column("net_mg", Integer),
-    Column("dia_mct", Integer),
-    Column("stn_mct", Integer),
-    Column("pieces", Integer),
+    Column("tunch_bp", BigInteger),
+    Column("gross_mg", BigInteger),
+    Column("net_mg", BigInteger),
+    Column("dia_mct", BigInteger),
+    Column("stn_mct", BigInteger),
+    Column("pieces", BigInteger),
     Column("tag_no", String(40)),
+    # What the item was billed at, in paise (NULL on lines from before 2026-10-27, or when the bill did not say), and the
+    # hallmark and diamond grading when given: the bill's details as the app shows them.
+    Column("labour_paise", BigInteger),
+    Column("dia_paise", BigInteger),
+    Column("stn_paise", BigInteger),
+    Column("metal_paise", BigInteger),
+    Column("huid", String(40)),
+    Column("colour", String(20)),
+    Column("clarity", String(20)),
 )
 
 metal_openings = Table(
@@ -138,7 +150,7 @@ metal_openings = Table(
     Column("id", Integer, primary_key=True),
     Column("ledger_id", Integer, ForeignKey("ledgers.id", ondelete="CASCADE"), nullable=False, index=True),
     Column("metal", String(10), nullable=False),
-    Column("opening_mg", Integer, nullable=False, default=0),  # + = Dr (owes us metal / metal in hand), as at fy_start
+    Column("opening_mg", BigInteger, nullable=False, default=0),  # + = Dr (owes us metal / metal in hand), as at fy_start
     UniqueConstraint("ledger_id", "metal", name="uq_metal_opening"),
 )
 

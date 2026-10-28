@@ -1,11 +1,10 @@
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { purityCode } from "../../books";
 import { readAmount } from "../../components/accounts/shared";
 import type { EntryKind } from "../../router";
-import type { Metal } from "../../types";
-import { AutoValue, Button, Card, Field, FieldRow, Input, Notice, Segmented, Select } from "../../ui";
+import { AutoValue, Button, Card, Field, FieldRow, Input, Notice, Select } from "../../ui";
 import type { AddRequest } from "./AddNameSheet";
-import { GST_DEFAULT, type FieldKey } from "./form";
+import type { FieldKey } from "./form";
 import { grams, gramsText, money } from "./money";
 import { TotalPanel } from "./TotalPanel";
 import type { useEntry } from "./useEntry";
@@ -13,23 +12,16 @@ import type { useEntry } from "./useEntry";
 type Props = { entry: ReturnType<typeof useEntry>; kind: EntryKind; ask: (request: AddRequest) => void };
 
 const OTHER = "__other";
-const METALS: { value: Metal; label: string }[] = [
-  { value: "gold", label: "Gold" },
-  { value: "silver", label: "Silver" },
-];
 
-/** Weights, purity, rates and the live bill: the design's "Weight & rates" card. */
+/** Weights, purity, rates and the live bill: the design's "Weight & rates" card, with only its fields (the metal and how
+ * it is settled keep their defaults: gold, by weight; no stones, no GST). */
 export function WeightCard({ entry, kind, ask }: Props) {
   const { form, set, errors, idOf, figures: f, books, general, saving } = entry;
-  const [editGst, setEditGst] = useState(form.gst !== GST_DEFAULT);
   const sale = kind === "sale";
-  const rs = form.settle === "Rs";
   const tunch = readAmount(form.purity);
   const karat = form.metal === "gold" && Number.isFinite(tunch) ? purityCode(tunch) : "";
   const purities = books.masters.purity.includes(form.purity) || !form.purity ? books.masters.purity : [...books.masters.purity, form.purity];
   const netTyped = form.net !== null;
-  const taxedOn = ["labour", "diamond", ...(f.stone ? ["stones"] : []), ...(rs ? ["metal"] : [])].join(" + ");
-  const split = !f.tax ? undefined : f.interState ? `IGST ${money(f.igst)}` : `CGST ${money(f.cgst)} + SGST ${money(f.sgst)}`;
 
   /** A number box. inputMode decimal brings up the number keyboard on phones. */
   const num = (key: FieldKey & keyof typeof form, label: string, placeholder = "0", extra: { hint?: ReactNode } = {}) => (
@@ -67,13 +59,12 @@ export function WeightCard({ entry, kind, ask }: Props) {
     <Card>
       <div className="entry-head">
         <h2 className="entry-head__title">Weight &amp; rates</h2>
-        <Segmented variant="metal" label="Metal" options={METALS} value={form.metal} onChange={(metal) => set({ metal })} />
       </div>
 
       <FieldRow>
-        {num("gross", "Gross weight (g)", "0.000")}
+        {num("gross", "Gross weight")}
         <Field
-          label="Net weight (g)"
+          label="Net weight"
           htmlFor={idOf("net")}
           error={errors.net}
           hint={
@@ -83,8 +74,8 @@ export function WeightCard({ entry, kind, ask }: Props) {
               </button>
             ) : netTyped && f.grossMg && f.netMg > f.grossMg ? (
               "More than the gross weight"
-            ) : !netTyped && (form.diamondCt || form.stoneCt) ? (
-              "gross − stones × 0.2 g/ct"
+            ) : !netTyped && form.diamondCt ? (
+              "gross − diamond × 0.2 g/ct"
             ) : undefined
           }
         >
@@ -93,7 +84,7 @@ export function WeightCard({ entry, kind, ask }: Props) {
             inputMode="decimal"
             enterKeyHint="next"
             autoComplete="off"
-            placeholder="0.000"
+            placeholder="0"
             className={netTyped ? undefined : "entry-auto-input"}
             value={form.net ?? (f.autoNetMg > 0 ? gramsText(f.autoNetMg) : "")}
             onFocus={(event) => !netTyped && event.target.select()}
@@ -111,7 +102,7 @@ export function WeightCard({ entry, kind, ask }: Props) {
           onChange={(event) => (event.target.value === OTHER ? askPurity() : set({ purity: event.target.value }))}
           aria-invalid={Boolean(errors.purity) || undefined}
         >
-          {!form.purity ? <option value="">Choose…</option> : null}
+          {!form.purity ? <option value="">Select</option> : null}
           {purities.map((p) => (
             <option key={p} value={p}>
               {p}%
@@ -125,85 +116,26 @@ export function WeightCard({ entry, kind, ask }: Props) {
         <AutoValue value={grams(f.fineMg)} note="net wt × purity %" tone="gold" />
       </Field>
 
-      <Field label="Settle metal">
-        <Segmented
-          label="Settle the metal"
-          value={form.settle}
-          onChange={(settle) => set({ settle })}
-          options={[
-            { value: "Wt", label: "By weight" },
-            { value: "Rs", label: "In rupees" },
-          ]}
-        />
-      </Field>
-
-      {rs ? (
-        <>
-          {num("metalRate", `${form.metal === "gold" ? "Gold" : "Silver"} rate (₹/g fine)`, "0")}
-          <Field label="Metal value">
-            <AutoValue value={money(f.metalValue)} note="fine wt × rate" />
-          </Field>
-        </>
-      ) : null}
-
       <FieldRow>
-        {num("diamondCt", "Diamond (ct)")}
-        {num("diamondRate", "Diamond rate (₹/ct)")}
+        {num("diamondCt", "Diamond weight")}
+        {num("diamondRate", "Diamond rate")}
       </FieldRow>
-      <FieldRow>
-        {num("stoneCt", "Stone (ct)")}
-        {num("stoneRate", "Stone rate (₹/ct)")}
-      </FieldRow>
-      {num("labourRate", "Labour rate (₹/g)")}
+      {num("labourRate", "Labour rate")}
 
       <Field label="Labour amount">
         <AutoValue value={money(f.labour)} note="net wt × labour rate" />
       </Field>
       <Field label="Diamond amount">
-        <AutoValue value={money(f.diamond)} note="rate × carats" />
-      </Field>
-      {f.stone || form.stoneCt ? (
-        <Field label="Stone amount">
-          <AutoValue value={money(f.stone)} note="rate × carats" />
-        </Field>
-      ) : null}
-
-      <Field
-        label={
-          <span className="entry-labelrow">
-            <span>GST {form.gst.trim() || "0"}%</span>
-            {!editGst ? (
-              <button type="button" className="entry-link" onClick={() => setEditGst(true)}>
-                Change rate
-              </button>
-            ) : null}
-          </span>
-        }
-        error={errors.gst}
-        hint={split}
-      >
-        {editGst ? (
-          <Input
-            id={idOf("gst")}
-            inputMode="decimal"
-            enterKeyHint="next"
-            autoComplete="off"
-            aria-label="GST rate %"
-            value={form.gst}
-            onChange={(event) => set({ gst: event.target.value })}
-            aria-invalid={Boolean(errors.gst) || undefined}
-          />
-        ) : null}
-        <AutoValue value={money(f.tax)} note={`on ${taxedOn}`} />
+        <AutoValue value={money(f.diamond)} note="rate × weight" />
       </Field>
 
-      <TotalPanel figures={f} form={form} sale={sale} />
+      <TotalPanel figures={f} />
 
       {general ? <Notice tone="error">{general}</Notice> : null}
       <Button variant="primary" size="lg" block type="submit" busy={saving}>
         {saving ? "Saving…" : sale ? "Save sale" : "Save purchase"}
       </Button>
-      <p className="entry-note">Posted to the books as a GST invoice · number given if left blank</p>
+      <p className="entry-note">Posted to the books · bill number given if left blank</p>
     </Card>
   );
 }

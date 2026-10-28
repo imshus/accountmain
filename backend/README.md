@@ -1,6 +1,7 @@
 # Accounts.ai backend
 
-The server: reads Excel uploads, keeps the books (SQLite), computes every report, and talks to GPT-6 Luna.
+The server: reads Excel uploads, keeps the books (in a PostgreSQL database, e.g. Supabase), computes every report, and
+talks to GPT-6 Luna. Nothing is stored on the server's disk: the books, uploads and chats are all in the database.
 It runs on its own; the web frontend and the Android app are clients that call its HTTP API (`/api/...`,
 interactive docs at `/docs`).
 
@@ -10,7 +11,7 @@ interactive docs at `/docs`).
 python -m venv .venv
 .venv\Scripts\activate            # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-copy .env.example .env            # macOS/Linux: cp .env.example .env  — then add OPENAI_API_KEY
+copy .env.example .env            # macOS/Linux: cp .env.example .env  — then add DATABASE_URL and OPENAI_API_KEY
 ```
 
 ## Run
@@ -29,10 +30,15 @@ rather than opening a port on your router.
 
 | Variable | Default | |
 | --- | --- | --- |
+| `DATABASE_URL` | — | Required: the database that holds everything. Supabase → Connect → **Session pooler** (port 5432), the URI with the database password; `sslmode=require` is added for you. Back-ups: Supabase → Database → Backups |
+| `DATABASE_PASSWORD` | — | The database password, when it has characters such as `@ : / % # ? +`: leave `[YOUR-PASSWORD]` in `DATABASE_URL` and put the password here as it is |
+| `DATABASE_SCHEMA` | `accountsai` | The schema the app's tables are made in (not `public`, which Supabase's web API exposes) |
 | `OPENAI_API_KEY` | — | Enables GPT-6 Luna in the chat |
-| `ANTHROPIC_API_KEY` | — | Enables Claude as a second chat model |
 | `CORS_ORIGINS` | dev server + Android app | Web pages allowed to call the API; add a hosted frontend's address |
-| `DATA_DIR` | `backend/data` | Where `accounts.db` (all books and uploads) is stored; back this folder up |
 | `MAX_UPLOAD_MB` | `25` | Upload size limit |
 
-See `.env.example` for the model and effort settings.
+See `.env.example` for the model and effort settings, and for the optional Supabase Storage (`SUPABASE_URL`,
+`SUPABASE_SECRET_KEY`) and MongoDB (`MONGODB_URI`, `MONGODB_DB`) copies.
+
+Use a separate database (another Supabase project, or a PostgreSQL on your PC) for development: the database is the
+only copy of the books, so a backend on your PC pointed at the server's `DATABASE_URL` changes the real books.

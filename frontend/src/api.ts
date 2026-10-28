@@ -47,6 +47,12 @@ export function serverUrl(): string {
   return API_URL;
 }
 
+// A free ngrok tunnel answers a browser (the app's WebView included) with its HTML warning page instead of the API
+// unless this header is sent. Only for ngrok, since a custom header makes every request ask CORS first.
+const TUNNEL_HEADERS: Record<string, string> = /^https?:\/\/[^/]+\.ngrok(-free)?\.(app|dev|io)(:\d+)?(\/|$)/i.test(API_URL)
+  ? { "ngrok-skip-browser-warning": "1" }
+  : {};
+
 // Earlier versions kept a typed-in address on the phone; it is no longer read, so drop it.
 try {
   localStorage.removeItem("accountsai.server");
@@ -88,7 +94,7 @@ const CRASHED =
  * CORS headers, which is how a crash on the server (or a web-server error page) looks from the app. */
 async function whyNoAnswer(): Promise<{ up: boolean; message: string }> {
   try {
-    const response = await fetch(`${serverUrl()}/api/health`, { signal: AbortSignal.timeout(5000) });
+    const response = await fetch(`${serverUrl()}/api/health`, { headers: TUNNEL_HEADERS, signal: AbortSignal.timeout(5000) });
     if (response.ok) return { up: true, message: CRASHED };
   } catch {
     // Really out of reach.
@@ -118,7 +124,7 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs: number = 
   const expired = () => Boolean(timeoutMs && !init?.signal && signal?.aborted);
   let response: Response;
   try {
-    response = await fetch(serverUrl() + path, { ...init, signal });
+    response = await fetch(serverUrl() + path, { ...init, headers: { ...TUNNEL_HEADERS, ...(init?.headers as Record<string, string>) }, signal });
   } catch {
     throw new ApiError(0, expired() ? timedOut(init, timeoutMs) : (await whyNoAnswer()).message);
   }
@@ -143,7 +149,7 @@ async function streamChat(path: string, payload: object, onEvent: (event: ChatEv
   try {
     response = await fetch(serverUrl() + path, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+      headers: { ...TUNNEL_HEADERS, "Content-Type": "application/json", Accept: "text/event-stream" },
       body: JSON.stringify({ ...payload, fresh: options.fresh ?? false }),
       signal: options.signal,
     });
@@ -353,6 +359,7 @@ export function uploadFile(file: File, onProgress: (fraction: number) => void, s
       reject(new DOMException("Upload stopped", "AbortError"));
     });
     xhr.open("POST", `${serverUrl()}/api/upload`);
+    for (const [name, value] of Object.entries(TUNNEL_HEADERS)) xhr.setRequestHeader(name, value);
     xhr.responseType = "json";
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) onProgress(event.loaded / event.total);

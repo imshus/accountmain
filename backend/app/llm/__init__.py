@@ -1,4 +1,4 @@
-"""Chat about an upload with GPT-6 Luna or Claude.
+"""Chat about an upload with GPT-6 Luna.
 
 Both models get the same instructions and the same tools: ``analyse`` (totals and
 breakdowns on exact decimals, no SQL), ``run_sql`` (read-only DuckDB, limited to the tables
@@ -20,7 +20,8 @@ from dataclasses import dataclass
 
 from .. import config
 from ..duck import sheet_key
-from . import claude, gpt
+from . import gpt
+from .books_data import unreadable_note
 from .common import (EMPTY_ANSWER, REPAIR_PROMPT, CancelEvent, Cancelled, LLMError, Reply, Toolbox, build_instructions,
                      is_fallback, pending_text, reply_language, strip_context)
 from .verify import indian_digits, known_values, verify
@@ -30,8 +31,6 @@ __all__ = ["CancelEvent", "Cancelled", "LLMError", "chat", "default_provider", "
 _MODEL_LABELS = {
     "gpt-6-luna": "GPT-6 Luna",
     "gpt-6-sol": "GPT-6 Sol",
-    "claude-opus-5-5": "Claude Opus 5.5",
-    "claude-sonnet-5-5": "Claude Sonnet 5.5",
 }
 
 
@@ -55,10 +54,6 @@ class Provider:
 PROVIDERS = {
     "openai": Provider("openai", config.OPENAI_MODEL, "OPENAI_API_KEY", config.openai_configured, gpt.chat,
                        lambda: config.OPENAI_REASONING_EFFORT, lambda: config.OPENAI_REPAIR_EFFORT, True),
-    "anthropic": Provider(
-        "anthropic", config.ANTHROPIC_MODEL, "ANTHROPIC_API_KEY", config.anthropic_configured, claude.chat,
-        lambda: config.ANTHROPIC_EFFORT, lambda: config.ANTHROPIC_REPAIR_EFFORT, False,
-    ),
 }
 
 # Answers to the same conversation on the same data, so asking again is instant. Only checked, complete
@@ -82,11 +77,8 @@ def _answer_key(provider: Provider, messages: list[dict], sheets: list[dict], ex
 
 
 def default_provider() -> str:
-    """The configured LLM_PROVIDER, else whichever provider has a key."""
-    preferred = PROVIDERS.get(config.LLM_PROVIDER, PROVIDERS["openai"])
-    if preferred.configured():
-        return preferred.id
-    return next((p.id for p in PROVIDERS.values() if p.configured()), preferred.id)
+    """The chat model: GPT (OpenAI) is the only one."""
+    return "openai"
 
 
 def provider_status() -> list[dict]:
@@ -98,13 +90,15 @@ def provider_status() -> list[dict]:
 
 def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extra: dict | None = None, emit=None,
          fresh: bool = False, documents: str | None = None, combined: Callable[[], str] | None = None,
-         cancel: threading.Event | None = None, company_id: int | None = None, pending: list[dict] | None = None) -> dict:
+         cancel: threading.Event | None = None, company_id: int | None = None, pending: list[dict] | None = None,
+         bill_company_id: int | None = None) -> dict:
     """Answer the conversation. ``emit`` receives live progress: steps, answer text as it is written,
     and "reset" when a draft is replaced (a correction round). ``combined`` returns the registers comparison
     added to ``documents``; it is called only when the answer is not remembered (it can take seconds).
     With ``company_id`` (an existing company) and sheets, the model may post a sheet to that company's books.
     ``pending``: shared sheets not in that company's books whose register the person has not said; the answer asks,
     and returns them as pending_registers unless it added a sheet to the books.
+    ``bill_company_id``: the company the model may save typed bills to (add_bill), with or without files.
     Once ``cancel`` is set the answer stops with Cancelled and is not kept."""
     send = emit or (lambda _event: None)
 
@@ -133,7 +127,9 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
     # The answer the latest message replies to: if it asked which register, naming both, the person may overrule the detection.
     previous = messages[-2]["content"] if len(messages) > 1 and messages[-2]["role"] == "assistant" else ""
     tools = Toolbox({sheet["table_name"]: sheet for sheet in sheets}, extra, emit=emit, cancel=cancel, company_id=company_id,
-                    request=latest, previous=strip_context(previous))
+                    request=latest, previous=strip_context(previous),
+                    bill_company_id=bill_company_id,
+                    recent="\n".join(m["content"] for m in messages[-6:] if m["role"] == "user"))
 
     def run(conversation: list[dict], effort: str, transcript: list | None = None) -> Reply:
         out = provider.run(conversation, instructions, tools, emit, effort, **({"transcript": transcript} if transcript else {}))
@@ -155,8 +151,9 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
             documents = f"{documents}\n\n{combined()}" if documents else combined()
         # Data ready by the time the model asks for it; started after the documents so it does not slow them down.
         threading.Thread(target=tools.prepare, daemon=True).start()
-        emit({"type": "step", "text": "Reading the question…"})
-        instructions, dictionary = build_instructions(sheets, registers=bool(extra and "registers" in extra), documents=documents)
+        emit({"type": "step", "text": "Reading your entries…"})
+        instructions, dictionary = build_instructions(sheets, registers=bool(extra and "registers" in extra), documents=documents,
+                                                      books=bool(extra and "book_sales" in extra), books_note=unreadable_note(extra))
         language = reply_language(messages)
         if language:  # last, so the long start of the instructions stays the same and is served from the prompt cache
             instructions += f"\n\nThe person's latest message is in {language}: reply in {language}."
@@ -193,7 +190,7 @@ def chat(provider_id: str | None, messages: list[dict], sheets: list[dict], extr
         "analyses": tools.analyses,
         "imports": tools.imports,
         # Still to be added once the person says which register; nothing is pending after an answer that added a sheet.
-        "pending_registers": [] if tools.imports else pending,
+        "pending_registers": [] if any(i.get("table") for i in tools.imports) else pending,
         "verification": {**check, "corrected": corrected},
         "model": reply.model,
         "provider": provider.id,
