@@ -14,7 +14,8 @@ import { HomeIntro } from "./home/HomeIntro";
 import { useChatEngine, type Attachments, type ChatStream } from "./home/useChatEngine";
 import { useFileDrop } from "./home/useFileDrop";
 import { useFollow } from "./home/useFollow";
-import { useSpeech } from "./home/useSpeech";
+import { spokenAnswer } from "./home/useVoiceAgent";
+import { VoiceAgent } from "./home/VoiceAgent";
 import "./home/Home.css";
 
 export type HomeScreenProps = {
@@ -83,24 +84,27 @@ export default function HomeScreen({ chatId, active }: HomeScreenProps) {
   const { active: chat, turns, notice, setNotice } = engine;
   const inChat = turns.length > 0;
 
-  const speech = useSpeech(setText, setNotice);
+  // The mic opens the voice agent: what is said goes through this chat, so it can do whatever the chat can.
+  const [voiceOpen, setVoiceOpen] = useState(false);
+  const askAndWaitRef = useRef(engine.askAndWait);
+  askAndWaitRef.current = engine.askAndWait;
+  const voiceAsk = useCallback(async (request: string) => spokenAnswer(await askAndWaitRef.current(request)), []);
+  const closeVoice = useCallback(() => setVoiceOpen(false), []);
   const dragging = useFileDrop(active, (files) => engine.share(files));
   const follow = useFollow(active && inChat, threadRef, turns, chat?.id ?? null);
 
-  // Hidden behind another screen: stop dictation and close the attach menu.
-  const stopListening = speech.stop;
+  // Hidden behind another screen: end the voice conversation and close the attach menu.
   useEffect(() => {
     if (active) return;
-    stopListening();
+    setVoiceOpen(false);
     setMenuOpen(false);
-  }, [active, stopListening]);
+  }, [active]);
 
   const askRef = useRef(engine.ask);
   askRef.current = engine.ask;
   const onAsk = useCallback((question: string, prompt: string) => void askRef.current(question, prompt), []);
 
   function submit() {
-    if (speech.listening) speech.stop();
     if (engine.ask(text)) setText("");
   }
 
@@ -153,9 +157,8 @@ export default function HomeScreen({ chatId, active }: HomeScreenProps) {
         onSubmit={submit}
         busy={engine.sending}
         onStop={engine.stop}
-        onMic={speech.supported ? () => speech.toggle(text) : undefined}
-        listening={speech.listening}
-        placeholder={speech.listening ? "Listening…" : undefined}
+        onMic={() => setVoiceOpen(true)}
+        listening={voiceOpen}
         menuOpen={menuOpen}
         onMenuToggle={setMenuOpen}
         menu={
@@ -216,6 +219,7 @@ export default function HomeScreen({ chatId, active }: HomeScreenProps) {
             document.body,
           )
         : null}
+      <VoiceAgent open={voiceOpen && active} onClose={closeVoice} ask={voiceAsk} />
     </AppShell>
   );
 }

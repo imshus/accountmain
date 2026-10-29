@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 import threading
-import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -23,7 +22,7 @@ from ..accounts.db import metal_lines as books_metal_lines
 from ..accounts.db import vouchers as books_vouchers
 from ..database import QueryError, engine, get_dataset, quote_ident, read_preview
 from ..duck import Session, prepare_sheet, sheet_frame, sheet_key
-from ..editing import EditError
+from ..editing import EditError, load_frame
 
 ROWS_SHOWN_TO_MODEL = 100
 SAMPLE_ROWS = 3
@@ -81,11 +80,9 @@ How to work:
 - If the data cannot answer the question, say so and say what is missing rather than guessing.
 
 Adding to the books:
-- Call add_to_books only when the person's latest message says a shared file is sales or purchase data or a register, or asks to add, save or post it to the books, in any language ("yeh sales data hai", "this is my purchase register", "ise sales mein daal do", "isko purchase me add karo", "ye sales me update kr do", "isko purchase me entry kardo", "isko books mein daal do", "add this file"), or answers your question which register it is ("purchase", or "haan" to "Lagta hai yeh purchase register hai - sahi hai?"). Earlier messages never call it. Never for a question, whether about the data ("sales data ka total kitna hai?") or about what a file is ("kya yeh sales data hai?"): answer it, and you may offer to add the file. If it is unclear which file or which register, ask. Without the add_to_books tool (no company chosen in the app, or no file shared), say what is missing.
-- The register is the one the person names. If they name none, decide from the file itself: its detection in <documents> (kind, confidence and evidence, such as the file name) and its columns and values in <tables>. A sales or purchase detection with high confidence and no evidence the other way is clear: call add_to_books without a register (the app uses that detection). A medium- or low-confidence, mixed or other detection (bank statement, ledger) is unclear: ask.
-- If the person names one register but <documents> detects the other with high confidence, do not add it yet: say in one line what the file looks like and why, and ask whether to add it as the register they named or as the detected one, naming both. Their answer decides.
-- After it runs, say in the person's language how many entries were added and how many were already in the books, exactly as it returned them, and mention its problems briefly (what went wrong, and how many problems in all), without row numbers. Never invent counts. If you left the register out, first say in one short line which register you chose and why (e.g. the file name, or a Type column of "S").
-- When <documents> lists shared files as "Not in the books yet", the person has not said which register they are: unless this answer adds them, end it with ONE short question in the person's language asking which it is, e.g. "Yeh sales ka data hai ya purchase ka?" (with a likely register listed: "Lagta hai yeh purchase register hai - sahi hai?"); the app shows Sales and Purchase buttons under it. Being listed is never a reason to call add_to_books: only the person's own words are.
+- The app itself reads, in any language, whether the person's latest message asks to add a shared file or a bill they typed to sales or purchases, and adds it: shared files before you answer (listed in <added>), a typed bill through add_bill, which you are given only when they asked. Never ask them to confirm, never ask "sales or purchase?", and never say something was added that <added> or add_bill does not show.
+- For each file in <added>, say in the person's language how many entries were added and how many were already in the books, exactly as given, and its problems briefly (what went wrong, and how many problems in all), without row numbers. Never invent counts. Its notes say when to add one short line: the register the app chose from the file (and why), a file that looks like the other register, the books-start date moved, or bills dated today or put under a customer or supplier because the file had none.
+- When <documents> lists shared files as "Not in the books yet" and nothing was added, end with ONE short line in the person's language offering to add them, e.g. "Isko Sales ya Purchase me add karna ho to neeche button dabayein ya likh dein."; the app shows Sales and Purchase buttons under it.
 
 Follow-up questions:
 - An earlier answer may end with a <context> block listing the tool calls that produced it. A short follow-up ("aur Garg ka?", "overall?", "June me?", "month-wise", "iska GST?", "and for purchases?") continues the latest question: keep its table, measure, filters and period, and change only what the new question changes. Another party or item: swap that filter value, matched to the exact values in <tables>. Drop the party or item filter only when the person asks for everyone ("overall", "sab parties", "sabka", "all items", "baaki sab bhi"); "total", "sab" or "all" on their own keep the current filters and period ("iska total GST?" is still the same party and period). "X-wise": add that grouping. A new period: change only the date filter.
@@ -413,10 +410,15 @@ def build_instructions(sheets: list[dict], registers: bool = False, documents: s
     books_text = "\n".join(part for part in (BOOKS_TABLES_TEXT, books_note) if part) if books else ""
     tables = "\n\n".join(part for part in (describe_tables(sheets), REGISTERS_TABLE_TEXT if registers else "",
                                            books_text) if part)
+    from datetime import date as _date
+
     instructions = f"{SYSTEM_PROMPT}\n\n<tables>\n{tables}\n</tables>"
     if documents:
         instructions += f"\n\n{DOCUMENTS_GUIDE}\n\n<documents>\n{documents}\n</documents>"
         tables += f"\n\n{documents}"
+    # Last, so everything above stays the same from day to day: "aaj ki sale" needs the date, which the model cannot know.
+    today = _date.today()
+    instructions += f"\n\nToday is {today:%A, %d %B %Y} ({today.isoformat()})."
     return instructions, tables
 
 
@@ -432,152 +434,209 @@ FORMULA_PARAMS = {
     "tolerance": "Largest difference still counted as a match, e.g. 0.001 for weights or 1 for rupee amounts.",
 }
 
-BOOKS_TOOL_DESCRIPTION = (
-    "Add one shared sheet to the chosen company's books as its sales or purchase register (the one the person named, or "
-    "the detected one when they named none), exactly as the app's import does: each invoice becomes a voucher. Rows "
-    "already in the books are skipped, so calling it again adds nothing twice. Returns how many entries were added, how "
-    "many were already there, and any problems."
-)
-BOOKS_PARAMS = {
-    "table": "The shared sheet to add, e.g. ds2_sheet1.",
-    "register": "sales for a sales register (invoices to customers), purchases for a purchase register (bills from suppliers), "
-                "as the person said; null when they did not say: the app then uses the register detected for the sheet "
-                "(see <documents>) and refuses an unclear detection.",
-}
 BOOKS_REGISTERS = ("sales", "purchases")
 _PROBLEMS_SHOWN_TO_MODEL = 10
-# A latest message that is a question ("kya yeh sales data hai?", "sales ka total kitna hai") adds nothing to the books,
-# unless it also asks to add. A question ends in "?" or has a question word: at the start in English, anywhere in Hindi.
-_LETTER = _DEVANAGARI.pattern
-_QUESTION = re.compile(
-    r"[?？]\s*$|^\W*(?:what|which|who|whose|why|how|when|where|does|did|can|could|would|should|will|shall"
-    r"|is\s+(?:this|it|that|the|there|my)|are\s+(?:these|they|there|the|my))\b"
-    r"|\b(?:kya|kitn[aei]|kaun(?:sa|si|se)?|kab|kahaa?n|ky(?:on|un|u)|kaise)\b"
-    rf"|(?<!{_LETTER})(?:क्या|कितन[ाीे]|कौन(?:सा|सी|से)?|कब|कहा[ँं]|क्यों|क्यूँ?|कैसे)(?!{_LETTER})", re.IGNORECASE)
-# Asking to add takes an add verb, whole ("add up", "jod" and "जोड़" alone are a total; "Chadha" is a name), and what
-# to add or where: "add this file", "save it to purchases", "post it in the books", "isko sales mein daal do", "ise jod do",
-# "इसे सेल्स में डाल दो".
-_HI_THEN = r"\s+(?:do|de|dena|dein|dijiye|dijie|diya|du|dun|doon|sakte|sakti|sakta)"
-_DEVA_THEN = r"\s*(?:दो|दे|दें|दीजिए|दीजिये|दिया|दूँ|दूं|सकते|सकती|सकता)"
-# A request ("kar do", "kardo", "karo", "kr do", "krdo", "kariye", "karna"), not a report or a question ("kar diya",
-# "kar di hai", "karoge"). The whitespace of each form is its own, so a long run of spaces is never tried two ways.
-_REQUEST = (r"(?:\s*(?:kar|kr)(?:\s+(?:do|de|to|dena|dein|dijiye|dijie|dijiyega|sakte|sakti|sakta)|do|de|o|iye|na)"
-            r"|\s+(?:do|de|dena|dein|dijiye|dijie))")
-_ADD_VERB = (rf"\b(?:(?:add|save|post|import|entry|enter)(?:\s+kar\w*|{_REQUEST})|daa?l(?:o|na|{_HI_THEN})"
-             rf"|(?:jod|chadh?a)(?:na|{_HI_THEN})|chadh?ao)\b"
-             rf"|(?<!{_LETTER})(?:(?:ऐड|एड|सेव|पोस्ट|इम्पोर्ट|एंट्री)\s*कर|डाल(?:ो|ना|{_DEVA_THEN})"
-             rf"|जो(?:\u095c|\u0921\u093c)(?:ना|{_DEVA_THEN})|च(?:\u095d|\u0922\u093c)ा(?:ओ|ना|{_DEVA_THEN}))")
-# Words that ask to add only when a register or the books is the target ("sales me update kr do", "purchase me likh do"),
-# never with "isko", "file" or "data" ("summary likh do", "file upload kar di" are not requests to add).
-_REGISTER_VERB = (rf"\b(?:(?:update|upload|record){_REQUEST}|likh(?:o|na|{_HI_THEN}))\b"
-                  rf"|(?<!{_LETTER})(?:(?:अपडेट|अपलोड)\s*कर|लिख(?:ो|ना|{_DEVA_THEN}))")
-_REGISTER_TARGET = (r"\b(?:books?|bahi|khat[ae]|registers?|tally|sales?|purchases?|kharid\w*|bikri)\s+(?:mein|me|men|main|mai|mei|par|pe)\b"
-                    rf"|(?<!{_LETTER})(?:बही|खात[ाे]|रजिस्टर|सेल्स|परचे(?:\u091c\u093c?|\u095b)|खरीद|बिक्री|बुक्स?)\s*(?:में|पर|पे)")
-_ADD_TARGET = (r"\b(?:ise|isko|inhe|inhen|inko|file|sheet|data)\b"
-               rf"|{_REGISTER_TARGET}|(?<!{_LETTER})(?:इसे|इसको|इन्हें|इनको|(?:\u092b\u093c?|\u095e)ाइल)")
-_ASKS_TO_ADD = re.compile(
-    r"\b(?:add|save|post|import)\b(?!(?:\s+\w+){0,2}\s+up\b)(?:"
-    r"(?:\s+(?:the|this|that|these|those|my|our|whole|entire|all|of)\b)*\s+(?:(?:files?|sheets?|data|registers?|workbook)\b"
-    r"|(?:it|this|these|them)(?=\s*(?:$|[?.!,]|(?:to|in|into|as)\b)))"
-    r"|[^.?!]{0,40}?\b(?:to|into|in)\s+(?:the\s+|my\s+|our\s+)?(?:books?|tally|accounts)\b)"
-    # "update this in sales", "put it in purchases": a file or "it/this" and then the register.
-    r"|\b(?:add|save|update|put|enter|record)\s+(?:it|this|these|them|(?:this|the|my)\s+(?:file|sheet|data|register))"
-    r"\s+(?:in|into|to)\s+(?:the\s+|my\s+)?(?:sales|purchases?)\b"
-    rf"|(?:{_ADD_TARGET})[^.?!।]{{0,60}}?(?:{_ADD_VERB})|(?:{_ADD_VERB})[^.?!।]{{0,60}}?(?:{_ADD_TARGET})"
-    rf"|(?:{_REGISTER_TARGET})[^.?!।]{{0,60}}?(?:{_REGISTER_VERB})|(?:{_REGISTER_VERB})[^.?!।]{{0,60}}?(?:{_REGISTER_TARGET})",
-    re.IGNORECASE)
+def _books_start_note(moved: dict) -> str:
+    return (f"The books began on {moved['from']:%d/%m/%Y}; they now begin on {moved['to']:%d/%m/%Y} (the start of the "
+            "financial year of the earliest bill), so the bills fit. Say so in one short line.")
 
 
-def _word_set(words: str) -> frozenset[str]:
-    return frozenset(unicodedata.normalize("NFC", w) for w in words.split())
+# The customer or supplier of a bill that names none: a walk-in, kept on one ledger, so the bill is still posted.
+CASH_PARTY = {"sales": "Cash Customer", "purchases": "Cash Supplier"}
+# This share of a sheet's codes found in another sheet of the same file: the same items listed twice.
+_SAME_ITEMS = 0.8
 
 
-# Saying which register a file is, in so many words: "this" (or the file's name), "is" / "hai" and the register, in Hindi
-# or English word order ("yeh purchase (ka) data hai", "AI SAMPLE.xlsx sales data hai", "This is my purchase register",
-# "यह सेल्स डेटा है"); or a short reply to an answer that ended asking which register ("purchase", "sales wala", "haan"
-# to "Lagta hai yeh purchase register hai - sahi hai?"). A request that only mentions sales or purchases ("month-wise
-# sales dikhao", "Top 10 customers by sales", the app's own "which is the sales register" prompt) says nothing about a file.
-_THIS = _word_set("yeh ye yah yahi yehi this that it these those यह ये यही")
-_IS = _word_set("hai hain he h is are was were है हैं")
-_FILE = _word_set("file sheet excel फ़ाइल फाइल शीट")  # "ye file purchase ki hai", "this file is sales data"
-_ARTICLE = _word_set("the my our a an all")  # "this is my purchase register"
-_REGISTER_TAIL = _word_set("ka ki ke wala wali wale vala vali data register bahi file sheet bill bills entries invoices "
-                           "khata का की के वाला वाली वाले डेटा डाटा रजिस्टर बही फ़ाइल फाइल शीट बिल")
-_YES = _word_set("haan han haa ha yes yeah yep ji sahi correct right theek thik ok okay bilkul हाँ हां जी सही")
-_NO = _word_set("nahi nahin nhi no not galat wrong नहीं गलत")
-_REPLY_WORDS = (_THIS | _IS | _FILE | _ARTICLE | _REGISTER_TAIL | _YES | _NO
-                | _word_set("ya or only sirf hi bhi wo woh vo mein me men main par pe में"))  # "purchase", "sales mein"
-_DOCUMENT = re.compile(r"\.(?:xlsx|xlsm|xls|csv)$")  # a file name says which file: "oct data.xlsx purchase data hai"
+# A column of row numbers ("S.No", "Sr. No."): its 1, 2, 3 are in every sheet and say nothing about the items.
+_SERIAL_COLUMN = re.compile(r"^(s|sr|sl|serial|sn|sno|srno|slno)(_?no|_?num|_?number)?$")
+# Columns naming a party, not an item or a bill: the same shops are billed every month.
+_PARTY_ID_COLUMN = re.compile(r"(^|_)(gstin|gst|gst_no|gstin_no|pan|phone|mobile|contact|party|customer|supplier|vendor|"
+                              r"client|buyer|seller|ledger|account|name)(_|$)")
+_GSTIN_VALUE = re.compile(r"^\d{2}[a-z]{5}\d{4}[a-z][0-9a-z]z[0-9a-z]$")
+# Columns naming a period (Apr-26, Q1, 2026), as a summary by month has: not item or bill codes.
+_PERIOD_COLUMN = re.compile(r"(^|_)(month|period|year|quarter|week|fy|financial_year)(_|$)")
+# Columns naming an item's kind ("Ring 22K", "Chain"), not one item: never codes.
+_LABEL_COLUMN = re.compile(r"(^|_)(item|items|item_name|category|description|product|particulars|details|narration|remarks|"
+                           r"metal|purity|karat|colour|color|clarity)(_|$)")
+# Number columns that are codes when they are named so: barcodes, tags, design or bill numbers kept as numbers.
+_CODE_NAME = re.compile(r"(^|_)(barcode|bar_code|code|tag|tag_no|huid|design|design_no|style|style_no|sku|bill|bill_no|"
+                        r"invoice|invoice_no|inv_no|voucher|voucher_no|vch_no)(_|$)")
 
 
-def _words(text: str) -> list[str]:
-    """A message's words, lower case: "it's" as "it is", a file name's last word whole, without a "(sheet)" after it."""
-    text = re.sub(r"(\.(?:xlsx|xlsm|xls|csv))\s*\([^)]{0,120}\)", r"\1", unicodedata.normalize("NFC", text).lower())
-    text = re.sub(r"\b(it|that|this)['’]s\b", r"\1 is", text)
-    return [w for w in (w.rstrip(".") for w in re.findall(r"[^\s,;:!?？।()\"'“”‘’]+", text)) if w]
+def _sheet_rows(sheet: dict) -> tuple[pd.DataFrame, dict[str, str]]:
+    """(the sheet's rows, column -> kind)."""
+    return load_frame(sheet), {c["name"]: c["kind"] for c in sheet["profile"]["columns"]}
 
 
-def _register_word(word: str) -> bool:
-    return not _DOCUMENT.search(word) and bool(detect.registers_named(word))
+def _code_columns(frame: pd.DataFrame, kinds: dict[str, str]) -> list[str]:
+    """Columns that name one item or one bill (a jewel code, tag, barcode or bill number): mostly different one-word
+    values with digits (TW001, S-101, 80451201); not row numbers (S.No, or 1, 2, 3...), not a party's GSTIN, phone or
+    name, not a period, and not an item's name or kind ("Ring 22K"). A number column counts only when named as a code."""
+    found = []
+    for column, kind in kinds.items():
+        if (kind not in ("text", "number") or (kind == "number" and not _CODE_NAME.search(column))
+                or _SERIAL_COLUMN.match(column) or _PARTY_ID_COLUMN.search(column) or _PERIOD_COLUMN.search(column)
+                or _LABEL_COLUMN.search(column)):
+            continue
+        values = [_code(v) for v in frame[column].dropna() if _code(v)]
+        distinct = set(values)
+        if (len(values) >= 2 and len(distinct) >= _SAME_ITEMS * len(values)
+                and sum(any(ch.isdigit() for ch in v) for v in values) >= _SAME_ITEMS * len(values)
+                and sum(" " not in v for v in values) >= _SAME_ITEMS * len(values)
+                and distinct != {str(n) for n in range(1, len(distinct) + 1)}
+                and sum(bool(_GSTIN_VALUE.match(v)) for v in distinct) < _SAME_ITEMS * len(distinct)):
+            found.append(column)
+    return found
 
 
-def _skip(words: list[str], start: int, allowed: frozenset[str], most: int = 1) -> int:
-    end = start
-    while end < len(words) and end - start < most and words[end] in allowed:
-        end += 1
-    return end
+def _code(value) -> str:
+    """A code cell as text: 80451201.0 (a barcode read as a number) is 80451201."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value).strip().lower()
 
 
-def _states_register(words: list[str]) -> bool:
-    at = lambda k, test: k < len(words) and test(words[k])  # noqa: E731
-    for i, word in enumerate(words):
-        if word in _THIS or _DOCUMENT.search(word):
-            j = _skip(words, i + 1, _FILE)
-            if at(j, _register_word) and at(_skip(words, j + 1, _REGISTER_TAIL, 3), _IS.__contains__):
-                return True  # yeh purchase (ka) data hai, AI SAMPLE.xlsx sales data hai, यह सेल्स डेटा है
-            if at(j, _IS.__contains__) and at(_skip(words, j + 1, _ARTICLE), _register_word):
-                return True  # this is (my) purchase register, it is sales data
-        elif _register_word(word):
-            k = _skip(words, i + 1, _REGISTER_TAIL, 3)
-            if at(k, _IS.__contains__) and at(k + 1, _THIS.__contains__):
-                return True  # purchase data hai yeh
-    return False
+def _second_columns(a: tuple, b: tuple) -> list[str]:
+    """Columns both sheets have that tell their rows apart besides the code: the date when both have one (bills on other
+    days are other bills, whatever their numbers), else the weights and amounts that vary from row to row, else (all
+    the same) any weight or amount they share."""
+    (fa, ka), (fb, kb) = a, b
+    shared = [c for c in ka if c in kb and ka[c] == kb[c]]
+    dates = [c for c in shared if ka[c] == "date"]
+    if dates:
+        return dates
+    numbers = [c for c in shared if ka[c] == "number"]
+    varying = [c for c in numbers if fa[c].nunique() >= 0.5 * max(1, fa[c].notna().sum())
+               and fb[c].nunique() >= 0.5 * max(1, fb[c].notna().sum())]
+    return varying or numbers
 
 
-def _asked_register(previous: str) -> set[str]:
-    """The registers an answer ended asking about: named in a question in its last line ("Yeh sales ka data hai ya
-    purchase ka?"), or both named there as a choice ("Kripya batayein ise sales mein daalun ya purchases mein.")."""
-    lines = previous.strip().splitlines()
-    last = lines[-1] if lines else ""
-    questions = re.findall(r"[^.!?？।]*[?？]", last)
-    named = detect.registers_named(last)
-    return (detect.registers_named(questions[-1]) if questions else set()) or (named if len(named) == 2 else set())
+def _pairs(frame: pd.DataFrame, code: str, second: str) -> set[tuple]:
+    """(code, the row's date / weight / amount) of every row with a code."""
+    def norm(value):
+        if isinstance(value, pd.Timestamp):
+            return value.date().isoformat()
+        try:
+            return round(float(value), 3)
+        except (TypeError, ValueError):
+            return str(value).strip().lower()
+
+    return {(str(c).strip().lower(), norm(x)) for c, x in zip(frame[code], frame[second])
+            if not pd.isna(c) and str(c).strip() and not pd.isna(x)}
 
 
-def says_register(request: str, previous: str = "") -> bool:
-    """The person's message says which register a shared file is ("yeh purchase data hai", "isko sales mein daal do", or
-    "purchase" / "haan" when ``previous``, the answer it replies to, ended asking), rather than only asking about one
-    ("kya yeh sales data hai?") or mentioning one ("month-wise sales dikhao")."""
-    if _ASKS_TO_ADD.search(request):
-        return bool(detect.registers_named(request))
-    if _QUESTION.search(request):
+def repeated_sheets(sheets: list[dict], registers: dict[str, str | None]) -> dict[str, str]:
+    """Sheets of one upload that only repeat the bills or items of another of its sheets going to the same register (a
+    packing list and its priced copy), each mapped to the sheet added instead. A sheet is left out only when another
+    one holds every one of its rows, matched on a code (jewel code, tag, bill number) AND on the date, or on a weight or
+    amount; between two sheets holding the same rows, the richer one is kept (posted by fine weight, then more number
+    columns). When neither holds all of the other's rows (a GST copy missing the estimates, bills to the same shops
+    each month, numbers that restart each month), both are added: a bill counted twice shows in the totals, a bill left
+    out does not. ``registers``: table -> the register it goes to."""
+    from ..accounts import metal as books_metal
+
+    def score(sheet: dict) -> tuple:
+        columns = sheet["profile"]["columns"]
+        return (books_metal.detect_jewellery(sheet) is not None, sum(c["kind"] == "number" for c in columns),
+                sheet.get("position", 0))
+
+    def holds(a: tuple, b: tuple) -> bool:
+        """Sheet a holds every row of sheet b (at least two), by a shared code and a second column."""
+        theirs_codes = _code_columns(*a)
+        for code in (c for c in _code_columns(*b) if c in theirs_codes):
+            for second in _second_columns(a, b):
+                mine, theirs = _pairs(a[0], code, second), _pairs(b[0], code, second)
+                if len(theirs) >= 2 and theirs <= mine:
+                    return True
         return False
-    words = _words(request)
-    if _states_register(words):
-        return True
-    asked = _asked_register(previous)
-    if not asked or not words or len(words) > 8 or not all(w in _REPLY_WORDS or _register_word(w) for w in words):
-        return False
-    # "haan" / "sahi hai" confirms the one register the question named; "nahi" alone names none.
-    return any(_register_word(w) for w in words) or (len(asked) == 1 and any(w in _YES for w in words)
-                                                     and not any(w in _NO for w in words))
+
+    groups: dict[tuple, list[dict]] = {}
+    for sheet in sheets:
+        groups.setdefault((sheet["dataset_id"], registers.get(sheet["table_name"])), []).append(sheet)
+    repeated: dict[str, str] = {}
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        rows = {s["table_name"]: _sheet_rows(s) for s in group}
+        for sheet in sorted(group, key=score):  # the poorest first: of two sheets with the same rows, it is left out
+            mine = sheet["table_name"]
+            other = next((o["table_name"] for o in group if o["table_name"] != mine and o["table_name"] not in repeated
+                          and holds(rows[o["table_name"]], rows[mine])
+                          and (not holds(rows[mine], rows[o["table_name"]]) or score(o) > score(sheet))), None)
+            if other:
+                repeated[mine] = other
+    return repeated
+
+
+# Amount columns (rupees): a summary is matched to the bills on these; pieces, rates and purity never.
+_MONEY_COLUMN = re.compile(r"(^|_)(amount|amt|total|value|sales|purchases?|price|taxable|invoice_value|bill_amount)(_|$)")
+# Weight columns: where a summary and the bills both have the same one, its totals must agree too.
+_WEIGHT_COLUMN = re.compile(r"(^|_)(gross|net|fine|pure)(_?(wt|weight))?$")
+
+
+def summary_sheets(sheets: list[dict], registers: dict[str, str | None]) -> dict[str, str]:
+    """Sheets of one upload that only total the bills of its other sheets going to the same register (by month,
+    category, item or customer), each mapped to the bills it totals. Only a sheet shaped like a summary is one: no
+    dates, no item or bill codes, a label column (Month, Category, Item, Customer), no more rows than the bills; and
+    its amount total equals the amount total of one bills sheet (with dates or codes) or of all of them, to the rupee,
+    with every weight column both have equal to the gram. Posting the totals as well would count the sales twice; any
+    doubt, and the sheet is added. A summary shared alone is not one of them: it is added as asked."""
+    from ..reports import _NOT_AMOUNT  # weights, pieces, rates, purity: never rupees
+    def total(frame: pd.DataFrame, column: str) -> float:
+        return float(pd.to_numeric(frame[column], errors="coerce").fillna(0).sum())
+
+    def money(kinds: dict[str, str]) -> list[str]:
+        return [c for c, k in kinds.items() if k == "number" and _MONEY_COLUMN.search(c) and not _NOT_AMOUNT.search(c)]
+
+    def weights(kinds: dict[str, str]) -> list[str]:
+        return [c for c, k in kinds.items() if k == "number" and _WEIGHT_COLUMN.search(c)]
+
+    groups: dict[tuple, list[dict]] = {}
+    for sheet in sheets:
+        groups.setdefault((sheet["dataset_id"], registers.get(sheet["table_name"])), []).append(sheet)
+    summaries: dict[str, str] = {}
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        rows = {s["table_name"]: _sheet_rows(s) for s in group}
+        # Bills have dates (a Month column of dates is a summary's label, not a bill date) or item or bill codes.
+        bills = [t for t, (frame, kinds) in rows.items()
+                 if any(k == "date" and not _PERIOD_COLUMN.search(c) for c, k in kinds.items()) or _code_columns(frame, kinds)]
+        for table, (frame, kinds) in rows.items():
+            if table in bills or not money(kinds):
+                continue
+            if not any((k == "text" or (k == "date" and _PERIOD_COLUMN.search(c))) and frame[c].notna().any()
+                       for c, k in kinds.items()):
+                continue  # no label column: not a summary by month, category, item or customer
+            # A row per sheet ("Total Sales 2,80,000", "October 1,20,000"): one row equals one bills sheet's total.
+            row_values = [float(v) for c in money(kinds) for v in pd.to_numeric(frame[c], errors="coerce").dropna() if v]
+            matched = next((b for b in bills for c in money(rows[b][1]) if total(rows[b][0], c)
+                            and any(abs(v - total(rows[b][0], c)) <= 1.0 for v in row_values)), None)
+            if matched and len(frame) <= sum(len(rows[b][0]) for b in bills):
+                summaries[table] = matched
+                continue
+            combos = [[b] for b in bills] + ([bills] if len(bills) > 1 else [])
+            for combo in combos:
+                size = sum(len(rows[b][0]) for b in combo)
+                if len(frame) > size:
+                    continue
+                theirs_money = [sum(total(rows[b][0], c) for b in combo if c in rows[b][1])
+                                for c in {c for b in combo for c in money(rows[b][1])}]
+                same_money = any(abs(total(frame, mine) - t) <= 1.0 for mine in money(kinds) for t in theirs_money if t)
+                shared_weights = [c for c in weights(kinds) if all(c in rows[b][1] for b in combo)]
+                same_weights = all(abs(total(frame, c) - sum(total(rows[b][0], c) for b in combo)) <= 0.001
+                                   for c in shared_weights)
+                if same_money and same_weights:
+                    summaries[table] = combo[0]
+                    break
+    return summaries
 
 
 def pending_text(pending: list[dict]) -> str:
-    """For <documents>: the shared sheets whose register the answer asks about (each {filename, sheet, suggestion})."""
+    """For <documents>: the shared sheets not in the books yet, which the answer offers to add (each {filename, sheet,
+    suggestion})."""
     likely = {"sales": "likely the sales register", "purchases": "likely the purchase register"}
-    return "\n".join(["Not in the books yet (the chosen company's books have nothing from these sheets, and the person has "
-                      "not said which register they are):"]
+    return "\n".join(["Not in the books yet (the chosen company's books have nothing from these sheets yet):"]
                      + [f'- File "{p["filename"]}", sheet "{p["sheet"]}": '
                         + likely.get(p["suggestion"], "a sales or purchase register, unclear which") for p in pending])
 
@@ -585,13 +644,15 @@ def pending_text(pending: list[dict]) -> str:
 BILL_TOOL_DESCRIPTION = (
     "Save one bill the person typed in the chat (\"Input by chat\") to the chosen company's books, as a sale or a purchase, "
     "exactly as the app's Sales / Purchase entry form does: a jewellery bill by weight, labour + diamond amounts, no GST. "
-    "Call it once per bill, only after the person said whether it is a sale or a purchase; never guess a weight, purity or "
-    "rate they did not give (null when not given: a bill without purity is saved without fine gold). Returns the bill "
+    "Call it once per bill as soon as the person asks, without asking them anything first; never guess a weight, purity "
+    "or rate they did not give (null when not given: a bill without purity is saved without fine gold). Returns the bill "
     "number and amounts."
 )
 _BILL_FIELDS = {  # name -> (JSON type, description)
-    "register": ("string", "sales for a bill to a customer, purchases for a bill from a supplier, as the person said."),
-    "party": ("string", "Customer (sales) or supplier (purchases) name, as typed."),
+    "register": ("string", "sales for a bill to a customer, purchases for a bill from a supplier: as the person said, else "
+                           "from their wording (bought from someone: purchases; sold to someone: sales), else sales."),
+    "party": ("string", "Customer (sales) or supplier (purchases) name, as typed; empty when not given (the bill is "
+                        "then a cash sale or purchase, posted to Cash)."),
     "item": ("string", "Item name, e.g. Ring, Chain, Bangle."),
     "gross_g": ("number|null", "Gross weight in grams; null when not given."),
     "purity_pct": ("number|null", "Purity / tunch in percent, e.g. 91.6 for 22K, 75 for 18K, 58.5 for 14K; null when not given "
@@ -617,19 +678,6 @@ def bill_tool_schema() -> dict:
         props[name] = {"type": [base, "null"] if nullable else base, "description": text}
     props["register"]["enum"] = list(BOOKS_REGISTERS)
     return {"type": "object", "properties": props, "required": list(_BILL_FIELDS), "additionalProperties": False}
-
-
-def books_tool_schema(tables) -> dict:
-    """add_to_books' parameters: one of these tables and a register, or null for the detected one."""
-    return {
-        "type": "object",
-        "properties": {
-            "table": {"type": "string", "enum": sorted(tables), "description": BOOKS_PARAMS["table"]},
-            "register": {"type": ["string", "null"], "enum": [*BOOKS_REGISTERS, None], "description": BOOKS_PARAMS["register"]},
-        },
-        "required": ["table", "register"],
-        "additionalProperties": False,
-    }
 
 
 # Imports take turns: two at once could both find a row not yet posted and post it twice.
@@ -663,20 +711,18 @@ class Toolbox:
     calculations: list[dict] = field(default_factory=list)
     formula_checks: list[dict] = field(default_factory=list)
     analyses: list[dict] = field(default_factory=list)
-    # The company whose books add_to_books posts the shared sheets to; None: the model has no such tool.
+    # The company whose books add_to_books posts the shared sheets to (the app calls it when the intent check, llm/intent.py,
+    # reads a request to add them); None: nothing can be added.
     company_id: int | None = None
-    # The person's latest message: only it can ask for add_to_books, and a question there is answered, not imported.
-    # "" outside a chat (a direct call), where nobody's words are checked.
-    request: str = ""
-    # The answer that message replies to ("" when there is none), without its <context> block.
-    previous: str = ""
     imports: list[dict] = field(default_factory=list)
-    # The company add_bill saves typed bills to (with or without shared files); None: no such tool.
+    # The company add_bill saves typed bills to; None: the model has no such tool (given only when the intent check read
+    # a request to save a typed bill).
     bill_company_id: int | None = None
+    # The register the intent check read for that bill ("sales" / "purchases"); None: the person did not say, the model
+    # decides from their wording.
+    bill_register: str | None = None
     # Each bill add_bill saved or found: [total ₹, labour ₹, diamonds ₹, net g, gross g, fine g, diamond ct], for verification.
     bills: list[list] = field(default_factory=list)
-    # The person's last few messages (latest last): a bill typed in one message may be confirmed in the next ("18k").
-    recent: str = ""
     # Set once add_to_books is called, even if it failed: such an answer is never remembered.
     added_to_books: bool = False
     # Live progress for the person waiting: {"type": "step", "text": ...} after each tool call.
@@ -714,16 +760,14 @@ class Toolbox:
         self.added_to_books = True  # an answer that saved a bill is never remembered
         if not self.can_add_bill:
             raise EditError("No company is chosen, so the bill cannot be saved. Ask the person to choose one in the app.")
+        register = self.bill_register or register  # the register the intent check read in the person's words wins
         if register not in BOOKS_REGISTERS:
             raise EditError(f"Unknown register {register!r}; use sales or purchases.")
-        if self.request and not self._bill_register_said(register):
-            raise EditError("Not saved: the person has not said whether this bill is a sale or a purchase (in their own "
-                            "words). Ask them (\"Sales ya purchase?\") and save it once they say.")
         party, item = (party or "").strip(), (item or "").strip()
         # Typed all in lower case on a phone ("hukum chand jewellers"): saved as a name is written. Other casing is kept.
         party, item = (party.title() if party.islower() else party), (item.title() if item.islower() else item)
-        if not party:
-            raise EditError("Not saved: the bill needs the customer or supplier name. Ask for it.")
+        # No name given: a walk-in customer or supplier, on one ledger, so the bill is saved instead of asked about.
+        party = party or CASH_PARTY[register]
         # The longest the books keep (the database refuses a longer value, where SQLite stored any length).
         if len(party) > 200:
             raise EditError("Not saved: the customer or supplier name is longer than 200 characters. Ask for the name as "
@@ -770,9 +814,14 @@ class Toolbox:
                     books_vouchers.c.cancelled.is_(False))).first()
                 fine_known = bool(found) and bool(conn.execute(select(func.sum(books_metal_lines.c.dr_mg + books_metal_lines.c.cr_mg)).where(
                     books_metal_lines.c.voucher_id == found.id)).scalar())
+                books_moved = None
                 if found and (fine_known or not purity_given):  # already in the books as asked: nothing saved again
                     vid, outcome = found.id, "already"
                 else:
+                    # A bill dated before the books begin moves the start back, in this same transaction.
+                    books_moved = books_imports.fit_books_start(conn, company, [day])
+                    if books_moved:
+                        company = books_service.get_company(self.bill_company_id, conn)
                     party_id = books_service.ensure_ledger(conn, self.bill_company_id, party,
                                                            "Sundry Debtors" if sales else "Sundry Creditors")
                     if purity_given:
@@ -805,25 +854,13 @@ class Toolbox:
             if not purity_given and outcome != "already":
                 note += (" Purity was not given, so the bill has no fine gold weight (its net weight and diamonds are counted "
                          "in stock); say so in one line.")
+            if books_moved:
+                note += " " + _books_start_note(books_moved)
             reply = self._book_replies[key] = json.dumps({
                 "saved": outcome != "already", "outcome": outcome, "register": register, "bill_no": saved.get("number"),
                 "date": str(day), "party": party, "item": item, "total_rupees": total_paise / 100, "note": note,
             }, ensure_ascii=False, default=str)
         return reply
-
-    def _bill_register_said(self, register: str) -> bool:
-        """Whether the person's own words choose ``register`` for a typed bill: their latest message names exactly it;
-        or it names none, the AI's last answer did not ask "sales or purchase?", and either they said "haan" to a question
-        naming only it, or their own recent messages (the bill typed earlier) name exactly it."""
-        own = detect.registers_named(self.request)
-        if own:
-            return own == {register}
-        asked = _asked_register(self.previous)
-        if len(asked) == 2 or len(detect.registers_named(self.previous)) == 2:
-            return False  # the AI asked which: the reply itself must say it
-        if asked == {register} and says_register(self.request, self.previous):
-            return True  # "haan" to "Yeh purchase bill hai?"
-        return detect.registers_named(self.recent) == {register}
 
     @property
     def cache_key(self) -> str:
@@ -933,49 +970,44 @@ class Toolbox:
         self.emit({"type": "step", "text": f"Calculated {expression} = {result}"})
         return result
 
-    def add_to_books(self, table: str, register: str | None = None) -> str:
+    def detected(self, table: str) -> tuple[str, dict]:
+        """(file name, detection) of a shared sheet: what <documents> says it is."""
+        sheet = self.sheets[table]
+        filename = (get_dataset(sheet["dataset_id"]) or {}).get("filename", "")
+        return filename, detect.classify(sheet, filename)
+
+    def register_for(self, table: str, register: str | None) -> str:
+        """The register a shared sheet is added to: the one the person said, else its detected one, else sales."""
+        if register in BOOKS_REGISTERS:
+            return register
+        kind = self.detected(table)[1]["kind"]
+        return kind if kind in BOOKS_REGISTERS else "sales"
+
+    def add_to_books(self, table: str, register: str | None = None, party: str | None = None) -> str:
         """Post a shared sheet to the company's books as POST /api/companies/{id}/import/register does; return the
-        counts as JSON for the model. Without ``register`` the sheet's detection decides, only when it is clear (high
-        confidence, no evidence for the other register); a register that a high-confidence detection contradicts needs
-        the person's answer to the AI's question naming both registers. Raises EditError/AccountsError on failure."""
+        counts as JSON for the model. The app calls it when the intent check read a request to add the sheet (asking
+        nothing): ``register`` is the one the person said, which wins over what the file looks like; None (they said
+        neither) takes the sheet's detected register, or sales when it points to neither. Nothing missing stops a bill:
+        one with no date is dated today, one with no customer or supplier is under ``party`` (the one the person or the
+        file name gave), else a cash party. Raises EditError/AccountsError on failure."""
+        from datetime import date as _date
+
         self.check_cancelled()
         self.added_to_books = True
         if not self.can_add_to_books:
-            raise EditError("No company is chosen, so nothing can be added to the books. Ask the person to choose one in the app.")
+            raise EditError("No company is chosen, so nothing can be added to the books.")
         if table not in self.sheets:
             raise EditError(f"Unknown table {table!r}; use one of {sorted(self.sheets)}.")
-        register = register or None  # an empty string from the model means left out
+        register = register or None
         if register is not None and register not in BOOKS_REGISTERS:
             raise EditError(f"Unknown register {register!r}; use sales or purchases.")
-        if _QUESTION.search(self.request) and not _ASKS_TO_ADD.search(self.request):
-            raise EditError("The person's latest message is a question, not a request to add the file to the books. Answer "
-                            "it, and ask whether to add the file before calling add_to_books.")
-        # Only the person's own words add a file: saying which register it is, or asking to add it. A message that only
-        # mentions sales or purchases (the app's own prompts too), or a file listed as not in the books, is no reason.
-        if self.request and not (says_register(self.request, self.previous) or _ASKS_TO_ADD.search(self.request)):
-            raise EditError("Not added: the person's latest message neither says which register a shared file is nor asks "
-                            "to add it to the books. Answer it; for a file not in the books yet, ask whether it is their "
-                            "sales or purchase data, and add it only once they say.")
         sheet = self.sheets[table]
-        filename = (get_dataset(sheet["dataset_id"]) or {}).get("filename", "")
-        found = detect.classify(sheet, filename)  # what <documents> says about this sheet
+        filename, found = self.detected(table)  # what <documents> says about this sheet
         because = "; ".join(found["reasons"]) or "no clear evidence"
         chosen = register is None
-        if chosen:
-            if found["kind"] not in BOOKS_REGISTERS or found["confidence"] != "high" or found["against_register"]:
-                against = "; ".join(found["against_register"])
-                raise EditError(f"Not added: the person did not say which register, and the detection is unclear "
-                                f"({found['label']}, {found['confidence']} confidence; {because}"
-                                + (f"; evidence the other way: {against}" if against else "")
-                                + "). Ask whether it is their sales or purchase register.")
-            register = found["kind"]
-        # The answer the person replies to raised the conflict only if it named both registers, as this refusal asks.
-        elif (found["kind"] in BOOKS_REGISTERS and found["kind"] != register and found["confidence"] == "high"
-              and not {register, found["kind"]} <= detect.registers_named(self.previous)):
-            raise EditError(f"Not added: the person said {register}, but the file looks like a {found['label'].lower()} "
-                            f"(high confidence; {because}). Say in one line what it looks like and why, and ask whether to "
-                            f"add it as {register} or as {found['kind']}, naming both; add it as {register} only when they "
-                            "confirm.")
+        register = self.register_for(table, register)
+        # Added as the person said; a file that clearly looks like the other register is mentioned, never asked about.
+        looks_other = found["kind"] in BOOKS_REGISTERS and found["kind"] != register and found["confidence"] == "high"
         # Imports take turns, and a repeat of a call waits for the first and gets its reply.
         with _BOOKS_LOCK:
             if (table, register) in self._book_replies:
@@ -983,7 +1015,8 @@ class Toolbox:
             self.emit({"type": "step", "text": f"Adding {filename} ({sheet['sheet_name']}) to the books as {register}…"})
             try:
                 # Stopped before the import commits: nothing is posted, as the person expects.
-                result = books_imports.import_register(self.company_id, sheet, register, before_commit=self.check_cancelled)
+                result = books_imports.import_register(self.company_id, sheet, register, before_commit=self.check_cancelled,
+                                                       default_date=_date.today(), default_party=party or CASH_PARTY[register])
             except AccountsError:
                 raise
             except Exception as exc:  # a KeyError here is the import's, not a wrong argument: say so to the model
@@ -998,9 +1031,13 @@ class Toolbox:
                 "file": filename,
                 "sheet": sheet["sheet_name"],
                 "register": register,
-                **({"register_note": f"You left the register out, so the app chose {register} from the detection: {because}. "
-                                     "Begin the reply with one short line saying which register you chose and why."}
+                **({"register_note": f"The person did not say sales or purchases, so the app chose {register} from the file: "
+                                     f"{because}. Begin the reply with one short line saying which register and why."}
                    if chosen else {}),
+                **({"looks_like_note": f"Added as {register}, as the person said, though the file looks like a "
+                                       f"{found['label'].lower()} ({because}). Mention it in one short line after the "
+                                       "counts, not as a question."} if looks_other else {}),
+                **({"books_start_note": _books_start_note(result["books_start"])} if result.get("books_start") else {}),
                 "created": result["created"],
                 "skipped": result["skipped"],
                 "problems": problems[:_PROBLEMS_SHOWN_TO_MODEL],

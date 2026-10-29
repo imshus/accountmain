@@ -206,8 +206,38 @@ function putJson<T>(path: string, payload: unknown, timeoutMs: number = TIMEOUT_
   );
 }
 
+/** The voice agent's call: the app's WebRTC offer to the backend, which starts the call with OpenAI and answers with
+ * OpenAI's SDP (backend/app/voice.py). No OpenAI key ever reaches the app. */
+async function voiceCall(sdp: string): Promise<string> {
+  let response: Response;
+  // Longer than the server's own 20 s wait for OpenAI, so a slow start comes back with the server's reason.
+  const signal = AbortSignal.timeout(TIMEOUT_MS + 10_000);
+  try {
+    response = await fetch(`${serverUrl()}/api/voice/call`, {
+      method: "POST",
+      body: sdp,
+      headers: { ...TUNNEL_HEADERS, "Content-Type": "application/sdp" },
+      signal,
+    });
+  } catch {
+    throw new ApiError(0, signal.aborted ? "The server did not start the voice call within 30 seconds. Try again." : (await whyNoAnswer()).message);
+  }
+  const text = await response.text();
+  if (!response.ok) {
+    let body: unknown = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      // Not the backend's JSON error: the status says enough.
+    }
+    throw new ApiError(response.status, errorMessage(response.status, body));
+  }
+  return text;
+}
+
 export const api = {
   health: () => request<Health>("/api/health"),
+  voiceCall,
   datasets: () => request<DatasetSummary[]>("/api/datasets"),
   dataset: (id: number) => request<DatasetDetail>(`/api/datasets/${id}`),
   deleteDataset: (id: number) => request<null>(`/api/datasets/${id}`, { method: "DELETE" }),

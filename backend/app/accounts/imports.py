@@ -24,7 +24,7 @@ from sqlalchemy import and_, insert, select
 from sqlalchemy.exc import DataError, IntegrityError
 
 from .. import gst, reports
-from ..books import _normalise
+from ..books import HEADS, _normalise
 from ..database import _safe_reason, engine, upsert
 from ..editing import load_frame
 from . import chart, service
@@ -123,16 +123,18 @@ def existing_documents(conn, company_id: int, skip_prefix: str) -> dict[tuple[st
 
 
 def already_in_books(index: dict, vtype: str, number: str, day: date, party_id: int | None, gstins=(),
-                     is_party: bool = True, value: int = 0) -> bool:
+                     is_party: bool = True, value: int = 0, dated: bool = True) -> bool:
     """True when this party already has this invoice / bill number in this financial year (not cancelled).
     The party is the same ledger or the same valid GSTIN. A register's party "Cash" (not a party ledger) is
-    shared by many suppliers, so there the date and invoice value must match too, as a re-upload repeats them."""
+    shared by many suppliers, so there the date and invoice value must match too, as a re-upload repeats them.
+    ``dated`` False: the bill's date was filled in (the day of an add from the chat), so it is not compared."""
     number = _as_reference(number).lower()  # as a voucher keeps it
     gstins = {g for g in map(_valid_gstin, gstins) if g}
     for entry in index.get((vtype, number, financial_year(day)), []) if number else []:
         if gstins & entry["gstins"]:
             return True
-        if party_id in entry["ledgers"] and (is_party or (entry["date"] == day and entry["ledgers"][party_id] == abs(value))):
+        if party_id in entry["ledgers"] and (is_party or ((not dated or entry["date"] == day)
+                                                          and entry["ledgers"][party_id] == abs(value))):
             return True
     return False
 
@@ -437,48 +439,272 @@ def _item_summary(row, item_col: str | None, net_col: str | None) -> tuple[str |
     return (" ".join(name.split())[:120] if name else None), (net if 0 < net <= _MAX_NET_MG else None)
 
 
-def import_register(company_id: int, sheet: dict, register: str, before_commit: Callable[[], None] | None = None) -> dict:
+# A column that names the customer or supplier. A "Category" or "Head" column is the kind of item in a list of items
+# (Ring, Pendant), not a party, although the column roles take it as an account for other sheets.
+_PARTY_COLUMN = re.compile(r"(^|_)(ledger|account|party|party_name|customer|vendor|supplier|client|payee|buyer|seller|name)(_|$)")
+# A sheet with no amount column: its price or value column is the bill's amount.
+_PRICE_COLUMN = re.compile(r"(^|_)(price|set_price|sale_price|selling_price|mrp|value|total)(_|$)")
+
+
+# A date column the uploader kept as text (a "-" or "N/A" among its dates): read as dates when the chat adds the sheet.
+_DATE_COLUMN = re.compile(r"(^|_)(date|dt|dated|bill_date|invoice_date)(_|$)")
+
+
+def loose_sheet(sheet: dict) -> dict:
+    """The sheet as an add from the chat reads it, which must not stop at a missing column role (asked for on
+    2026-10-28): a "Category" column is not taken as the customer or supplier; a date column kept as text is the date
+    (read by text_dates); and a sheet with no amount column takes its first price or value column as the bill's amount,
+    never one part of the value (metal, diamond, stone or labour value: the jewellery import adds the parts up).
+    Column roles the person chose are used as they are."""
+    from . import metal  # metal imports this module
+
+    profile = sheet["profile"]
+    if profile.get("mapping") is not None:
+        return sheet
+    mapping = reports.detect_mapping(profile)
+    if "account" in mapping and not _PARTY_COLUMN.search(mapping["account"]):
+        mapping.pop("account")
+    if "date" not in mapping:
+        text_date = next((c["name"] for c in profile["columns"] if c["kind"] == "text" and c["non_null"] > 0
+                          and _DATE_COLUMN.search(c["name"])), None)
+        if text_date:
+            mapping["date"] = text_date
+    if not any(role in mapping for role in ("taxable", "invoice_value", "amount", "debit")):
+        parts = [re.compile(metal._COLUMNS[k]) for k in metal._VALUE_PARTS]
+        price = next((c["name"] for c in profile["columns"] if c["kind"] == "number" and c["non_null"] > 0
+                      and _PRICE_COLUMN.search(c["name"]) and not reports._NOT_AMOUNT.search(c["name"])
+                      and not any(p.match(c["name"]) for p in parts)), None)
+        if price:
+            mapping["amount"] = price
+    return {**sheet, "profile": {**profile, "mapping": mapping}}
+
+
+def text_dates(values: pd.Series) -> pd.Series:
+    """A date column kept as text, read as the upload reads dates: the format that fits the column best (10/06/2026 is
+    10 June, the Indian order); NaT where a cell is not a date ("-", "N/A"), which then gets the add's own date."""
+    from ..excel_loader import _parse_dates
+
+    found, _notes = _parse_dates(list(values.dropna().unique()))
+    return pd.Series([found.get(v, pd.NaT) if not pd.isna(v) else pd.NaT for v in values], index=values.index,
+                     dtype="datetime64[ns]")
+
+
+def date_kept_as_text(sheet: dict, mapping: dict[str, str]) -> str | None:
+    """The date column, when the upload kept it as text (then read with text_dates)."""
+    kinds = {c["name"]: c["kind"] for c in sheet["profile"]["columns"]}
+    column = mapping.get("date")
+    return column if column and kinds.get(column) == "text" else None
+
+
+# Dates before this are an empty or broken Excel cell (Excel's day 0 is 1899-12-30), never a bill.
+_EARLIEST_BILL_YEAR = 2000
+
+
+def fit_books_start(conn, company: dict, days) -> dict | None:
+    """In an add from the chat: move the books-start date back to the financial year of the earliest of ``days`` (the
+    bills about to be posted, outside any locked period) when it is before the books begin and the company has no
+    opening balances (service.move_books_start_back), on the posting's own transaction, so a stopped or failed add
+    leaves it as it was. {"from", "to"} when it moved, else None."""
+    locked = company.get("locked_until")
+    days = [d for d in days if d is not None and d.year >= _EARLIEST_BILL_YEAR and not (locked and d <= locked)]
+    earliest = min(days, default=None)
+    if earliest is None or not company.get("fy_start") or earliest >= company["fy_start"]:
+        return None
+    start = service.fy_of(earliest)[0]
+    if not service.move_books_start_back(company["id"], start, conn):
+        return None
+    return {"from": company["fy_start"], "to": start}
+
+
+def one_bill_sheet(sheet: dict, default_date: date | None) -> bool:
+    """A list of items with no date, bill number or customer/supplier column, added from the chat: one bill for it all."""
+    mapping = reports.effective_mapping(sheet["profile"])
+    return default_date is not None and not any(role in mapping for role in ("date", "voucher_no", "account"))
+
+
+# "Total", "Grand Total", "G. Total", "G.TOTAL", "GTOTAL", "Bill Total", "TOTAL SALE": in any cell of a total row.
+_TOTAL_WORD = re.compile(r"\btotals?\b|\bg\.?\s*totals?\b|\bgtotals?\b", re.IGNORECASE)
+# Rates and purities are not added up in a total row, so they are not compared.
+_NOT_SUMMED = re.compile(r"(^|_)(rate|tunch|touch|purity|karat|kt|percent|pct)(_|$)")
+_SUM_TOLERANCE = 0.0051  # to the paisa and the milligram, after Excel's float noise
+
+
+def total_rows(sheet: dict, raw: pd.DataFrame, mapping: dict[str, str]) -> list[int]:
+    """Rows (ids) that only add up the rows above them: a grand total, or a bill's subtotal ("Bill Total"). Such a row
+    has no date, bill number or party; its text cells are blank or say "total"; and each of its figures (rates and
+    purities aside) equals the sum of the rows since its bill began, or since the last total, over two rows or more.
+    An add from the chat leaves them out, so they are neither posted as bills nor joined into the bill above."""
+    kinds = {c["name"]: c["kind"] for c in sheet["profile"]["columns"]}
+    keys = [mapping[role] for role in ("date", "voucher_no", "account") if mapping.get(role) in raw]
+    numbers = [c for c, k in kinds.items() if k == "number" and c in raw and not _NOT_SUMMED.search(c)]
+    texts = [c for c, k in kinds.items() if k == "text" and c in raw and c not in keys]
+
+    def blank(value) -> bool:
+        return value is None or (not isinstance(value, str) and pd.isna(value)) or not str(value).strip()
+
+    def figure(value) -> float:
+        try:
+            return 0.0 if blank(value) else float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    found: list[int] = []
+    since_bill, bill_rows = dict.fromkeys(numbers, 0.0), 0
+    since_total, total_rows_seen = dict.fromkeys(numbers, 0.0), 0
+    for record in raw.to_dict("records"):
+        # "Grand Total" typed in the Date or Customer column labels the row: it does not start a bill.
+        labels = [str(record[k]) for k in keys if not blank(record[k]) and _TOTAL_WORD.search(str(record[k]))]
+        starts = any(not blank(record[k]) for k in keys) and not labels
+        if starts:
+            since_bill, bill_rows = dict.fromkeys(numbers, 0.0), 0
+        words = labels + [str(record[c]) for c in texts if not blank(record[c])]
+        values = {c: figure(record[c]) for c in numbers if figure(record[c])}
+        if not starts and values and (not words or any(_TOTAL_WORD.search(w) for w in words)) and any(
+                count >= 2 and all(abs(v - sums[c]) <= _SUM_TOLERANCE for c, v in values.items())
+                for sums, count in ((since_bill, bill_rows), (since_total, total_rows_seen))):
+            found.append(int(record["_rowid"]))
+            since_bill, bill_rows = dict.fromkeys(numbers, 0.0), 0
+            since_total, total_rows_seen = dict.fromkeys(numbers, 0.0), 0
+            continue
+        for c in numbers:
+            since_bill[c] += figure(record[c])
+            since_total[c] += figure(record[c])
+        bill_rows += 1
+        total_rows_seen += 1
+    return found
+
+
+def totals_note(rowids: list[int]) -> list[str]:
+    return [f"row {rowid}: only adds up the rows above it (a total), not posted." for rowid in rowids]
+
+
+def item_row(date_value, number, party) -> bool:
+    """A row with no date, bill number or party: in a register with those columns, an item typed under the bill above
+    it (its cells left blank, or merged in Excel)."""
+    return pd.isna(date_value) and not str(number or "").strip() and party in ("(blank)", "(not given)")
+
+
+def bill_groups(frame: pd.DataFrame, one_bill: bool, join_items: bool) -> list[list[int]]:
+    """The register's rows (positions in ``frame``) grouped into bills: every row its own bill; all rows one bill for a
+    list of items; and with ``join_items`` (an add from the chat), an item row joins the bill above it."""
+    if one_bill:
+        return [list(range(len(frame)))]
+    groups: list[list[int]] = []
+    for position, row in enumerate(frame.itertuples(index=False)):
+        if join_items and groups and item_row(row.date, row.invoice_no, row.party):
+            groups[-1].append(position)
+        else:
+            groups.append([position])
+    return groups
+
+
+def _join_rows(frame: pd.DataFrame, raw: pd.DataFrame, groups: list[list[int]], item_col: str | None,
+               net_col: str | None) -> tuple[pd.DataFrame, dict[int, tuple], dict[int, str]]:
+    """One row per bill: the bill's first row with the amounts of all its rows added up; and, by that row's id, the
+    bill's items and net weight, and its label, for the bills of several rows."""
+    money = [c for c in ("invoice_value", "taxable", *HEADS, "gst_unsplit", "tax") if c in frame]
+    firsts, items, labels = [], {}, {}
+    for group in groups:
+        first = frame.iloc[[group[0]]].copy()
+        for column in money:
+            first[column] = int(frame[column].iloc[group].sum())
+        firsts.append(first)
+        if len(group) > 1:
+            rowids = [frame["rowid"].iloc[position] for position in group]
+            listed = [_item_summary(raw.loc[rowid], item_col, net_col) for rowid in rowids]
+            items[rowids[0]] = ("\n".join(dict.fromkeys(name for name, _ in listed if name)) or None,
+                                sum(net or 0 for _, net in listed) or None)
+            labels[rowids[0]] = f"rows {rowids[0]}–{rowids[-1]}"
+    return pd.concat(firsts, ignore_index=True), items, labels
+
+
+def filled_notes(filled: dict[str, int], default_date: date | None, default_party: str | None) -> list[str]:
+    """What the import filled in for bills that had no date or no party (an import asked for from the chat)."""
+    def bills(n: int) -> str:
+        return f"{n} bill{'s' if n != 1 else ''}"
+
+    notes = []
+    if filled["date"]:
+        notes.append(f"{bills(filled['date'])} had no date, so {'it is' if filled['date'] == 1 else 'they are'} dated "
+                     f"{default_date:%d/%m/%Y} (the day it was added).")
+    if filled["party"]:
+        notes.append(f"{bills(filled['party'])} had no customer or supplier name, so {'it is' if filled['party'] == 1 else 'they are'} "
+                     f"under {default_party}.")
+    return notes
+
+
+def import_register(company_id: int, sheet: dict, register: str, before_commit: Callable[[], None] | None = None,
+                    default_date: date | None = None, default_party: str | None = None) -> dict:
     """Post one sales or purchase register sheet. Returns counts and a list of problems.
     Jewellery registers (fine weight / tunch columns) are posted by weight; see metal.import_jewellery.
     A row's item name and net weight, when the register has them, are kept on its voucher for the voucher list
     (no metal lines: the rupees are all that is posted). ``before_commit`` is called last, inside the transaction: if
-    it raises (the chat that asked for the import was stopped), nothing is posted."""
+    it raises (the chat that asked for the import was stopped), nothing is posted. ``default_date`` / ``default_party``
+    (an add asked for from the chat, which must not stop at a missing detail): the date and the customer or supplier of
+    a bill that has none, instead of leaving it out."""
     if register not in ("sales", "purchases"):
         raise AccountsError("Choose whether the sheet is a sales or a purchase register.")
     from . import metal  # metal imports this module
 
+    if default_date is not None or default_party:
+        sheet = loose_sheet(sheet)
     if metal.detect_jewellery(sheet):
-        return metal.import_jewellery(company_id, sheet, register, before_commit)
+        return metal.import_jewellery(company_id, sheet, register, before_commit, default_date, default_party)
     raw = load_frame(sheet)
     frame, notes, _ = _normalise({**sheet, "register": register}, raw)
+    text_date = date_kept_as_text(sheet, reports.effective_mapping(sheet["profile"])) if default_date else None
+    if text_date:  # a "-" among the dates kept the column as text: read it as dates, day first
+        frame["date"] = text_dates(raw[text_date]).to_numpy()
+    # An add from the chat leaves out the rows that only add up those above them (a total, a bill's subtotal).
+    totals = total_rows(sheet, raw, reports.effective_mapping(sheet["profile"])) if default_date else []
+    if totals:
+        frame = frame[~frame["rowid"].isin(totals)].reset_index(drop=True)
     item_col, net_col = _item_columns(sheet, metal.register_columns(sheet))
     raw = raw.set_index("_rowid")
+    # Rows that are items of one bill become one row: the whole sheet for a list of items (one_bill_sheet), or, in an add
+    # from the chat, the item rows typed under a bill with its date, number and party left blank.
+    groups = bill_groups(frame, one_bill_sheet(sheet, default_date), join_items=default_date is not None)
+    joined_items: dict[int, tuple] = {}
+    joined_labels: dict[int, str] = {}
+    if any(len(group) > 1 for group in groups):
+        frame, joined_items, joined_labels = _join_rows(frame, raw, groups, item_col, net_col)
     service.get_company(company_id)  # "Company not found." before any work
     sales = register == "sales"
     states, problems = place_of_supply(sheet, sales)
+    problems += totals_note(totals)
     created, skipped, duplicates, bad_gstins = 0, 0, [], {}
+    filled = {"date": 0, "party": 0}
     with engine.begin() as conn:
         # First of all: an import of the same sheet running meanwhile (a double tap, the chat and the Books screen) is
         # waited for, and its rows are then found in `done` below instead of being posted again.
         service.lock_books(conn, company_id)
         company = service.get_company(company_id, conn)
         done = _imported_sources(conn, company_id, f"import:{sheet['table_name']}:")
+        # An add from the chat: bills dated before the books begin move the start back, in this same transaction.
+        books_start = fit_books_start(conn, company, [
+            pd.Timestamp(r.date).date() for r in frame.itertuples(index=False)
+            if not pd.isna(r.date) and f"import:{sheet['table_name']}:{r.rowid}" not in done]) if default_date else None
+        if books_start:
+            company = service.get_company(company_id, conn)
         in_books = existing_documents(conn, company_id, f"import:{sheet['table_name']}:")
         main_ledger = service.ensure_ledger(conn, company_id, "Sales" if sales else "Purchase",
                                             "Sales Accounts" if sales else "Purchase Accounts")
         known: dict = {}  # ledger ids looked up once per import (remembered_ledger)
         for row in frame.itertuples(index=False):
             source = f"import:{sheet['table_name']}:{row.rowid}"
-            label = f"row {row.rowid}" + (f" ({row.invoice_no})" if row.invoice_no else "")
+            label = joined_labels.get(row.rowid) or f"row {row.rowid}" + (f" ({row.invoice_no})" if row.invoice_no else "")
             if source in done:
                 skipped += 1
                 continue
-            if pd.isna(row.date):
+            undated, party = pd.isna(row.date), row.party
+            if undated and default_date is None:
                 problems.append(f"{label}: no date, not posted.")
                 continue
-            if row.party in ("(blank)", "(not given)"):
+            unnamed = party in ("(blank)", "(not given)")
+            if unnamed and not default_party:
                 problems.append(f"{label}: no customer/supplier name, not posted.")
                 continue
+            party = default_party if unnamed else party
             value = int(row.invoice_value)
             if value == 0:
                 problems.append(f"{label}: zero value, not posted.")
@@ -486,16 +712,18 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
             returned = value < 0
             vtype = ("Credit Note" if returned else "Sales") if sales else ("Debit Note" if returned else "Purchase")
             sign = -1 if returned else 1
-            day = pd.Timestamp(row.date).date()
+            day = default_date if undated else pd.Timestamp(row.date).date()
             # By GSTIN first, so a renamed or differently spelt party does not get a new, empty ledger.
             if already_in_books(in_books, vtype, row.invoice_no, day, None, [row.gstin]):
                 skipped += 1
                 duplicates.append(label)
                 continue
-            party_id = service.ensure_ledger(conn, company_id, row.party, "Sundry Debtors" if sales else "Sundry Creditors",
+            party_id = service.ensure_ledger(conn, company_id, party, "Sundry Debtors" if sales else "Sundry Creditors",
                                              gstin=row.gstin or None)
             is_party, saved_gstin = ledger_facts(conn, party_id)
-            if already_in_books(in_books, vtype, row.invoice_no, day, party_id, [saved_gstin], is_party, value):
+            # A filled-in party (Cash Supplier) is shared by many: there the date and value must match too, as for "Cash".
+            if already_in_books(in_books, vtype, row.invoice_no, day, party_id, [saved_gstin], is_party and not unnamed, value,
+                                dated=not undated):
                 skipped += 1
                 duplicates.append(label)
                 continue
@@ -503,16 +731,18 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
             heads = {h: sign * int(getattr(row, h)) for h in ("cgst", "sgst", "igst", "cess")}
             state, reported, used = party_state(conn, company, party_id, row.gstin, states.get(int(row.rowid)), label, problems)
             split_unsplit_gst(company, row.gstin, heads, sign * int(row.gst_unsplit), state)
-            check_reported_state(company, vtype, row.party, heads, state, reported, label, problems)
+            check_reported_state(company, vtype, party, heads, state, reported, label, problems)
             lines = posting_lines(conn, company_id, vtype, party_id, main_ledger, abs(value), taxable, heads, label, problems, known)
             number, reference = document_number(sales, row.invoice_no, label, problems)
-            item, net_mg = _item_summary(raw.loc[row.rowid], item_col, net_col)
+            item, net_mg = joined_items.get(row.rowid) or _item_summary(raw.loc[row.rowid], item_col, net_col)
             try:
                 with conn.begin_nested():
                     service.save_voucher(company_id, vtype, day, lines, number=number or None,
                                          reference=reference, narration=f"Imported from {sheet['sheet_name']}",
                                          source=source, conn=conn, items_text=item, net_mg=net_mg, company=company)
                 created += 1
+                filled["date"] += undated
+                filled["party"] += unnamed
                 note_bad_gstin(bad_gstins, row.gstin, label, used)
             except AccountsError as exc:
                 problems.append(number_clash(conn, in_books, vtype, number, day, label, str(exc)) or f"{label}: {exc}")
@@ -522,7 +752,8 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
         if before_commit:
             before_commit()
     return {"created": created, "skipped": skipped, "problems": problems + gstin_warnings(bad_gstins),
-            "notes": duplicates_note(duplicates, not sales) + [n["message"] for n in notes]}
+            "notes": duplicates_note(duplicates, not sales) + filled_notes(filled, default_date, default_party)
+            + [n["message"] for n in notes], "books_start": books_start}
 
 
 def refused(label: str, exc: Exception) -> str:

@@ -264,7 +264,7 @@ def rate_cut(conn, company: dict, party_id: int, metal: str, fine_mg: int, rate_
 
 # Role -> pattern on the column's snake_case name (first matching column wins).
 _COLUMNS = {
-    "fine": r"^(fine|gold_fine|fine_wt|fine_weight)$",
+    "fine": r"^(fine|gold_fine|fine_wt|fine_weight|pure_wt|pure_weight)$",  # "Pure Wt" on suppliers' item lists
     "silver_fine": r"^(sil_fine|silver_fine)$",
     "net": r"^(net_wt|net_weight|net|gold_std)$",
     "gross": r"^(gr_wt|gross_wt|gross_weight|gross)$",
@@ -277,8 +277,8 @@ _COLUMNS = {
     "stn_val": r"^(stn_val|stone_val|stone_value)$",
     "lbr_val": r"^(lbr_val|labour_val|labour_value|making_val|making_charges)$",
     "settle": r"^(wt_rs|wt_or_rs|settle|settlement)$",
-    "item": r"^(item_name|item|description|product)$",
-    "tag": r"^(tag_no|tag|huid)$",
+    "item": r"^(item_name|item|description|product|category)$",  # an item list's "Category": Ring, Pendant...
+    "tag": r"^(tag_no|tag|huid|jewel_code|item_code)$",
     "pieces": r"^(pc|pcs|pieces)$",
     "type": r"^(type|vch_type|voucher_type|trans_type)$",
 }
@@ -351,16 +351,20 @@ def _value(row, column: str | None):
     return None if value is None or (not isinstance(value, str) and pd.isna(value)) else value
 
 
-def import_jewellery(company_id: int, sheet: dict, register: str, before_commit: Callable[[], None] | None = None) -> dict:
+def import_jewellery(company_id: int, sheet: dict, register: str, before_commit: Callable[[], None] | None = None,
+                     default_date: date | None = None, default_party: str | None = None) -> dict:
     """Post a jewellery register: one voucher per invoice (date + voucher no. + party), rupees for the
     billed value and metal lines for every item's fine weight. Each item's net and fine weight are
     re-computed and any difference from the register is reported (the register's figure is posted).
-    Each voucher also keeps its rows' item names and net weight for the voucher list. ``before_commit``: as in
-    imports.import_register."""
+    Each voucher also keeps its rows' item names and net weight for the voucher list. ``before_commit``,
+    ``default_date`` and ``default_party``: as in imports.import_register; with them, a list of items that has no date,
+    bill number or party column at all (a packing list) is one bill."""
     from ..books import _normalise  # rupee columns: taxable value, GST, invoice value, party, GSTIN
     from .imports import (_imported_sources, already_in_books, check_reported_state, document_number, duplicates_note,
-                          existing_documents, gstin_warnings, ledger_facts, note_bad_gstin, note_register, number_clash,
-                          party_state, place_of_supply, posting_lines, refused, remembered_ledger, split_unsplit_gst)
+                          date_kept_as_text, existing_documents, filled_notes, fit_books_start, gstin_warnings, item_row,
+                          ledger_facts, note_bad_gstin, note_register, number_clash, party_state, place_of_supply,
+                          posting_lines, refused, remembered_ledger, split_unsplit_gst, text_dates, total_rows,
+                          totals_note)
 
     cols = detect_jewellery(sheet)
     if cols is None:
@@ -377,20 +381,35 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
                  ["The register has only weights (no rupee column such as Taxable Value, Invoice Total, Metal Value or Labour Value), "
                   "so only fine metal was posted and no rupees. Bill the rupees by a rate cut or a separate invoice."])
     has_rupees = bool(any(money[c].abs().sum() for c in ("taxable", "invoice_value")))
-    money = money.set_index("rowid")
+    text_date = date_kept_as_text(sheet, mapping) if default_date else None
+    if text_date:  # a "-" among the dates kept the column as text: read it as dates, day first
+        money["date"] = text_dates(load_frame(sheet)[text_date]).to_numpy()
+    # An add from the chat leaves out the rows that only add up those above them (a total, a bill's subtotal).
+    totals = total_rows(sheet, load_frame(sheet), mapping) if default_date else []
+    money = money[~money["rowid"].isin(totals)].set_index("rowid")
     states, problems = place_of_supply(sheet, register == "sales")
+    problems += totals_note(totals)
     raw = load_frame(sheet).set_index("_rowid")
     service.get_company(company_id)  # "Company not found." before any work
     default_vtype = "Sales" if register == "sales" else "Purchase"
     created, skipped, duplicates, bad_gstins, moved = 0, 0, [], {}, {"gold": 0, "silver": 0}
     checked = {"net": 0, "fine": 0, "total": 0}
+    filled = {"date": 0, "party": 0}
+    # A list of items with none of date, bill number and party (filled in by the chat's add): one bill for the sheet.
+    one_bill = default_date is not None and not any(role in mapping for role in ("date", "voucher_no", "account"))
 
     # Invoices: consecutive rows sharing date, voucher number, party and type.
     keys = []
     for rowid in money.index:
         r, m = raw.loc[rowid], money.loc[rowid]
         doc = str(_value(r, cols.get("type")) or "").strip().lower()
-        keys.append((m.date, m.invoice_no or f"row{rowid}", m.party, doc))
+        # "rows": not a bill number (unnumbered keys start with "row"); None, not NaT, so the rows' keys are equal.
+        if one_bill:
+            keys.append((None, "rows", "(not given)", doc))
+        elif default_date is not None and keys and item_row(m.date, m.invoice_no, m.party):
+            keys.append(keys[-1])  # an item typed under the bill above it (date, number and party blank): that bill
+        else:
+            keys.append((m.date, m.invoice_no or f"row{rowid}", m.party, doc))
     groups: list[tuple[tuple, list[int]]] = []
     for key, rowid in zip(keys, money.index):
         if groups and groups[-1][0] == key:
@@ -402,6 +421,12 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
         service.lock_books(conn, company_id)  # as in imports.import_register: the same sheet imported at once waits
         company = service.get_company(company_id, conn)
         done = _imported_sources(conn, company_id, f"import:{sheet['table_name']}:")
+        # An add from the chat: bills dated before the books begin move the start back, in this same transaction.
+        books_start = fit_books_start(conn, company, [
+            pd.Timestamp(day).date() for (day, *_rest), rowids in groups
+            if not pd.isna(day) and f"import:{sheet['table_name']}:{rowids[0]}" not in done]) if default_date else None
+        if books_start:
+            company = service.get_company(company_id, conn)
         in_books = existing_documents(conn, company_id, f"import:{sheet['table_name']}:")
         known: dict = {}  # ledger ids looked up once per import (imports.remembered_ledger)
         for (day, number, party, doc), rowids in groups:
@@ -411,12 +436,14 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
             if source in done:
                 skipped += 1
                 continue
-            if pd.isna(day):
+            undated, unnamed = pd.isna(day), party in ("(blank)", "(not given)")
+            if undated and default_date is None:
                 problems.append(f"{label}: no date, not posted.")
                 continue
-            if party in ("(blank)", "(not given)"):
+            if unnamed and not default_party:
                 problems.append(f"{label}: no party name, not posted.")
                 continue
+            day, party = (default_date if undated else day), (default_party if unnamed else party)
             vtype = _DOC_TYPES.get(doc, default_vtype) if doc else default_vtype
             if doc and doc not in _DOC_TYPES:
                 problems.append(f"{label}: type {doc!r} not understood; posted as {default_vtype}.")
@@ -433,7 +460,9 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
                                              gstin=first.gstin or None)
             is_party, saved_gstin = ledger_facts(conn, party_id)
             value = abs(sum(int(money.loc[rowid].invoice_value) for rowid in rowids))
-            if numbered and already_in_books(in_books, vtype, str(number), on_day, party_id, [saved_gstin], is_party, value):
+            # A filled-in party (Cash Customer) is shared by many: there the date and value must match too, as for "Cash".
+            if numbered and already_in_books(in_books, vtype, str(number), on_day, party_id, [saved_gstin], is_party and not unnamed,
+                                             value, dated=not undated):
                 skipped += 1
                 duplicates.append(label)
                 continue
@@ -555,6 +584,8 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
                                          source=source, conn=conn, metal=metal, items_text="\n".join(names) or None,
                                          net_mg=weight or None, company=company)
                 created += 1
+                filled["date"] += undated
+                filled["party"] += unnamed
                 note_bad_gstin(bad_gstins, first.gstin, label, used)
                 for line in metal:
                     if line.details:
@@ -571,17 +602,19 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
     problems += gstin_warnings(bad_gstins)
     if not created:
         every = groups and skipped == len(groups)  # not when some invoice was refused: that one is not in the books
-        return {"created": 0, "skipped": skipped, "problems": problems,
+        return {"created": 0, "skipped": skipped, "problems": problems, "books_start": books_start,
                 "notes": (["Every invoice in this sheet is already in the books; nothing new was posted."] if every else []) + already}
-    summary = [f"Read as a jewellery register: one voucher per invoice, metal posted by fine weight "
-               f"({', '.join(f'{_g(mg)} fine {name}' for name, mg in moved.items() if mg) or 'no metal'})."]
+    summary = [f"Read as a jewellery register: {'one bill for the whole list of items' if one_bill else 'one voucher per invoice'}, "
+               f"metal posted by fine weight ({', '.join(f'{_g(mg)} fine {name}' for name, mg in moved.items() if mg) or 'no metal'})."]
+    summary += filled_notes(filled, default_date, default_party)
     summary.append(f"Checked every row: net = gross − (diamond + stone ct) × 0.2 on {checked['net']} rows, "
                    f"fine = net × tunch ÷ 100 on {checked['fine']}, value = metal + diamonds + stones + labour on {checked['total']}.")
     # abs(): returns entered with minus signs would otherwise cancel the sales' GST in the sum.
     if has_rupees and not any(money[h].abs().sum() for h in ("cgst", "sgst", "igst", "gst_unsplit")):
         summary.append("The register has no GST amounts, so the invoices were posted without tax. If GST applies (3% on jewellery), "
                        "it is not in the books yet.")
-    return {"created": created, "skipped": skipped, "problems": problems, "notes": already + summary + notes}
+    return {"created": created, "skipped": skipped, "problems": problems, "notes": already + summary + notes,
+            "books_start": books_start}
 
 
 # --- Reports -------------------------------------------------------------------------------------------

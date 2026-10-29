@@ -14,17 +14,17 @@ from concurrent.futures import TimeoutError as FutureTimeout  # the builtin Time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 from starlette.formparsers import MultiPartParser
 
 from datetime import date
 
-from . import analysis, books, classify, cloud, config, database, detect, editing, llm, mongo_sync, reports
+from . import analysis, books, classify, cloud, config, database, detect, editing, llm, mongo_sync, reports, voice
 from .accounts import api as accounts_api
 from .accounts import db as _accounts_tables  # noqa: F401  (registers the books tables before create_all)
 from .accounts import imports as accounts_imports
@@ -35,7 +35,7 @@ from .duck import Session, cached, sheet_key
 from .excel_loader import UploadError, read_workbook
 from .llm import followups
 from .llm.books_data import books_tables
-from .llm.common import describe_tables, says_register, warm_tables
+from .llm.common import describe_tables, warm_tables
 from .schemas import (
     AddRowRequest,
     AnalysisRequest,
@@ -653,6 +653,19 @@ def warm_ai():
         threading.Thread(target=llm.gpt.warm_up, daemon=True).start()
 
 
+@app.post("/api/voice/call")
+async def voice_call(request: Request):
+    """The voice agent: the app's WebRTC offer (SDP text) in, OpenAI's SDP answer out (voice.answer)."""
+    body = await request.body()
+    if len(body) > voice.MAX_SDP_BYTES:
+        raise HTTPException(status_code=413, detail="That voice call offer is too large.")
+    try:
+        sdp = await asyncio.to_thread(voice.answer, body.decode("utf-8", "replace"))
+    except voice.VoiceError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from None
+    return Response(content=sdp, media_type="application/sdp")
+
+
 # A sheet counts as a register (stacked into "registers" and compared) only when detected with confidence:
 # a low-confidence guess, such as an invoice sheet inside a ledger workbook, would change every total.
 _CONFIDENT = ("high", "medium")
@@ -773,13 +786,12 @@ def _books_company(company_id: int | None, sheets: list[dict]) -> int | None:
     return _company_for(company_id)
 
 
-def _pending_registers(found: list[dict], company_id: int | None, messages: list[dict]) -> list[dict]:
+def _pending_registers(found: list[dict], company_id: int | None) -> list[dict]:
     """Shared sheets that are (or may be) a sales or purchase register and are not in the company's books yet (nor
-    imported as a register already, whatever that import posted), while the person's latest message does not say which
-    register: the answer asks, and the app shows a button for each register. Only with a company. The suggestion is the
-    detected register when it is fairly sure and nothing points the other way."""
-    previous = messages[-2]["content"] if len(messages) > 1 and messages[-2]["role"] == "assistant" else ""
-    if company_id is None or says_register(messages[-1]["content"], llm.strip_context(previous)):
+    imported as a register already, whatever that import posted): unless the answer adds them (the person asked, as the
+    intent check reads), it offers to, and the app shows a button for each register. Only with a company. The suggestion
+    is the detected register when it is fairly sure and nothing points the other way."""
+    if company_id is None:
         return []
     candidates = [f for f in found if f["kind"] in books.REGISTERS]
     tables = [f["table_name"] for f in candidates]
@@ -798,12 +810,12 @@ def files_chat_stream(body: FilesChatRequest):
     books_company = _books_company(body.company_id, [{}])
 
     def answer(emit, cancel):
-        pending = _pending_registers(found, company_id, messages)
+        pending = _pending_registers(found, company_id)
         books = books_tables(books_company) if books_company is not None else {}
         if not registers:
             return llm.chat(body.provider, messages, sheets, books or None, emit=emit, fresh=body.fresh,
                             documents=documents_text, cancel=cancel, company_id=company_id, pending=pending,
-                            bill_company_id=books_company)
+                            bill_company_id=books_company, files=found)
         table, comparison = _register_jobs(registers)
         wait = _waiter(emit, cancel)
         stacked = wait(table)
@@ -811,7 +823,7 @@ def files_chat_stream(body: FilesChatRequest):
         # The app's exact comparison of the two registers, read only when the answer is not remembered.
         return llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh, documents=documents_text,
                         combined=(lambda: wait(comparison)) if stacked else None, cancel=cancel, company_id=company_id,
-                        pending=pending, bill_company_id=books_company)
+                        pending=pending, bill_company_id=books_company, files=found)
 
     return _stream_chat(answer)
 

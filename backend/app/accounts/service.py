@@ -311,6 +311,30 @@ def update_company(company_id: int, **values) -> dict:
     return get_company(company_id)
 
 
+def move_books_start_back(company_id: int, start: date, conn=None) -> bool:
+    """Move the books-start date back to ``start`` so that earlier bills can be posted (an add from the chat, asked for on
+    2026-10-28 not to stop at such a date). Only the opening balances are dated by it, so it moves only while the company
+    has none (rupees or metal); the entries already made all come after the old start, so after the new one too. False
+    when the books already begin on or before ``start``, or there are opening balances (the person's to change).
+    ``conn``: the posting's own transaction, so a stopped or failed add leaves the date as it was."""
+    if conn is None:
+        with engine.begin() as own:
+            return move_books_start_back(company_id, start, own)
+    lock_books(conn, company_id)  # no voucher or opening balance is saved between the checks and the change
+    before = get_company(company_id, conn)
+    if not before["fy_start"] or start >= before["fy_start"]:
+        return False
+    rupees = conn.execute(select(func.count()).select_from(ledgers).where(and_(
+        ledgers.c.company_id == company_id, ledgers.c.opening_paise != 0))).scalar_one()
+    metal = conn.execute(select(func.count()).select_from(metal_openings.join(ledgers, metal_openings.c.ledger_id == ledgers.c.id))
+                         .where(and_(ledgers.c.company_id == company_id, metal_openings.c.opening_mg != 0))).scalar_one()
+    if rupees or metal:
+        return False
+    conn.execute(update(companies).where(companies.c.id == company_id).values(fy_start=start))
+    _audit(conn, company_id, "update", "company", company_id, before, {"fy_start": start})
+    return True
+
+
 def list_ledgers(company_id: int) -> list[dict]:
     def load() -> list[dict]:
         with connect() as conn:
