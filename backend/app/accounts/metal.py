@@ -294,6 +294,13 @@ def register_columns(sheet: dict) -> dict[str, str]:
         hit = next((n for n in names if re.match(pattern, n) and n not in found.values()), None)
         if hit:
             found[role] = hit
+    # A supplier's packing list heads its diamond and stone sections "Diamond" and "Stone" in a row above Shape, Size,
+    # Pcs, Wt, Rate, Amt (that row is not kept): after Shape, the first Wt right after a Pcs is the diamonds' carats and
+    # the second the stones'.
+    if "shape" in names and "dia_wt" not in found and "stn_wt" not in found:
+        after = names[names.index("shape"):]
+        weights = [n for i, n in enumerate(after) if i and re.match(r"^wt(_\d+)?$", n) and re.match(r"^pcs(_\d+)?$", after[i - 1])]
+        found.update(zip(("dia_wt", "stn_wt"), weights))
     return found
 
 
@@ -351,6 +358,28 @@ def _value(row, column: str | None):
     return None if value is None or (not isinstance(value, str) and pd.isna(value)) else value
 
 
+def _lines_under_items(raw: pd.DataFrame, cols: dict[str, str], rowids: list[int]) -> dict[int, tuple[int, int]]:
+    """Diamond and stone carats (thousandths) on rows with no weight, item or tag of their own, by the item row above
+    them: a packing list puts each item's diamond and stone lines on the rows under it."""
+    if "dia_wt" not in cols and "stn_wt" not in cols:
+        return {}
+    carried: dict[int, tuple[int, int]] = {}
+    item = None
+    for rowid in rowids:
+        r = raw.loc[rowid]
+        if any(_value(r, cols.get(k)) is not None for k in ("gross", "net", "fine", "silver_fine", "item", "tag")):
+            item = rowid
+            continue
+        try:
+            dia, stn = to_mct(_value(r, cols.get("dia_wt")), "Diamond carats"), to_mct(_value(r, cols.get("stn_wt")), "Stone carats")
+        except AccountsError:
+            continue
+        if item is not None and (dia or stn):
+            before = carried.get(item, (0, 0))
+            carried[item] = (before[0] + dia, before[1] + stn)
+    return carried
+
+
 def import_jewellery(company_id: int, sheet: dict, register: str, before_commit: Callable[[], None] | None = None,
                      default_date: date | None = None, default_party: str | None = None) -> dict:
     """Post a jewellery register: one voucher per invoice (date + voucher no. + party), rupees for the
@@ -388,7 +417,6 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
     totals = total_rows(sheet, load_frame(sheet), mapping) if default_date else []
     money = money[~money["rowid"].isin(totals)].set_index("rowid")
     states, problems = place_of_supply(sheet, register == "sales")
-    problems += totals_note(totals)
     raw = load_frame(sheet).set_index("_rowid")
     service.get_company(company_id)  # "Company not found." before any work
     default_vtype = "Sales" if register == "sales" else "Purchase"
@@ -482,13 +510,14 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
             # lines with the same details, and a row with no fine (a loose diamond, say) posts none.
             names: list[str] = []
             weight = 0
+            under = _lines_under_items(raw, cols, rowids)
             for rowid in rowids:
                 r, m = raw.loc[rowid], money.loc[rowid]
                 where = f"row {rowid}"
                 try:
                     gross = to_mg(_value(r, cols.get("gross")), "Gross weight")
-                    dia = to_mct(_value(r, cols.get("dia_wt")), "Diamond carats")
-                    stn = to_mct(_value(r, cols.get("stn_wt")), "Stone carats")
+                    dia = to_mct(_value(r, cols.get("dia_wt")), "Diamond carats") + under.get(rowid, (0, 0))[0]
+                    stn = to_mct(_value(r, cols.get("stn_wt")), "Stone carats") + under.get(rowid, (0, 0))[1]
                     net = to_mg(_value(r, cols.get("net")), "Net weight")
                     tunch = to_bp(_value(r, cols.get("tunch")), "Tunch") if _value(r, cols.get("tunch")) is not None else None
                     fines = {"gold": to_mg(_value(r, cols.get("fine")), "Fine"), "silver": to_mg(_value(r, cols.get("silver_fine")), "Silver fine")}
@@ -606,7 +635,7 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
                 "notes": (["Every invoice in this sheet is already in the books; nothing new was posted."] if every else []) + already}
     summary = [f"Read as a jewellery register: {'one bill for the whole list of items' if one_bill else 'one voucher per invoice'}, "
                f"metal posted by fine weight ({', '.join(f'{_g(mg)} fine {name}' for name, mg in moved.items() if mg) or 'no metal'})."]
-    summary += filled_notes(filled, default_date, default_party)
+    summary += filled_notes(filled, default_date, default_party) + totals_note(totals)
     summary.append(f"Checked every row: net = gross − (diamond + stone ct) × 0.2 on {checked['net']} rows, "
                    f"fine = net × tunch ÷ 100 on {checked['fine']}, value = metal + diamonds + stones + labour on {checked['total']}.")
     # abs(): returns entered with minus signs would otherwise cancel the sales' GST in the sum.

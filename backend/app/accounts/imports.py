@@ -533,6 +533,11 @@ def total_rows(sheet: dict, raw: pd.DataFrame, mapping: dict[str, str]) -> list[
     """Rows (ids) that only add up the rows above them: a grand total, or a bill's subtotal ("Bill Total"). Such a row
     has no date, bill number or party; its text cells are blank or say "total"; and each of its figures (rates and
     purities aside) equals the sum of the rows since its bill began, or since the last total, over two rows or more.
+    As in a supplier's packing list (each item's subtotal under its diamond lines, a grand total at the end), a row with
+    at least two matching figures still counts when the others are in columns blank on every row added up (an amount
+    worked out only on the total row, such as the diamonds' value), or at most half as many as match are off (the
+    supplier's subtotal of fine weight at another tunch); and a grand total under subtotals adds up the rows since the
+    last grand total, the subtotals left out.
     An add from the chat leaves them out, so they are neither posted as bills nor joined into the bill above."""
     kinds = {c["name"]: c["kind"] for c in sheet["profile"]["columns"]}
     keys = [mapping[role] for role in ("date", "voucher_no", "account") if mapping.get(role) in raw]
@@ -548,9 +553,19 @@ def total_rows(sheet: dict, raw: pd.DataFrame, mapping: dict[str, str]) -> list[
         except (TypeError, ValueError):
             return 0.0
 
+    def adds_up(values: dict[str, float], sums: dict[str, float], count: int) -> bool:
+        if count < 2:
+            return False
+        matched = [c for c, v in values.items() if abs(v - sums[c]) <= _SUM_TOLERANCE]
+        off = [c for c in values if c not in matched and sums[c]]
+        if len(matched) == len(values):
+            return True
+        return len(matched) >= max(2, 2 * len(off))
+
     found: list[int] = []
     since_bill, bill_rows = dict.fromkeys(numbers, 0.0), 0
     since_total, total_rows_seen = dict.fromkeys(numbers, 0.0), 0
+    since_grand, grand_rows = dict.fromkeys(numbers, 0.0), 0  # not reset by a subtotal
     for record in raw.to_dict("records"):
         # "Grand Total" typed in the Date or Customer column labels the row: it does not start a bill.
         labels = [str(record[k]) for k in keys if not blank(record[k]) and _TOTAL_WORD.search(str(record[k]))]
@@ -559,23 +574,33 @@ def total_rows(sheet: dict, raw: pd.DataFrame, mapping: dict[str, str]) -> list[
             since_bill, bill_rows = dict.fromkeys(numbers, 0.0), 0
         words = labels + [str(record[c]) for c in texts if not blank(record[c])]
         values = {c: figure(record[c]) for c in numbers if figure(record[c])}
-        if not starts and values and (not words or any(_TOTAL_WORD.search(w) for w in words)) and any(
-                count >= 2 and all(abs(v - sums[c]) <= _SUM_TOLERANCE for c, v in values.items())
-                for sums, count in ((since_bill, bill_rows), (since_total, total_rows_seen))):
-            found.append(int(record["_rowid"]))
-            since_bill, bill_rows = dict.fromkeys(numbers, 0.0), 0
-            since_total, total_rows_seen = dict.fromkeys(numbers, 0.0), 0
-            continue
+        if not starts and values and (not words or any(_TOTAL_WORD.search(w) for w in words)):
+            subtotal = adds_up(values, since_bill, bill_rows) or adds_up(values, since_total, total_rows_seen)
+            if subtotal or adds_up(values, since_grand, grand_rows):
+                found.append(int(record["_rowid"]))
+                since_bill, bill_rows = dict.fromkeys(numbers, 0.0), 0
+                since_total, total_rows_seen = dict.fromkeys(numbers, 0.0), 0
+                if not subtotal:
+                    since_grand, grand_rows = dict.fromkeys(numbers, 0.0), 0
+                continue
         for c in numbers:
             since_bill[c] += figure(record[c])
             since_total[c] += figure(record[c])
+            since_grand[c] += figure(record[c])
         bill_rows += 1
         total_rows_seen += 1
+        grand_rows += 1
     return found
 
 
 def totals_note(rowids: list[int]) -> list[str]:
-    return [f"row {rowid}: only adds up the rows above it (a total), not posted." for rowid in rowids]
+    """The total rows an add from the chat left out, as one note (a packing list has a subtotal under every item)."""
+    if not rowids:
+        return []
+    shown = ", ".join(str(rowid) for rowid in rowids[:3]) + (f" and {len(rowids) - 3} more" if len(rowids) > 3 else "")
+    if len(rowids) == 1:
+        return [f"1 row ({shown}) only adds up the rows above it (a total), so it was left out."]
+    return [f"{len(rowids)} rows ({shown}) only add up the rows above them (subtotals or a total), so they were left out."]
 
 
 def item_row(date_value, number, party) -> bool:
@@ -671,7 +696,6 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
     service.get_company(company_id)  # "Company not found." before any work
     sales = register == "sales"
     states, problems = place_of_supply(sheet, sales)
-    problems += totals_note(totals)
     created, skipped, duplicates, bad_gstins = 0, 0, [], {}
     filled = {"date": 0, "party": 0}
     with engine.begin() as conn:
@@ -753,7 +777,7 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
             before_commit()
     return {"created": created, "skipped": skipped, "problems": problems + gstin_warnings(bad_gstins),
             "notes": duplicates_note(duplicates, not sales) + filled_notes(filled, default_date, default_party)
-            + [n["message"] for n in notes], "books_start": books_start}
+            + totals_note(totals) + [n["message"] for n in notes], "books_start": books_start}
 
 
 def refused(label: str, exc: Exception) -> str:

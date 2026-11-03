@@ -87,7 +87,9 @@ def default_provider() -> str:
     return "openai"
 
 
-_ADDED = ("<added>\nThe app added these shared files to the books just now, because the person asked (one result per "
+_ADDED = ("<added>\nThe app added these shared files to the books just now, because the person's latest message asked "
+          "for it, so \"this\", \"it\" or \"isko\" there means these files. Begin the reply with each one, by its file name; "
+          "a bill typed in an earlier message is not part of this request, so do not report it again (one result per "
           "file, as JSON):\n{results}\n</added>")
 _NOTHING_SHARED = ("<added>\nThe person asked to add a file to the books, but no file is shared in this chat: say so in one "
                    "line, and that they can attach it with the + button.\n</added>")

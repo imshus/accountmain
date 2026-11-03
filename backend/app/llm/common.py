@@ -81,7 +81,7 @@ How to work:
 
 Adding to the books:
 - The app itself reads, in any language, whether the person's latest message asks to add a shared file or a bill they typed to sales or purchases, and adds it: shared files before you answer (listed in <added>), a typed bill through add_bill, which you are given only when they asked. Never ask them to confirm, never ask "sales or purchase?", and never say something was added that <added> or add_bill does not show.
-- For each file in <added>, say in the person's language how many entries were added and how many were already in the books, exactly as given, and its problems briefly (what went wrong, and how many problems in all), without row numbers. Never invent counts. Its notes say when to add one short line: the register the app chose from the file (and why), a file that looks like the other register, the books-start date moved, or bills dated today or put under a customer or supplier because the file had none.
+- For each file in <added>, say in the person's language how many entries were added and how many were already in the books, exactly as given, and its problems briefly (what went wrong, and how many problems in all), without row numbers. Never invent counts. Its notes say when to add one short line: the register the app chose from the file (and why), a file that looks like the other register, the books-start date moved, bills dated today or put under a customer or supplier because the file had none, or total rows left out (with their count; they are not problems).
 - When <documents> lists shared files as "Not in the books yet" and nothing was added, end with ONE short line in the person's language offering to add them, e.g. "Isko Sales ya Purchase me add karna ho to neeche button dabayein ya likh dein."; the app shows Sales and Purchase buttons under it.
 
 Follow-up questions:
@@ -651,8 +651,10 @@ BILL_TOOL_DESCRIPTION = (
 _BILL_FIELDS = {  # name -> (JSON type, description)
     "register": ("string", "sales for a bill to a customer, purchases for a bill from a supplier: as the person said, else "
                            "from their wording (bought from someone: purchases; sold to someone: sales), else sales."),
-    "party": ("string", "Customer (sales) or supplier (purchases) name, as typed; empty when not given (the bill is "
-                        "then a cash sale or purchase, posted to Cash)."),
+    "party": ("string", "Customer (sales) or supplier (purchases) the person named, as typed, in any wording or language: "
+                        "\"from X\", \"X se\", \"to X\", \"X ko\", \"X ka\", \"X ke naam\", \"in X\" or \"X me\" (in X's "
+                        "account); e.g. \"purchase of necklace in trpl\": trpl. Empty only when no one is named (the bill "
+                        "is then a cash sale or purchase, posted to Cash)."),
     "item": ("string", "Item name, e.g. Ring, Chain, Bangle."),
     "gross_g": ("number|null", "Gross weight in grams; null when not given."),
     "purity_pct": ("number|null", "Purity / tunch in percent, e.g. 91.6 for 22K, 75 for 18K, 58.5 for 14K; null when not given "
