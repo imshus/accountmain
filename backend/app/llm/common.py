@@ -80,7 +80,7 @@ How to work:
 - If the data cannot answer the question, say so and say what is missing rather than guessing.
 
 Adding to the books:
-- The app itself reads, in any language, whether the person's latest message asks to add a shared file or a bill they typed to sales or purchases, and adds it: shared files before you answer (listed in <added>), a typed bill through add_bill, which you are given only when they asked. Never ask them to confirm, never ask "sales or purchase?", and never say something was added that <added> or add_bill does not show.
+- The app itself reads, in any language, whether the person's latest message asks to add a shared file or a bill they typed to sales or purchases, and adds it: shared files before you answer (listed in <added>), a typed bill through add_bill, which you are given only when they asked. Never ask them to confirm and never ask "sales or purchase?"; ask only for what <needs> lists (a file's missing date or customer / supplier). Never say something was added that <added> or add_bill does not show.
 - For each file in <added>, say in the person's language how many entries were added and how many were already in the books, exactly as given, and its problems briefly (what went wrong, and how many problems in all), without row numbers. Never invent counts. Its notes say when to add one short line: the register the app chose from the file (and why), a file that looks like the other register, the books-start date moved, bills dated today or put under a customer or supplier because the file had none, or total rows left out (with their count; they are not problems).
 - When <documents> lists shared files as "Not in the books yet" and nothing was added, end with ONE short line in the person's language offering to add them, e.g. "Isko Sales ya Purchase me add karna ho to neeche button dabayein ya likh dein."; the app shows Sales and Purchase buttons under it.
 
@@ -436,6 +436,11 @@ FORMULA_PARAMS = {
 
 BOOKS_REGISTERS = ("sales", "purchases")
 _PROBLEMS_SHOWN_TO_MODEL = 10
+# The upload's warnings about the sheet's own reports when it has no date or party column: untrue of the books once the
+# chat's add has given each bill a date and a party (its notes say which), so not passed on.
+_SHEET_REPORT_NOTE = re.compile(r"no (date|customer/supplier) column chosen")
+
+
 def _books_start_note(moved: dict) -> str:
     return (f"The books began on {moved['from']:%d/%m/%Y}; they now begin on {moved['to']:%d/%m/%Y} (the start of the "
             "financial year of the earliest bill), so the bills fit. Say so in one short line.")
@@ -985,13 +990,22 @@ class Toolbox:
         kind = self.detected(table)[1]["kind"]
         return kind if kind in BOOKS_REGISTERS else "sales"
 
-    def add_to_books(self, table: str, register: str | None = None, party: str | None = None) -> str:
+    def missing_details(self, table: str, register: str | None = None) -> dict:
+        """How many of the bills adding the shared sheet would post have no date, or no customer or supplier, of their
+        own ({"bills", "skipped", "date", "party"}): the add is rehearsed and rolled back, nothing is posted."""
+        self.check_cancelled()
+        self.added_to_books = True  # the books can change before it is asked again: never remembered
+        self.emit({"type": "step", "text": "Checking the file for missing dates and names…"})
+        return books_imports.missing_details(self.company_id, self.sheets[table], self.register_for(table, register))
+
+    def add_to_books(self, table: str, register: str | None = None, party: str | None = None, day=None) -> str:
         """Post a shared sheet to the company's books as POST /api/companies/{id}/import/register does; return the
-        counts as JSON for the model. The app calls it when the intent check read a request to add the sheet (asking
-        nothing): ``register`` is the one the person said, which wins over what the file looks like; None (they said
-        neither) takes the sheet's detected register, or sales when it points to neither. Nothing missing stops a bill:
-        one with no date is dated today, one with no customer or supplier is under ``party`` (the one the person or the
-        file name gave), else a cash party. Raises EditError/AccountsError on failure."""
+        counts as JSON for the model. The app calls it when the intent check read a request to add the sheet:
+        ``register`` is the one the person said, which wins over what the file looks like; None (they said neither)
+        takes the sheet's detected register, or sales when it points to neither. A bill with no date is dated ``day``
+        (the date the person gave, else today), one with no customer or supplier is under ``party`` (the one the person
+        or the file name gave), else a cash party; what was filled in is then written into the uploaded sheet too.
+        Raises EditError/AccountsError on failure."""
         from datetime import date as _date
 
         self.check_cancelled()
@@ -1015,14 +1029,25 @@ class Toolbox:
             if (table, register) in self._book_replies:
                 return self._book_replies[(table, register)]
             self.emit({"type": "step", "text": f"Adding {filename} ({sheet['sheet_name']}) to the books as {register}…"})
+            day, party = day or _date.today(), party or CASH_PARTY[register]
+            party = party.title() if party.islower() else party  # "dummy", "khanak jewellers": saved as a name is written
             try:
                 # Stopped before the import commits: nothing is posted, as the person expects.
                 result = books_imports.import_register(self.company_id, sheet, register, before_commit=self.check_cancelled,
-                                                       default_date=_date.today(), default_party=party or CASH_PARTY[register])
+                                                       default_date=day, default_party=party)
             except AccountsError:
                 raise
             except Exception as exc:  # a KeyError here is the import's, not a wrong argument: say so to the model
                 raise AccountsError(f"The import failed ({type(exc).__name__}: {exc}).") from exc
+            filled = result.get("filled") or {}
+            written = []
+            if result["created"] and (filled.get("date") or filled.get("party")):
+                try:  # the bills are in the books either way: a sheet that could not be written is only mentioned
+                    written = books_imports.write_details(self.company_id, sheet, register, day if filled.get("date") else None,
+                                                          party if filled.get("party") else None)
+                except Exception as exc:  # noqa: BLE001
+                    written = [f"The uploaded sheet could not be updated with the date and name ({type(exc).__name__}); "
+                               "the bills are in the books."]
             problems = list(result["problems"])
             self.imports.append({"register": register, "dataset_id": sheet["dataset_id"], "table": table, "filename": filename,
                                  "sheet": sheet["sheet_name"], "created": result["created"], "skipped": result["skipped"],
@@ -1044,7 +1069,7 @@ class Toolbox:
                 "skipped": result["skipped"],
                 "problems": problems[:_PROBLEMS_SHOWN_TO_MODEL],
                 "more_problems": max(0, len(problems) - _PROBLEMS_SHOWN_TO_MODEL),
-                "notes": result["notes"],
+                "notes": [note for note in result["notes"] if not _SHEET_REPORT_NOTE.search(note)] + written,
             }, ensure_ascii=False, default=str)
         self.emit({"type": "step", "text": f"Added {result['created']} entries to the books ({result['skipped']} already there)"})
         return reply

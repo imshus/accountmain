@@ -381,13 +381,14 @@ def _lines_under_items(raw: pd.DataFrame, cols: dict[str, str], rowids: list[int
 
 
 def import_jewellery(company_id: int, sheet: dict, register: str, before_commit: Callable[[], None] | None = None,
-                     default_date: date | None = None, default_party: str | None = None) -> dict:
+                     default_date: date | None = None, default_party: str | None = None, rehearse: bool = False) -> dict:
     """Post a jewellery register: one voucher per invoice (date + voucher no. + party), rupees for the
     billed value and metal lines for every item's fine weight. Each item's net and fine weight are
     re-computed and any difference from the register is reported (the register's figure is posted).
     Each voucher also keeps its rows' item names and net weight for the voucher list. ``before_commit``,
-    ``default_date`` and ``default_party``: as in imports.import_register; with them, a list of items that has no date,
-    bill number or party column at all (a packing list) is one bill."""
+    ``default_date``, ``default_party`` and ``rehearse``: as in imports.import_register; with the defaults, a list of
+    items that has no date, bill number or party column at all (a packing list) is one bill."""
+    from .imports import Rehearsal
     from ..books import _normalise  # rupee columns: taxable value, GST, invoice value, party, GSTIN
     from .imports import (_imported_sources, already_in_books, check_reported_state, document_number, duplicates_note,
                           date_kept_as_text, existing_documents, filled_notes, fit_books_start, gstin_warnings, item_row,
@@ -623,6 +624,8 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
                 problems.append(number_clash(conn, in_books, vtype, num, on_day, label, str(exc)) or f"{label}: {exc}")
             except (DataError, IntegrityError) as exc:  # only this invoice's savepoint is rolled back; the import goes on
                 problems.append(refused(label, exc))
+        if rehearse:  # rolled back with the transaction
+            raise Rehearsal({"bills": created, "skipped": skipped, **filled})
         note_register(conn, company_id, sheet["table_name"], register)
         if before_commit:
             before_commit()
@@ -631,7 +634,7 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
     problems += gstin_warnings(bad_gstins)
     if not created:
         every = groups and skipped == len(groups)  # not when some invoice was refused: that one is not in the books
-        return {"created": 0, "skipped": skipped, "problems": problems, "books_start": books_start,
+        return {"created": 0, "skipped": skipped, "problems": problems, "books_start": books_start, "filled": dict(filled),
                 "notes": (["Every invoice in this sheet is already in the books; nothing new was posted."] if every else []) + already}
     summary = [f"Read as a jewellery register: {'one bill for the whole list of items' if one_bill else 'one voucher per invoice'}, "
                f"metal posted by fine weight ({', '.join(f'{_g(mg)} fine {name}' for name, mg in moved.items() if mg) or 'no metal'})."]
@@ -643,7 +646,7 @@ def import_jewellery(company_id: int, sheet: dict, register: str, before_commit:
         summary.append("The register has no GST amounts, so the invoices were posted without tax. If GST applies (3% on jewellery), "
                        "it is not in the books yet.")
     return {"created": created, "skipped": skipped, "problems": problems, "notes": already + summary + notes,
-            "books_start": books_start}
+            "books_start": books_start, "filled": dict(filled)}
 
 
 # --- Reports -------------------------------------------------------------------------------------------

@@ -552,12 +552,15 @@ def _parse_sheet(name: str, raw: pd.DataFrame, marks: dict | None = None) -> Par
         return None
 
     header_idx = _find_header_row(raw)
-    header_row = int(header_idx) + 1
-    body = raw.loc[raw.index > header_idx]
+    # A file with no header row (a CSV export of items): its first row is an entry, and the columns are numbered.
+    headerless = header_idx == raw.index[0] and _entry_not_header(raw, header_idx)
+    header_row = 0 if headerless else int(header_idx) + 1
+    body = raw if headerless else raw.loc[raw.index > header_idx]
     if body.empty:
         raise _NoEntries(f'Sheet "{name}" has a header row (row {header_row}) but no entries under it, so it was not imported.')
 
-    labels_in_file = [_header_text(value, i) for i, value in enumerate(raw.loc[header_idx])]
+    labels_in_file = ([f"Column {i + 1}" for i in range(raw.shape[1])] if headerless
+                      else [_header_text(value, i) for i, value in enumerate(raw.loc[header_idx])])
     names = _unique_names([clean_name(text) for text in labels_in_file])
     labels = dict(zip(names, labels_in_file))
     source_columns = list(raw.columns)
@@ -565,8 +568,12 @@ def _parse_sheet(name: str, raw: pd.DataFrame, marks: dict | None = None) -> Par
 
     checks: list[dict] = []
     if marks:
-        body, format_checks = _apply_format_marks(body, marks, source_columns, names, labels, header_idx)
+        body, format_checks = _apply_format_marks(body, marks, source_columns, names, labels,
+                                                  header_idx - 1 if headerless else header_idx)
         checks += format_checks
+    if headerless:
+        checks.append({"level": "info", "message": "The first row is an entry, not a header (the file has none), so the "
+                                                   "columns are named Column 1, Column 2, …"})
     if header_row > 1:
         checks.append({"level": "info", "message": f"Header found on row {header_row}; rows above it were treated as titles."})
 
@@ -957,6 +964,17 @@ def _find_header_row(raw: pd.DataFrame):
                 continue
         return indexes[i]
     return raw.index[0]
+
+
+def _entry_not_header(raw: pd.DataFrame, header_idx) -> bool:
+    """The row taken as the header is an entry: it holds a number that heads no column (1, 1499; a year such as 2025
+    may) and a text that is an entry too, longer than any heading or repeated in its column below ("necklace" over
+    more "necklace")."""
+    row = raw.loc[header_idx].dropna()
+    below = raw.loc[raw.index > header_idx]
+    if below.empty or all(_is_header_label(v) for v in row):
+        return False
+    return any(_is_text_label(v) and (len(v.strip()) > 60 or bool((below[col] == v).any())) for col, v in row.items())
 
 
 def _header_text(value, position: int) -> str:

@@ -20,7 +20,7 @@ from collections.abc import Callable
 from datetime import date, datetime, timezone
 
 import pandas as pd
-from sqlalchemy import and_, insert, select
+from sqlalchemy import and_, insert, select, text
 from sqlalchemy.exc import DataError, IntegrityError
 
 from .. import gst, reports
@@ -474,9 +474,24 @@ def loose_sheet(sheet: dict) -> dict:
         price = next((c["name"] for c in profile["columns"] if c["kind"] == "number" and c["non_null"] > 0
                       and _PRICE_COLUMN.search(c["name"]) and not reports._NOT_AMOUNT.search(c["name"])
                       and not any(p.match(c["name"]) for p in parts)), None)
+        if not price:  # no column named as a price (a file with no header: Column 1, Column 2...): the only number
+            # column that is no serial number, weight, quantity, rate or value part
+            numbers = [c["name"] for c in profile["columns"] if c["kind"] == "number" and c["non_null"] > 0
+                       and not reports._NOT_AMOUNT.search(c["name"]) and not any(p.match(c["name"]) for p in parts)
+                       and not _serial(c) and (c.get("stats") or {}).get("min", 0) >= 0]
+            price = numbers[0] if len(numbers) == 1 else None
         if price:
             mapping["amount"] = price
     return {**sheet, "profile": {**profile, "mapping": mapping}}
+
+
+def _serial(column: dict) -> bool:
+    """A column numbering the rows (1, 2, 3...): whole numbers, each once, with no gaps."""
+    stats = column.get("stats") or {}
+    low, high = stats.get("min"), stats.get("max")
+    if low is None or high is None or not float(low).is_integer():
+        return False
+    return column.get("unique") == column["non_null"] and high - low + 1 == column["non_null"]
 
 
 def text_dates(values: pd.Series) -> pd.Series:
@@ -651,22 +666,92 @@ def filled_notes(filled: dict[str, int], default_date: date | None, default_part
     notes = []
     if filled["date"]:
         notes.append(f"{bills(filled['date'])} had no date, so {'it is' if filled['date'] == 1 else 'they are'} dated "
-                     f"{default_date:%d/%m/%Y} (the day it was added).")
+                     f"{default_date:%d/%m/%Y} ({'the day it was added' if default_date == date.today() else 'the date the person gave'}).")
     if filled["party"]:
         notes.append(f"{bills(filled['party'])} had no customer or supplier name, so {'it is' if filled['party'] == 1 else 'they are'} "
                      f"under {default_party}.")
     return notes
 
 
+class Rehearsal(Exception):
+    """Raised by a rehearsed import just before it would commit (so nothing is posted), with what it found: the bills
+    it would post ("bills") and already in the books ("skipped"), and how many of those have no date ("date") or no
+    customer or supplier ("party") of their own."""
+
+    def __init__(self, found: dict):
+        super().__init__("rehearsal")
+        self.found = found
+
+
+def missing_details(company_id: int, sheet: dict, register: str) -> dict:
+    """How many of the bills an add from the chat would post have no date, or no customer or supplier, in the file: the
+    add is run and rolled back. {"bills", "skipped", "date", "party"}."""
+    try:
+        import_register(company_id, sheet, register, default_date=date.today(), default_party="(asked)", rehearse=True)
+    except Rehearsal as found:
+        return found.found
+    return {"bills": 0, "skipped": 0, "date": 0, "party": 0}
+
+
+def write_details(company_id: int, sheet: dict, register: str, day: date | None, party: str | None) -> list[str]:
+    """Write into the uploaded sheet itself the date and the customer or supplier an add from the chat gave the bills
+    that had none (asked for on 2026-11-03: "excel bhi update kr ke"): the blanks of the sheet's own date or party column
+    on the rows that begin a bill in the books, or, when the sheet has no such column, a new Date and Customer / Supplier
+    column on every entry. The column roles the add read become the sheet's own (Reports → Column roles), so a new
+    column changes nothing in how the sheet is read, and a later add finds the same bills already in the books.
+    Returns one note per change, for the answer."""
+    from .. import editing
+    from ..database import quote_ident
+
+    loose = loose_sheet(sheet)
+    mapping = reports.effective_mapping(loose["profile"])
+    raw = load_frame(sheet).set_index("_rowid", drop=False)
+    totals = set(total_rows(loose, raw.reset_index(drop=True), mapping))
+    entries = [int(r) for r in raw.index if int(r) not in totals]
+    with engine.connect() as conn:
+        begins = {int(s.rsplit(":", 1)[1]) for s in _imported_sources(conn, company_id, f"import:{sheet['table_name']}:")
+                  if s.rsplit(":", 1)[1].isdigit()}
+    names = {c["name"] for c in sheet["profile"]["columns"]}
+    table, rowid = quote_ident(sheet["table_name"]), quote_ident("_rowid")
+    added, notes = [], []
+    with engine.begin() as conn:
+        for role, value, kind, label in (("date", day, "DATE", "Date"),
+                                         ("account", party, "TEXT", "Customer" if register == "sales" else "Supplier")):
+            if value is None:
+                continue
+            column = mapping.get(role)
+            if column:  # its blanks on the rows that begin a bill: an item row under a bill stays blank, as it was read
+                rows = [r for r in entries if r in begins and pd.isna(raw.at[r, column])]
+                where = f"{quote_ident(column)} IS NULL AND {rowid} = ANY(CAST(:ids AS bigint[]))"
+                new = ""
+            else:  # a new column, on every entry (the add read none, and still reads none: see the roles below)
+                column, n = editing.clean_name(label), 2
+                while column in names:
+                    column, n = f"{editing.clean_name(label)}_{n}", n + 1
+                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {quote_ident(column)} {kind}")
+                names.add(column)
+                added.append({"name": column, "label": label, "kind": "date" if role == "date" else "text"})
+                rows, where, new = entries, f"{rowid} = ANY(CAST(:ids AS bigint[]))", f" (a new {label} column)"
+            if rows:
+                conn.execute(text(f"UPDATE {table} SET {quote_ident(column)} = :value WHERE {where}"), {"ids": rows, "value": value})
+                shown = value.strftime("%d/%m/%Y") if isinstance(value, date) else value
+                notes.append(f"The uploaded sheet now has {label.lower()} {shown} on {len(rows)} "
+                             f"{'entry' if len(rows) == 1 else 'entries'}{new}.")
+    if notes:
+        profile = {**sheet["profile"], "mapping": mapping, "columns": sheet["profile"]["columns"] + added}
+        editing.refresh_profile({**sheet, "profile": profile}, {"details": len(notes)})
+    return notes
+
+
 def import_register(company_id: int, sheet: dict, register: str, before_commit: Callable[[], None] | None = None,
-                    default_date: date | None = None, default_party: str | None = None) -> dict:
+                    default_date: date | None = None, default_party: str | None = None, rehearse: bool = False) -> dict:
     """Post one sales or purchase register sheet. Returns counts and a list of problems.
     Jewellery registers (fine weight / tunch columns) are posted by weight; see metal.import_jewellery.
     A row's item name and net weight, when the register has them, are kept on its voucher for the voucher list
     (no metal lines: the rupees are all that is posted). ``before_commit`` is called last, inside the transaction: if
     it raises (the chat that asked for the import was stopped), nothing is posted. ``default_date`` / ``default_party``
     (an add asked for from the chat, which must not stop at a missing detail): the date and the customer or supplier of
-    a bill that has none, instead of leaving it out."""
+    a bill that has none, instead of leaving it out. ``rehearse``: nothing is posted; Rehearsal is raised instead."""
     if register not in ("sales", "purchases"):
         raise AccountsError("Choose whether the sheet is a sales or a purchase register.")
     from . import metal  # metal imports this module
@@ -674,7 +759,7 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
     if default_date is not None or default_party:
         sheet = loose_sheet(sheet)
     if metal.detect_jewellery(sheet):
-        return metal.import_jewellery(company_id, sheet, register, before_commit, default_date, default_party)
+        return metal.import_jewellery(company_id, sheet, register, before_commit, default_date, default_party, rehearse)
     raw = load_frame(sheet)
     frame, notes, _ = _normalise({**sheet, "register": register}, raw)
     text_date = date_kept_as_text(sheet, reports.effective_mapping(sheet["profile"])) if default_date else None
@@ -772,12 +857,14 @@ def import_register(company_id: int, sheet: dict, register: str, before_commit: 
                 problems.append(number_clash(conn, in_books, vtype, number, day, label, str(exc)) or f"{label}: {exc}")
             except (DataError, IntegrityError) as exc:  # only the row's savepoint is rolled back; the import goes on
                 problems.append(refused(label, exc))
+        if rehearse:  # rolled back with the transaction
+            raise Rehearsal({"bills": created, "skipped": skipped, **filled})
         note_register(conn, company_id, sheet["table_name"], register)
         if before_commit:
             before_commit()
     return {"created": created, "skipped": skipped, "problems": problems + gstin_warnings(bad_gstins),
             "notes": duplicates_note(duplicates, not sales) + filled_notes(filled, default_date, default_party)
-            + totals_note(totals) + [n["message"] for n in notes], "books_start": books_start}
+            + totals_note(totals) + [n["message"] for n in notes], "books_start": books_start, "filled": dict(filled)}
 
 
 def refused(label: str, exc: Exception) -> str:

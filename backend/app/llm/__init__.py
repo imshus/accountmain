@@ -93,14 +93,25 @@ _ADDED = ("<added>\nThe app added these shared files to the books just now, beca
           "file, as JSON):\n{results}\n</added>")
 _NOTHING_SHARED = ("<added>\nThe person asked to add a file to the books, but no file is shared in this chat: say so in one "
                    "line, and that they can attach it with the + button.\n</added>")
+# A file whose bills lack a date or a customer / supplier is added only once the person gives them, or says to go on
+# without (asked for on 2026-11-03: "user se proper input lo"; "sare me wo apply kr do").
+_NEEDS = ("<needs>\nThe person asked to add these files, but some of their bills have no date, or no customer / supplier, in "
+          "the file, so they were NOT added yet. In the person's language, ask in ONE short question for exactly what is "
+          "missing, naming each file and the register it goes to: the date of the bills, and the customer (sales) or "
+          "supplier (purchases), suggesting the name from the file's name when given. Say they can reply with them, or "
+          "with \"aise hi add kro\" to add with today's date and the suggested name (else Cash Customer / Cash Supplier), "
+          "and that what they give is written into the sheet as well. Never say these files were added (one per file, as "
+          "JSON):\n{asks}\n</needs>")
 
 
 def _add_files(tools: Toolbox, wanted: intent.Intent) -> tuple[str, set[str]]:
     """Add the shared sheets the person asked for (read by the intent check) to the books, each in the register they
-    said for it (else the message's, else the sheet's own) and under the party they or the file name gave, asking
-    nothing. A sheet that only repeats another one's items is left out. Returns the <added> block the answer reports,
-    and the tables it dealt with (no Sales / Purchase buttons for them). A file that fails is reported there, the others
-    are still added."""
+    said for it (else the message's, else the sheet's own), with the date and customer or supplier they gave on the
+    bills that have none (else today and the file name's party or a cash one, when they said to go on without). A
+    sheet whose bills lack a date or party the person did not give is not added: the answer asks for them (<needs>).
+    A sheet that only repeats another one's items is left out. Returns the <added> / <needs> blocks the answer
+    reports, and the tables it dealt with (no Sales / Purchase buttons for them). A file that fails is reported
+    there, the others are still added."""
     if not tools.sheets:
         return _NOTHING_SHARED, set()
     sheets = [tools.sheets[f.table] for f in wanted.files]
@@ -120,7 +131,7 @@ def _add_files(tools: Toolbox, wanted: intent.Intent) -> tuple[str, set[str]]:
     registers = {f.table: tools.register_for(f.table, said(f)) for f in wanted.files}
     summaries = summary_sheets(sheets, registers)
     repeated = repeated_sheets([s for s in sheets if s["table_name"] not in summaries], registers)
-    results = []
+    results, asks = [], []
     for f in wanted.files:
         if f.table in summaries:
             bills = tools.sheets[summaries[f.table]]
@@ -137,12 +148,23 @@ def _add_files(tools: Toolbox, wanted: intent.Intent) -> tuple[str, set[str]]:
                                       ensure_ascii=False))
             continue
         try:
-            results.append(tools.add_to_books(f.table, said(f), f.party))
+            if not wanted.anyway and (wanted.day is None or not f.party_given):
+                gaps = tools.missing_details(f.table, said(f))
+                no_date, no_party = (gaps["date"] if wanted.day is None else 0), (0 if f.party_given else gaps["party"])
+                if no_date or no_party:
+                    sheet = tools.sheets[f.table]
+                    asks.append(json.dumps({
+                        "file": tools.detected(f.table)[0], "sheet": sheet["sheet_name"], "register": tools.register_for(f.table, said(f)),
+                        "bills": gaps["bills"], "bills_with_no_date": no_date, "bills_with_no_customer_or_supplier": no_party,
+                        "name_from_file_name": None if f.party_given else f.party}, ensure_ascii=False))
+                    continue
+            results.append(tools.add_to_books(f.table, said(f), f.party, wanted.day))
         except Cancelled:
             raise
         except Exception as exc:  # noqa: BLE001 - reported in the answer, as a tool's error would be
             results.append(json.dumps({"table": f.table, "error": tool_error(exc)}, ensure_ascii=False))
-    return _ADDED.format(results="\n".join(results)), {f.table for f in wanted.files}
+    blocks = ([_ADDED.format(results="\n".join(results))] if results else []) + ([_NEEDS.format(asks="\n".join(asks))] if asks else [])
+    return "\n\n".join(blocks), {f.table for f in wanted.files}
 
 
 def provider_status() -> list[dict]:
