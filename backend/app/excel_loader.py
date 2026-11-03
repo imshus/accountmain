@@ -149,7 +149,7 @@ def read_workbook(content: bytes, filename: str) -> list[ParsedSheet]:
     sheets, skipped = [], []
     for name, raw in raw_sheets.items():
         try:
-            sheet = _parse_sheet(str(name), raw, marks.get(name))
+            sheet = _parse_sheet(str(name).replace("\x00", ""), raw, marks.get(name))  # no NUL (see _blank_to_nan)
         except _NoEntries as exc:
             skipped.append(str(exc))
             continue
@@ -491,9 +491,26 @@ def _read_html_tables(text: str) -> dict[str, pd.DataFrame]:
     return out
 
 
+def _utf16_without_bom(content: bytes) -> str | None:
+    """"utf-16-le" or "utf-16-be" for text saved as UTF-16 without its byte-order mark (every other byte NUL in Latin
+    text), else None. Read as cp1252 it would be letters with NULs between them, which the database cannot store."""
+    head = content[:4000]
+    if len(head) < 4 or len(head) % 2 or head.count(0) < len(head) // 4:
+        return None
+    odd, even = head[1::2].count(0), head[0::2].count(0)
+    encoding = "utf-16-le" if odd > 3 * even else "utf-16-be" if even > 3 * odd else None
+    try:
+        return encoding if encoding and "\x00" not in content.decode(encoding) else None
+    except UnicodeDecodeError:
+        return None
+
+
 def _decode_text(content: bytes) -> str:
     if content.startswith((b"\xff\xfe", b"\xfe\xff")):
         return content.decode("utf-16")
+    utf16 = _utf16_without_bom(content)
+    if utf16:
+        return content.decode(utf16)
     for encoding in ("utf-8-sig", "cp1252", "latin-1"):
         try:
             return content.decode(encoding)
@@ -508,7 +525,9 @@ def _read_csv(content: bytes) -> pd.DataFrame:
     pandas' reader fixes the column count from the first line, so a one-cell title row
     makes it reject the rest of the file; the csv module reads ragged rows fine.
     """
-    text = _decode_text(content)
+    # No NUL characters (the database cannot store them in text; see _blank_to_nan). Taken out before reading, as
+    # Python 3.9 and 3.10's csv module refuses a line with one, so every Python reads such a file the same way.
+    text = _decode_text(content).replace("\x00", "")
     try:
         dialect = csv.Sniffer().sniff(text[:20_000], delimiters=",;\t|")
     except csv.Error:
@@ -887,8 +906,11 @@ def _reconcile_totals(frame: pd.DataFrame, grand: pd.Series | None, labels: dict
 
 
 def _blank_to_nan(value):
-    if isinstance(value, str) and not value.strip():
-        return np.nan
+    if isinstance(value, str):
+        if "\x00" in value:  # a NUL character (a damaged or binary cell): the database cannot store it in text
+            value = value.replace("\x00", "")
+        if not value.strip():
+            return np.nan
     return value
 
 
@@ -956,13 +978,19 @@ def clean_name(text: str) -> str:
     return name[:60]
 
 
+# PostgreSQL keeps at most 63 bytes of a name and cuts the rest silently, so "..._100" on a 60-letter name could
+# become the same column as "..._10". Names are ASCII (clean_name), so bytes are letters.
+_MAX_NAME = 63
+
+
 def _unique_names(names: list[str]) -> list[str]:
     seen: set[str] = set()
     out = []
     for name in names:
         candidate, n = name, 2
         while candidate in seen:
-            candidate, n = f"{name}_{n}", n + 1
+            suffix = f"_{n}"
+            candidate, n = f"{name[:_MAX_NAME - len(suffix)]}{suffix}", n + 1
         seen.add(candidate)
         out.append(candidate)
     return out

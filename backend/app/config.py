@@ -15,11 +15,55 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 _MONGODB_OFF = os.environ.get("MONGODB_URI") == ""
 load_dotenv(BASE_DIR / ".env")
 
-DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
-DB_PATH = DATA_DIR / "accounts.db"
 
-# Which chat model the app uses when more than one is configured: "openai" or "anthropic".
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
+# --- The database: the one store of the books, uploads and chats -------------------------------------------------------
+# A PostgreSQL database: on Supabase, Project > Connect > "Session pooler" (port 5432), with the database password in it.
+# Nothing is kept on this machine's disk. Never printed: messages name only the host.
+_DATABASE_NAMES = ("DATABASE_URL", "SUPABASE_DB_URL", "SUPABASE_DATABASE_URL", "POSTGRES_URL", "POSTGRES_URI")
+# The tables live in their own schema, which Supabase's web API does not expose (its "public" schema it does).
+DATABASE_SCHEMA = re.sub(r"[^a-z0-9_]", "", os.getenv("DATABASE_SCHEMA", "").strip().lower()) or "accountsai"
+DATABASE_POOL_SIZE = max(1, int(os.getenv("DATABASE_POOL_SIZE", "5")))
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _database_url() -> str:
+    """DATABASE_URL (or the same address under another common name) as a SQLAlchemy URL for psycopg 3, or "" when it is
+    missing or malformed (the reason is printed, without the address). A password left out of the address, or still the
+    "[YOUR-PASSWORD]" of Supabase's copy button, is taken from DATABASE_PASSWORD, percent-encoded so @ : / + % work."""
+    raw = next((os.getenv(name, "").strip() for name in _DATABASE_NAMES if os.getenv(name, "").strip()), "")
+    if not raw:
+        return ""
+    if any(c.isspace() or ord(c) < 32 for c in raw):
+        print("DATABASE_URL contains spaces or line breaks (copy it again in one line); the backend cannot reach its database.")
+        return ""
+    scheme, sep, rest = raw.partition("://")
+    if not sep or scheme.lower() not in ("postgres", "postgresql", "postgresql+psycopg"):
+        print("DATABASE_URL must start with postgresql:// (Supabase > Connect > Session pooler).")
+        return ""
+    authority, slash, tail = rest.partition("/")
+    userinfo, at, hostport = authority.rpartition("@")
+    password = os.getenv("DATABASE_PASSWORD", "") or os.getenv("SUPABASE_DB_PASSWORD", "")
+    if at and password:
+        user, _, given = userinfo.partition(":")
+        if not given or given in ("[YOUR-PASSWORD]", "YOUR-PASSWORD", "<password>"):
+            userinfo = f"{user}:{urllib.parse.quote(password, safe='')}"
+    host = hostport.rsplit(":", 1)[0].strip("[]").lower() if hostport else ""
+    query = tail.partition("?")[2]
+    if host and host not in _LOCAL_HOSTS and "sslmode=" not in query:
+        tail += ("&" if "?" in tail else "?") + "sslmode=require"
+    return f"postgresql+psycopg://{userinfo}{at}{hostport}{slash}{tail}"
+
+
+DATABASE_URL = _database_url()
+
+
+def database_host() -> str:
+    """host:port of the database, for messages (never the user name or password)."""
+    if not DATABASE_URL:
+        return ""
+    hostport = DATABASE_URL.partition("://")[2].partition("/")[0].rpartition("@")[2]
+    return hostport
+
 
 # Speed with accuracy: answers start at low effort (about twice as fast as high on this app's questions),
 # because the numbers come from the tools and every figure is checked. If a figure fails the check, the
@@ -34,9 +78,6 @@ OPENAI_VERBOSITY = os.getenv("OPENAI_VERBOSITY", "low").strip() or None
 # Optional: "priority" asks OpenAI for faster processing at a higher price per token.
 OPENAI_SERVICE_TIER = os.getenv("OPENAI_SERVICE_TIER", "").strip() or None
 
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5-5")
-ANTHROPIC_EFFORT = os.getenv("ANTHROPIC_EFFORT", "low")
-ANTHROPIC_REPAIR_EFFORT = os.getenv("ANTHROPIC_REPAIR_EFFORT", "medium")
 
 # Optional: also keep every uploaded document in a private Supabase Storage bucket (app/cloud.py).
 # Key: Supabase > Project Settings > API Keys > Secret keys (sb_secret_...); a legacy service_role key (eyJ...) also
@@ -71,7 +112,7 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "").strip() or "documents"
 SUPABASE_FOLDER = re.sub(r"/+", "/", re.sub(r"[^A-Za-z0-9_/.-]+", "_", os.getenv("SUPABASE_FOLDER", "uploads"))).strip("/")
 
 # Optional: a live copy of the app's records (uploads with their sheets' statistics, notes and setup; chat
-# conversations) in MongoDB (app/mongo_sync.py); SQLite stays the main copy.
+# conversations) in MongoDB (app/mongo_sync.py); the database (DATABASE_URL) stays the main copy.
 # MONGODB_URI: MongoDB Atlas > Connect > Drivers, the mongodb+srv://user:password@... string. It holds a password, so it
 # stays on this server and is never printed: messages name only the host.
 def _mongodb_parts(uri: str) -> tuple[list[str], dict[str, str]] | None:
@@ -165,6 +206,3 @@ CORS_ORIGINS = [
 def openai_configured() -> bool:
     return bool(os.getenv("OPENAI_API_KEY"))
 
-
-def anthropic_configured() -> bool:
-    return bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))

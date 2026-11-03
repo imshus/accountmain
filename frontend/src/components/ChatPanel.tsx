@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { formatCount } from "../format";
 import type { AnalysisSpec, Health, QueryResult, Sheet as DataSheet } from "../types";
 import { Button, Chip, ChipGroup, Composer, Icon, Input, Notice, Sheet, TextArea } from "../ui";
@@ -7,7 +7,8 @@ import { ChatThread } from "../screens/home/ChatThread";
 import { dayLabel } from "../screens/home/chatUtils";
 import { useChatEngine, type ChatStream } from "../screens/home/useChatEngine";
 import { useFollow } from "../screens/home/useFollow";
-import { useSpeech } from "../screens/home/useSpeech";
+import { spokenAnswer } from "../screens/home/useVoiceAgent";
+import { VoiceAgent } from "../screens/home/VoiceAgent";
 import DataTable from "./DataTable";
 import "../screens/home/ChatPanel.css";
 
@@ -70,7 +71,12 @@ export default function ChatPanel({ scope, subject, suggestionList, health, stre
 
   const engine = useChatEngine({ scope, health, stream, activeId, onStarted: setActiveId, inputRef });
   const { active, turns, notice, setNotice } = engine;
-  const speech = useSpeech(setText, setNotice);
+  // The mic opens the voice agent: what is said goes through this chat, so it can do whatever the chat can.
+  const [voiceOpen, setVoiceOpen] = useState(false);
+  const askAndWaitRef = useRef(engine.askAndWait);
+  askAndWaitRef.current = engine.askAndWait;
+  const voiceAsk = useCallback(async (request: string) => spokenAnswer(await askAndWaitRef.current(request)), []);
+  const closeVoice = useCallback(() => setVoiceOpen(false), []);
   const follow = useFollow(mode === "chat" && turns.length > 0, mainRef, turns, active?.id ?? null);
 
   function open(id: string | null) {
@@ -84,7 +90,6 @@ export default function ChatPanel({ scope, subject, suggestionList, health, stre
   }
 
   function submit() {
-    if (speech.listening) speech.stop();
     if (engine.ask(text)) setText("");
   }
 
@@ -163,11 +168,11 @@ export default function ChatPanel({ scope, subject, suggestionList, health, stre
                 value={text}
                 onChange={setText}
                 onSubmit={submit}
-                placeholder={speech.listening ? "Listening…" : `Ask about ${subject}`}
+                placeholder={`Ask about ${subject}`}
                 busy={engine.sending}
                 onStop={engine.stop}
-                onMic={speech.supported ? () => speech.toggle(text) : undefined}
-                listening={speech.listening}
+                onMic={() => setVoiceOpen(true)}
+                listening={voiceOpen}
                 inputRef={inputRef}
                 above={
                   notice ? (
@@ -208,6 +213,7 @@ export default function ChatPanel({ scope, subject, suggestionList, health, stre
           </>
         }
       />
+      <VoiceAgent open={voiceOpen} onClose={closeVoice} ask={voiceAsk} />
     </section>
   );
 }

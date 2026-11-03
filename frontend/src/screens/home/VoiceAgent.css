@@ -1,0 +1,286 @@
+/* The voice agent: a full-screen sheet over the chat (a centred card on wide windows). */
+.voice {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  background: var(--scrim-strong, rgba(5, 5, 7, 0.82));
+  backdrop-filter: blur(6px);
+}
+
+.voice__panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  max-width: 520px;
+  min-height: 0;
+  padding: calc(env(safe-area-inset-top, 0px) + 12px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+  background: var(--bg);
+  color: var(--ink);
+}
+
+@media (min-width: 720px) {
+  .voice {
+    align-items: center;
+  }
+  .voice__panel {
+    height: min(760px, 92vh);
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    box-shadow: var(--shadow-lg, 0 24px 60px rgba(0, 0, 0, 0.5));
+  }
+}
+
+.voice__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 44px;
+}
+
+.voice__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--soft);
+}
+
+.voice__close {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--raised);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+/* The orb: its glow and motion say what the agent is doing. */
+.voice__orb {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 168px;
+  height: 168px;
+  margin: 28px 0 12px;
+}
+
+.voice__ring,
+.voice__core {
+  position: absolute;
+  border-radius: 50%;
+}
+
+.voice__ring {
+  inset: 0;
+  background: radial-gradient(circle, var(--brand-tint-strong) 0%, transparent 70%);
+  transition: transform 0.3s ease, opacity 0.3s ease;
+}
+
+.voice__core {
+  inset: 34px;
+  display: grid;
+  place-items: center;
+  background: var(--brand-solid);
+  color: var(--on-brand);
+  box-shadow: 0 0 40px rgba(124, 92, 252, 0.45);
+}
+
+.voice__orb--connecting .voice__ring,
+.voice__orb--idle .voice__ring {
+  animation: voice-breathe 1.6s ease-in-out infinite;
+  opacity: 0.6;
+}
+
+.voice__orb--listening .voice__ring {
+  animation: voice-breathe 2.4s ease-in-out infinite;
+}
+
+.voice__orb--hearing .voice__ring {
+  animation: voice-pulse 0.7s ease-in-out infinite;
+}
+
+.voice__orb--thinking .voice__core {
+  animation: voice-spin 1.2s linear infinite;
+  background: conic-gradient(var(--brand-solid), var(--brand-light), var(--brand-solid));
+}
+
+.voice__orb--speaking .voice__ring {
+  animation: voice-pulse 0.45s ease-in-out infinite alternate;
+  background: radial-gradient(circle, rgba(52, 216, 163, 0.3) 0%, transparent 70%);
+}
+
+.voice__orb--error .voice__core {
+  background: var(--rose);
+  box-shadow: none;
+}
+
+@keyframes voice-breathe {
+  0%,
+  100% {
+    transform: scale(0.88);
+  }
+  50% {
+    transform: scale(1);
+  }
+}
+
+@keyframes voice-pulse {
+  from {
+    transform: scale(0.92);
+  }
+  to {
+    transform: scale(1.08);
+  }
+}
+
+@keyframes voice-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice__ring,
+  .voice__core {
+    animation: none !important;
+  }
+}
+
+.voice__status {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+.voice__error {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--rose-edge);
+  border-radius: 12px;
+  background: var(--rose-tint);
+  color: var(--ink);
+  font-size: 0.9rem;
+  line-height: 1.4;
+  text-align: center;
+}
+
+/* Why the call ended by itself (quiet, or the time limit): information, not a failure. */
+.voice__note {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--raised);
+  color: var(--soft);
+  font-size: 0.9rem;
+  line-height: 1.4;
+  text-align: center;
+}
+
+/* Captions of both sides; the examples before anything is said. */
+.voice__lines {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  margin-top: 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.voice__line {
+  max-width: 88%;
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 16px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.voice__line--you {
+  align-self: flex-end;
+  background: var(--brand-solid);
+  color: var(--on-brand);
+  border-bottom-right-radius: 6px;
+}
+
+.voice__line--ai {
+  align-self: flex-start;
+  background: var(--raised);
+  color: var(--ink);
+  border-bottom-left-radius: 6px;
+}
+
+.voice__examples {
+  margin: auto 0;
+  text-align: center;
+}
+
+.voice__hint {
+  margin: 0 0 10px;
+  color: var(--faint);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.voice__examples ul {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.voice__examples li {
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--raised);
+  color: var(--soft);
+  font-size: 0.95rem;
+}
+
+.voice__foot {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  margin-top: 14px;
+}
+
+.voice__end,
+.voice__retry {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 52px;
+  border: 0;
+  border-radius: 16px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.voice__end {
+  background: var(--rose);
+  color: #2a0711; /* dark on the rose: white would be too faint */
+}
+
+.voice__retry {
+  background: var(--raised);
+  color: var(--ink);
+}

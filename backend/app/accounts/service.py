@@ -14,17 +14,22 @@ Every create/update/cancel is written to the audit log with before/after snapsho
 
 from __future__ import annotations
 
+import copy
+import functools
 import json
 import math
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from sqlalchemy import and_, func, insert, select, update
+from sqlalchemy import Numeric, and_, cast, func, insert, select, text, update
+from sqlalchemy.dialects.postgresql import array_agg
 
 from .. import gst
-from ..database import columns_of, engine
+from ..database import columns_of, engine, upsert
 from ..excel_loader import to_number
 from . import chart
 from .db import audit_log, bank_lines, bill_allocations, companies, ledgers, metal_lines, metal_openings, voucher_lines, vouchers
@@ -129,6 +134,78 @@ def net_of(gross_mg: int, dia_mct: int = 0, stn_mct: int = 0) -> int:
     return gross_mg - half_up((dia_mct + stn_mct) * 2, 10)
 
 
+def lock_books(conn, company_id: int) -> bool:
+    """Make this transaction the company's only books writer until it ends. SQLite let one writer in at a time; Postgres
+    runs writers side by side, so every books write takes this lock before it reads what it decides on (the next number,
+    what an import already posted, a bill's pending amount, whether a ledger exists). Asked of the database once per
+    transaction; returns whether it was taken just now (False: this transaction already held it)."""
+    transaction = conn.get_transaction()
+    held = conn.info.get("books_locks")  # (transaction, company ids): conn.info outlives the transaction, hence the check
+    if held is not None and held[0] is transaction and company_id in held[1]:
+        return False
+    conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": f"books:{company_id}"})
+    if conn.get_nested_transaction() is None:  # taken inside a savepoint, a rollback to it would let it go
+        if held is None or held[0] is not transaction:
+            held = conn.info["books_locks"] = (transaction, set())
+        held[1].add(company_id)
+    return True
+
+
+# --- One view of the books for a report -----------------------------------------------------------------
+
+_reading: ContextVar[tuple | None] = ContextVar("books_reading", default=None)
+
+
+@contextmanager
+def reading():
+    """One view of the books for a whole report or screen: one connection and one REPEATABLE READ snapshot, so a voucher
+    saved meanwhile cannot make a report's own checks disagree, and each table is read once (remembered()) however
+    many parts of the report need it. Inside another reading(), that one is used."""
+    if _reading.get() is not None:
+        yield
+        return
+    with engine.connect() as conn:
+        conn.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        token = _reading.set((conn, {}))
+        try:
+            yield
+        finally:
+            _reading.reset(token)
+            conn.rollback()
+
+
+def one_view(report):
+    """Decorator: the report runs in one reading()."""
+    @functools.wraps(report)
+    def run(*args, **kwargs):
+        with reading():
+            return report(*args, **kwargs)
+    return run
+
+
+@contextmanager
+def connect():
+    """The connection of the reading() in progress, else a connection of its own."""
+    current = _reading.get()
+    if current is not None:
+        yield current[0]
+        return
+    with engine.connect() as conn:
+        yield conn
+
+
+def remembered(key: tuple, load):
+    """``load()``, run once per reading() (its snapshot does not change); outside one, every time. Each caller gets its
+    own copy, free to change."""
+    current = _reading.get()
+    if current is None:
+        return load()
+    memo = current[1]
+    if key not in memo:
+        memo[key] = load()
+    return copy.deepcopy(memo[key])
+
+
 def _audit(conn, company_id: int, action: str, entity: str, entity_id: int | None, before=None, after=None):
     conn.execute(insert(audit_log).values(
         company_id=company_id, at=_now(), action=action, entity=entity, entity_id=entity_id,
@@ -145,15 +222,40 @@ def create_company(name: str, gstin: str | None, fy_start: date) -> int:
     if gstin and gst.gstin_problem(gstin):
         raise AccountsError(f"GSTIN {gstin}: {gst.gstin_problem(gstin)}.")
     with engine.begin() as conn:
-        company_id = conn.execute(insert(companies).values(
-            name=name.strip(), gstin=gstin, state_code=gstin[:2] if gstin else None,
-            fy_start=fy_start, created_at=_now(),
-        )).inserted_primary_key[0]
-        for ledger, (group, tax_kind) in chart.DEFAULT_LEDGERS.items():
-            conn.execute(insert(ledgers).values(company_id=company_id, name=ledger, group_name=group, opening_paise=0,
-                                                tax_kind=tax_kind, created_at=_now()))
-        _audit(conn, company_id, "create", "company", company_id, after={"name": name, "gstin": gstin, "fy_start": fy_start})
+        return _create_company(conn, name, gstin, fy_start)
+
+
+def _create_company(conn, name: str, gstin: str | None, fy_start: date) -> int:
+    company_id = conn.execute(insert(companies).values(
+        name=name.strip(), gstin=gstin, state_code=gstin[:2] if gstin else None,
+        fy_start=fy_start, created_at=_now(),
+    )).inserted_primary_key[0]
+    # One statement for the whole chart: each statement is a trip to the database.
+    conn.execute(insert(ledgers), [{"company_id": company_id, "name": ledger, "group_name": group, "opening_paise": 0,
+                                    "tax_kind": tax_kind, "created_at": _now()}
+                                   for ledger, (group, tax_kind) in chart.DEFAULT_LEDGERS.items()])
+    _audit(conn, company_id, "create", "company", company_id, after={"name": name, "gstin": gstin, "fy_start": fy_start})
     return company_id
+
+
+DEFAULT_COMPANY_NAME = "My Business"  # the name the app gives the first company (frontend/src/session.tsx)
+
+
+def company_or_default(company_id: int | None) -> int:
+    """The company asked for when it exists, else the default one: the newest company (the one the app picks first),
+    or a new "My Business" when there is none, made as the app makes its first. So a device still holding a company
+    that is gone (deleted by a fresh start) keeps working instead of failing with "Company not found."."""
+    if company_id is not None:
+        with engine.connect() as conn:
+            if conn.execute(select(companies.c.id).where(companies.c.id == company_id)).first() is not None:
+                return company_id
+    with engine.begin() as conn:
+        # One default company even when several requests arrive at once with none there yet.
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('accountsai-default-company'))"))
+        newest = conn.execute(select(func.max(companies.c.id))).scalar()
+        if newest is not None:
+            return newest
+        return _create_company(conn, DEFAULT_COMPANY_NAME, None, fy_of(date.today())[0])
 
 
 def list_companies() -> list[dict]:
@@ -172,9 +274,12 @@ def _company_out(row) -> dict:
     return data
 
 
-def get_company(company_id: int) -> dict:
-    with engine.connect() as conn:
-        row = conn.execute(select(companies).where(companies.c.id == company_id)).mappings().first()
+def get_company(company_id: int, conn=None) -> dict:
+    """The company's row; read on ``conn`` when given (a write transaction that holds lock_books)."""
+    if conn is None:
+        with engine.connect() as own:
+            return get_company(company_id, own)
+    row = conn.execute(select(companies).where(companies.c.id == company_id)).mappings().first()
     if row is None:
         raise AccountsError("Company not found.")
     return _company_out(row)
@@ -188,6 +293,8 @@ def update_company(company_id: int, **values) -> dict:
             raise AccountsError(f"GSTIN {values['gstin']}: {gst.gstin_problem(values['gstin'])}.")
         values["state_code"] = values["gstin"][:2]
     with engine.begin() as conn:
+        lock_books(conn, company_id)  # no voucher can be saved between the count below and the change
+        before = get_company(company_id, conn)
         if values.get("fy_start") and values["fy_start"] != before["fy_start"]:
             # Opening balances are as at the books-start day, so it can only move while there are no vouchers.
             count = conn.execute(select(func.count()).select_from(vouchers).where(and_(
@@ -204,10 +311,39 @@ def update_company(company_id: int, **values) -> dict:
     return get_company(company_id)
 
 
+def move_books_start_back(company_id: int, start: date, conn=None) -> bool:
+    """Move the books-start date back to ``start`` so that earlier bills can be posted (an add from the chat, asked for on
+    2026-10-28 not to stop at such a date). Only the opening balances are dated by it, so it moves only while the company
+    has none (rupees or metal); the entries already made all come after the old start, so after the new one too. False
+    when the books already begin on or before ``start``, or there are opening balances (the person's to change).
+    ``conn``: the posting's own transaction, so a stopped or failed add leaves the date as it was."""
+    if conn is None:
+        with engine.begin() as own:
+            return move_books_start_back(company_id, start, own)
+    lock_books(conn, company_id)  # no voucher or opening balance is saved between the checks and the change
+    before = get_company(company_id, conn)
+    if not before["fy_start"] or start >= before["fy_start"]:
+        return False
+    rupees = conn.execute(select(func.count()).select_from(ledgers).where(and_(
+        ledgers.c.company_id == company_id, ledgers.c.opening_paise != 0))).scalar_one()
+    metal = conn.execute(select(func.count()).select_from(metal_openings.join(ledgers, metal_openings.c.ledger_id == ledgers.c.id))
+                         .where(and_(ledgers.c.company_id == company_id, metal_openings.c.opening_mg != 0))).scalar_one()
+    if rupees or metal:
+        return False
+    conn.execute(update(companies).where(companies.c.id == company_id).values(fy_start=start))
+    _audit(conn, company_id, "update", "company", company_id, before, {"fy_start": start})
+    return True
+
+
 def list_ledgers(company_id: int) -> list[dict]:
-    with engine.connect() as conn:
-        rows = conn.execute(select(ledgers).where(ledgers.c.company_id == company_id).order_by(ledgers.c.group_name, ledgers.c.name)).mappings().all()
-    return [dict(r) for r in rows]
+    def load() -> list[dict]:
+        with connect() as conn:
+            # COLLATE "C": by character code, as SQLite sorted (capitals first), not by the database's language rules.
+            rows = conn.execute(select(ledgers).where(ledgers.c.company_id == company_id)
+                                .order_by(ledgers.c.group_name.collate("C"), ledgers.c.name.collate("C"))).mappings().all()
+        return [dict(r) for r in rows]
+
+    return remembered(("ledgers", company_id), load)
 
 
 def ledger_map(company_id: int) -> dict[int, dict]:
@@ -229,8 +365,8 @@ def _save_metal_openings(conn, company_id: int, ledger_id: int, opening_metal: d
             metal_openings.c.ledger_id == ledger_id, metal_openings.c.metal == metal))).scalar()
         if before == mg or (before is None and not mg):
             continue
-        conn.execute(metal_openings.delete().where(and_(metal_openings.c.ledger_id == ledger_id, metal_openings.c.metal == metal)))
-        conn.execute(insert(metal_openings).values(ledger_id=ledger_id, metal=metal, opening_mg=mg))
+        statement = upsert(metal_openings).values(ledger_id=ledger_id, metal=metal, opening_mg=mg)
+        conn.execute(statement.on_conflict_do_update(constraint="uq_metal_opening", set_={"opening_mg": statement.excluded.opening_mg}))
         _audit(conn, company_id, "update", "ledger", ledger_id, {f"opening_{metal}_mg": before or 0}, {f"opening_{metal}_mg": mg})
 
 
@@ -256,7 +392,10 @@ def save_ledger(company_id: int, ledger_id: int | None, name: str, group: str, o
     values = {"name": name, "group_name": group, "opening_paise": opening_paise, "gstin": gstin,
               "state_code": gstin[:2] if gstin else state_code, "credit_days": credit_days}
     with engine.begin() as conn:
-        clash = conn.execute(select(ledgers.c.id).where(and_(ledgers.c.company_id == company_id, func.lower(ledgers.c.name) == name.lower()))).scalar()
+        lock_books(conn, company_id)  # two saves of the same name cannot both pass the check below
+        # Both sides lowered by the database, so a name with non-English letters is compared the same way on each side.
+        clash = conn.execute(select(ledgers.c.id).where(and_(ledgers.c.company_id == company_id, func.lower(ledgers.c.name) == func.lower(name)))
+                             .order_by(ledgers.c.id)).scalar()
         if clash and clash != ledger_id:
             raise AccountsError(f'A ledger called "{name}" already exists.')
         if ledger_id:
@@ -270,11 +409,23 @@ def save_ledger(company_id: int, ledger_id: int | None, name: str, group: str, o
             _audit(conn, company_id, "create", "ledger", ledger_id, after=values)
         if opening_metal:
             _save_metal_openings(conn, company_id, ledger_id, opening_metal)
-    return ledger_map(company_id)[ledger_id]
+        return dict(conn.execute(select(ledgers).where(ledgers.c.id == ledger_id)).mappings().one())
+
+
+LEDGER_NAME_LENGTH = 200  # ledgers.name
 
 
 def ensure_ledger(conn, company_id: int, name: str, group: str, *, gstin: str | None = None, tax_kind: str | None = None) -> int:
-    existing = conn.execute(select(ledgers.c.id, ledgers.c.gstin).where(and_(ledgers.c.company_id == company_id, func.lower(ledgers.c.name) == name.lower()))).first()
+    # A register's party cell can be longer than the column, or hold NUL characters: Postgres refuses both (SQLite kept them).
+    name = name.replace("\x00", "")[:LEDGER_NAME_LENGTH]
+    same = and_(ledgers.c.company_id == company_id, func.lower(ledgers.c.name) == func.lower(name))
+
+    def find():
+        return conn.execute(select(ledgers.c.id, ledgers.c.gstin).where(same).order_by(ledgers.c.id)).first()
+
+    existing = find()
+    if existing is None and lock_books(conn, company_id):  # another request may have just made it: look again in turn
+        existing = find()
     if existing:
         if gstin and not existing.gstin and not gst.gstin_problem(gstin):
             conn.execute(update(ledgers).where(ledgers.c.id == existing.id).values(gstin=gstin, state_code=gstin[:2]))
@@ -287,7 +438,8 @@ def ensure_ledger(conn, company_id: int, name: str, group: str, *, gstin: str | 
 
 
 def _tax_ledger(conn, company_id: int, kind: str) -> int:
-    row = conn.execute(select(ledgers.c.id).where(and_(ledgers.c.company_id == company_id, ledgers.c.tax_kind == kind))).first()
+    row = conn.execute(select(ledgers.c.id).where(and_(ledgers.c.company_id == company_id, ledgers.c.tax_kind == kind))
+                       .order_by(ledgers.c.id)).first()
     if row:
         return row.id
     if kind == "tds_receivable":  # TDS customers deducted from what they paid us: an asset until claimed
@@ -307,7 +459,8 @@ class Line:
     bills: list[dict] = field(default_factory=list)  # {kind, bill_ref, amount (signed paise), bill_date, due_date}
 
 
-METAL_DETAILS = ("item", "purity", "tunch_bp", "gross_mg", "net_mg", "dia_mct", "stn_mct", "pieces", "tag_no")
+METAL_DETAILS = ("item", "purity", "tunch_bp", "gross_mg", "net_mg", "dia_mct", "stn_mct", "pieces", "tag_no",
+                 "labour_paise", "dia_paise", "stn_paise", "metal_paise", "huid", "colour", "clarity")
 
 
 @dataclass
@@ -323,19 +476,24 @@ class MetalLine:
 def next_number(conn, company_id: int, vtype: str, day: date) -> str:
     start, end = fy_of(day)
     prefix = f"{PREFIX[vtype]}/{fy_label(day)}/"
-    numbers = conn.execute(select(vouchers.c.number).where(and_(
+    # The highest of the digits the series' numbers end with, found by the database (not every number of the year sent
+    # here). ILIKE: "inv/26-27/0042" typed by hand counts, as it did with SQLite's LIKE. NUMERIC: any run of digits fits.
+    highest = conn.execute(select(func.max(cast(func.substring(vouchers.c.number, "[0-9]+$"), Numeric))).where(and_(
         vouchers.c.company_id == company_id, vouchers.c.vtype == vtype, vouchers.c.date >= start, vouchers.c.date <= end,
-        vouchers.c.number.like(f"{prefix}%"),
-    ))).scalars().all()
-    used = [int(m.group(1)) for n in numbers if (m := re.search(r"(\d+)$", n))]
-    return f"{prefix}{(max(used) + 1 if used else 1):04d}"
+        vouchers.c.number.ilike(f"{prefix}%"),
+    ))).scalar()
+    return f"{prefix}{(int(highest) + 1 if highest is not None else 1):04d}"
 
 
 def _validate_metal(metal: list[MetalLine]) -> None:
+    # A bill whose items' purity was not given (metal.purity_unknown_invoice): every line has fine 0, and some line
+    # carries an item's weight. Nothing else may have a zero line.
+    unknown_purity = bool(metal) and all(l.dr == 0 and l.cr == 0 for l in metal) and any(
+        l.details.get("net_mg") or l.details.get("gross_mg") for l in metal)
     for line in metal:
         if line.metal not in chart.METALS:
             raise AccountsError(f"Unknown metal {line.metal!r}.")
-        if line.dr < 0 or line.cr < 0 or (line.dr > 0) == (line.cr > 0):
+        if line.dr < 0 or line.cr < 0 or (line.dr > 0 and line.cr > 0) or (line.dr == line.cr == 0 and not unknown_purity):
             raise AccountsError("Each metal line must have either a debit or a credit fine weight (not both, not zero).")
     for name in chart.METALS:
         mine = [l for l in metal if l.metal == name]
@@ -345,8 +503,22 @@ def _validate_metal(metal: list[MetalLine]) -> None:
                                 f"{abs(dr - cr) / 1000:,.3f} g fine. They must be equal.")
 
 
+def _voucher_ledgers(conn, company_id: int, lines: list[Line], metal: list[MetalLine]) -> dict:
+    """Ledger id -> (group_name, credit_days) of the company's ledgers on the voucher: one read of just those, not the
+    whole chart (which, after imports, holds every party)."""
+    ids = {l.ledger_id for l in [*lines, *metal]}
+    if not ids:
+        return {}
+    return {r.id: r for r in conn.execute(select(ledgers.c.id, ledgers.c.group_name, ledgers.c.credit_days).where(and_(
+        ledgers.c.company_id == company_id, ledgers.c.id.in_(ids)))).all()}
+
+
+# Column lengths (vouchers.number, vouchers.reference, bill_allocations.bill_ref): Postgres refuses a longer text.
+NUMBER_LENGTH, REFERENCE_LENGTH = 40, 60
+
+
 def _validate(conn, company: dict, vtype: str, day: date, number: str, lines: list[Line], voucher_id: int | None,
-              metal: list[MetalLine] = ()) -> None:
+              metal: list[MetalLine] = (), reference: str = "", by_id: dict | None = None) -> None:
     if vtype not in chart.VOUCHER_TYPES:
         raise AccountsError(f"Unknown voucher type {vtype!r}.")
     if company.get("fy_start") and day < company["fy_start"]:
@@ -370,7 +542,7 @@ def _validate(conn, company: dict, vtype: str, day: date, number: str, lines: li
     if total_dr != total_cr:
         raise AccountsError(f"Debits {total_dr / 100:,.2f} and credits {total_cr / 100:,.2f} differ by {abs(total_dr - total_cr) / 100:,.2f}. They must be equal.")
     _validate_metal(metal)
-    by_id = {r.id: r for r in conn.execute(select(ledgers).where(ledgers.c.company_id == company["id"])).all()}
+    by_id = _voucher_ledgers(conn, company["id"], lines, metal) if by_id is None else by_id
     for line in [*lines, *metal]:
         if line.ledger_id not in by_id:
             raise AccountsError("A line uses a ledger that does not belong to this company.")
@@ -387,8 +559,17 @@ def _validate(conn, company: dict, vtype: str, day: date, number: str, lines: li
             raise AccountsError(f"GST document numbers can be at most 16 characters (Rule 46); {number!r} has {len(number)}.")
         if not re.fullmatch(r"[A-Za-z0-9/-]+", number):
             raise AccountsError("GST document numbers may contain only letters, digits, '/' and '-' (Rule 46).")
+    if len(number) > NUMBER_LENGTH:
+        raise AccountsError(f"Voucher numbers can be at most {NUMBER_LENGTH} characters; {number!r} has {len(number)}.")
+    if len(reference or "") > REFERENCE_LENGTH:
+        raise AccountsError(f"The reference can be at most {REFERENCE_LENGTH} characters; {reference!r} has {len(reference)}.")
+    for line in lines:
+        for bill in line.bills:
+            if len(bill.get("bill_ref") or "") > REFERENCE_LENGTH:
+                raise AccountsError(f"Bill references can be at most {REFERENCE_LENGTH} characters; {bill['bill_ref']!r} has "
+                                    f"{len(bill['bill_ref'])}.")
     start, end = fy_of(day)
-    same_number = and_(vouchers.c.company_id == company["id"], vouchers.c.vtype == vtype, func.lower(vouchers.c.number) == number.lower(),
+    same_number = and_(vouchers.c.company_id == company["id"], vouchers.c.vtype == vtype, func.lower(vouchers.c.number) == func.lower(number),
                        vouchers.c.date >= start, vouchers.c.date <= end, vouchers.c.id != (voucher_id or 0))
     # Rule 46: a GST document number is used once in a financial year, even if that invoice was later cancelled.
     if vtype not in GST_DOCUMENTS:
@@ -408,11 +589,12 @@ def _validate(conn, company: dict, vtype: str, day: date, number: str, lines: li
             raise AccountsError("Bill-wise amounts on a party line must add up to that line's amount.")
 
 
-def _default_bills(conn, company_id: int, vtype: str, number: str, reference: str, day: date, lines: list[Line]) -> None:
+def _default_bills(conn, company_id: int, vtype: str, number: str, reference: str, day: date, lines: list[Line],
+                   by_id: dict | None = None) -> None:
     """Party lines without bill-wise details get Tally's defaults: an invoice opens a New Ref named after
     its number (for purchases, the supplier's bill number when given); anything else is On Account."""
-    party_ids = set(conn.execute(select(ledgers.c.id).where(and_(
-        ledgers.c.company_id == company_id, ledgers.c.group_name.in_(chart.PARTY_GROUPS)))).scalars())
+    by_id = _voucher_ledgers(conn, company_id, lines, []) if by_id is None else by_id
+    party_ids = {lid for lid, r in by_id.items() if r.group_name in chart.PARTY_GROUPS}
     bill_ref = (reference or number) if vtype in ("Purchase", "Debit Note") else number
     for line in lines:
         if line.ledger_id in party_ids and not line.bills:
@@ -435,75 +617,100 @@ def pending_by_bill(conn, party_id: int) -> dict[str, int]:
 
 def _snapshot(conn, voucher_id: int) -> dict:
     head = conn.execute(select(*columns_of(vouchers).values()).where(vouchers.c.id == voucher_id)).mappings().first()
+    if head is None:
+        raise AccountsError("Voucher not found.")
     lines = conn.execute(select(voucher_lines).where(voucher_lines.c.voucher_id == voucher_id).order_by(voucher_lines.c.position)).mappings().all()
     line_ids = [l["id"] for l in lines]
     bills = conn.execute(select(bill_allocations).where(bill_allocations.c.line_id.in_(line_ids))).mappings().all() if line_ids else []
-    metal = conn.execute(select(metal_lines).where(metal_lines.c.voucher_id == voucher_id).order_by(metal_lines.c.position)).mappings().all()
+    metal = conn.execute(select(*columns_of(metal_lines).values()).where(metal_lines.c.voucher_id == voucher_id)
+                         .order_by(metal_lines.c.position)).mappings().all()
     return {**dict(head), "lines": [dict(l) | {"bills": [dict(b) for b in bills if b["line_id"] == l["id"]]} for l in lines],
             "metal_lines": [dict(m) for m in metal]}
 
 
-def _write_metal(conn, voucher_id: int, metal: list[MetalLine]) -> None:
-    for position, line in enumerate(metal):
-        details = {k: line.details.get(k) for k in METAL_DETAILS}
-        conn.execute(insert(metal_lines).values(voucher_id=voucher_id, position=position, ledger_id=line.ledger_id,
-                                                metal=line.metal, dr_mg=line.dr, cr_mg=line.cr, **details))
+def _insert_rows(conn, table, rows: list[dict], columns) -> list[dict]:
+    """Insert ``rows`` in one statement (each statement is a trip to the database) and return them as stored, in order."""
+    if not rows:
+        return []
+    return [dict(r) for r in conn.execute(insert(table).returning(*columns, sort_by_parameter_order=True), rows).mappings()]
 
 
-def _write_lines(conn, voucher_id: int, day: date, lines: list[Line], credit_days: dict[int, int | None]) -> None:
-    for position, line in enumerate(lines):
-        line_id = conn.execute(insert(voucher_lines).values(
-            voucher_id=voucher_id, position=position, ledger_id=line.ledger_id, dr_paise=line.dr, cr_paise=line.cr,
-        )).inserted_primary_key[0]
+def _no_nul(text_: str | None) -> str | None:
+    """Text without NUL characters, which Postgres cannot store (an Excel or CSV cell may hold them; SQLite kept them)."""
+    return text_.replace("\x00", "") if isinstance(text_, str) else text_
+
+
+def _write_metal(conn, voucher_id: int, metal: list[MetalLine]) -> list[dict]:
+    """Insert the voucher's metal lines; returns them as stored."""
+    stored = columns_of(metal_lines)  # a column this database lacks (it could not be added) is left out
+    rows = [{"voucher_id": voucher_id, "position": position, "ledger_id": line.ledger_id, "metal": line.metal, "dr_mg": line.dr,
+             "cr_mg": line.cr, **{k: _no_nul(line.details.get(k)) for k in METAL_DETAILS if stored[k] is metal_lines.c[k]}}
+            for position, line in enumerate(metal)]
+    return _insert_rows(conn, metal_lines, rows, stored.values())
+
+
+def _write_lines(conn, voucher_id: int, day: date, lines: list[Line], credit_days: dict[int, int | None]) -> list[dict]:
+    """Insert the voucher's lines, then their bill-wise details; returns the lines as stored, each with its "bills"."""
+    stored = _insert_rows(conn, voucher_lines, [
+        {"voucher_id": voucher_id, "position": position, "ledger_id": line.ledger_id, "dr_paise": line.dr, "cr_paise": line.cr}
+        for position, line in enumerate(lines)], voucher_lines.c)
+    bills = []
+    for line, row in zip(lines, stored):
         for bill in line.bills:
             bill_date = bill.get("bill_date") or day
             days = credit_days.get(line.ledger_id)
             due = bill.get("due_date") or (date.fromordinal(bill_date.toordinal() + days) if days else None)
-            conn.execute(insert(bill_allocations).values(
-                line_id=line_id, ledger_id=line.ledger_id, kind=bill["kind"], bill_ref=bill.get("bill_ref"),
-                amount_paise=bill["amount"], bill_date=bill_date, due_date=due,
-            ))
+            bills.append({"line_id": row["id"], "ledger_id": line.ledger_id, "kind": bill["kind"], "bill_ref": bill.get("bill_ref"),
+                          "amount_paise": bill["amount"], "bill_date": bill_date, "due_date": due})
+    bills = _insert_rows(conn, bill_allocations, bills, bill_allocations.c)
+    return [row | {"bills": [b for b in bills if b["line_id"] == row["id"]]} for row in stored]
 
 
 def save_voucher(company_id: int, vtype: str, day: date, lines: list[Line], *, number: str | None = None, narration: str = "",
                  reference: str = "", source: str = "manual", voucher_id: int | None = None, conn=None,
-                 metal: list[MetalLine] | None = None, items_text: str | None = None, net_mg: int | None = None) -> int:
+                 metal: list[MetalLine] | None = None, items_text: str | None = None, net_mg: int | None = None,
+                 company: dict | None = None) -> int:
     """items_text / net_mg: an imported bill's item names and net weight, for the voucher list (kept by an update that
-    leaves the items on its metal lines as they were)."""
+    leaves the items on its metal lines as they were). ``company``: its row, read by the caller after lock_books in the
+    same transaction (an import reads it once, not once per voucher)."""
     metal = metal or []
+    narration, reference, items_text = _no_nul(narration), _no_nul(reference), _no_nul(items_text)
 
     def run(c) -> int:
-        company = dict(c.execute(select(companies).where(companies.c.id == company_id)).mappings().first() or {})
-        if not company:
+        lock_books(c, company_id)  # before the next number and the number check are read
+        known = company if company is not None else dict(c.execute(select(companies).where(companies.c.id == company_id)).mappings().first() or {})
+        if not known:
             raise AccountsError("Company not found.")
         num = (number or "").strip() or next_number(c, company_id, vtype, day)
-        _default_bills(c, company_id, vtype, num, reference, day, lines)
-        _validate(c, company, vtype, day, num, lines, voucher_id, metal)
-        credit_days = dict(c.execute(select(ledgers.c.id, ledgers.c.credit_days).where(ledgers.c.company_id == company_id)).all())
+        by_id = _voucher_ledgers(c, company_id, lines, metal)
+        _default_bills(c, company_id, vtype, num, reference, day, lines, by_id)
+        _validate(c, known, vtype, day, num, lines, voucher_id, metal, reference, by_id)
+        credit_days = {lid: r.credit_days for lid, r in by_id.items()}
+        head = columns_of(vouchers).values()
         if voucher_id:
             before = _snapshot(c, voucher_id)
             if before["company_id"] != company_id:
                 raise AccountsError("Voucher not found.")
-            if company.get("locked_until") and before["date"] <= company["locked_until"]:
+            if known.get("locked_until") and before["date"] <= known["locked_until"]:
                 raise AccountsError("This voucher is in the locked period and cannot be changed.")
             c.execute(voucher_lines.delete().where(voucher_lines.c.voucher_id == voucher_id))
             c.execute(metal_lines.delete().where(metal_lines.c.voucher_id == voucher_id))
             # Once an edit changes the items, the list reads them from the new metal lines, not the import's summary.
             same = [[m[k] for k in METAL_DETAILS] for m in before["metal_lines"]] == [[l.details.get(k) for k in METAL_DETAILS] for l in metal]
-            c.execute(update(vouchers).where(vouchers.c.id == voucher_id).values(
+            saved = c.execute(update(vouchers).where(vouchers.c.id == voucher_id).values(
                 vtype=vtype, number=num, date=day, narration=narration, reference=reference, updated_at=_now(),
-                **({} if same else {"items_text": None, "net_mg": None})))
-            _write_lines(c, voucher_id, day, lines, credit_days)
-            _write_metal(c, voucher_id, metal)
-            _audit(c, company_id, "update", "voucher", voucher_id, before, _snapshot(c, voucher_id))
+                **({} if same else {"items_text": None, "net_mg": None})).returning(*head)).mappings().one()
+            after = {**saved, "lines": _write_lines(c, voucher_id, day, lines, credit_days), "metal_lines": _write_metal(c, voucher_id, metal)}
+            _audit(c, company_id, "update", "voucher", voucher_id, before, after)
             return voucher_id
-        new_id = c.execute(insert(vouchers).values(
+        saved = c.execute(insert(vouchers).values(
             company_id=company_id, vtype=vtype, number=num, date=day, narration=narration, reference=reference,
             source=source, cancelled=False, created_at=_now(), updated_at=_now(), items_text=items_text, net_mg=net_mg,
-        )).inserted_primary_key[0]
-        _write_lines(c, new_id, day, lines, credit_days)
-        _write_metal(c, new_id, metal)
-        _audit(c, company_id, "create" if source == "manual" else "import", "voucher", new_id, after=_snapshot(c, new_id))
+        ).returning(*head)).mappings().one()
+        new_id = saved["id"]
+        # The audit's "after" is what was written, as returned by each insert, rather than read back statement by statement.
+        after = {**saved, "lines": _write_lines(c, new_id, day, lines, credit_days), "metal_lines": _write_metal(c, new_id, metal)}
+        _audit(c, company_id, "create" if source == "manual" else "import", "voucher", new_id, after=after)
         return new_id
 
     if conn is not None:
@@ -514,6 +721,7 @@ def save_voucher(company_id: int, vtype: str, day: date, lines: list[Line], *, n
 
 def cancel_voucher(company_id: int, voucher_id: int) -> None:
     with engine.begin() as conn:
+        lock_books(conn, company_id)  # not while the period is being locked or the voucher edited
         before = _snapshot(conn, voucher_id)
         if before["company_id"] != company_id:
             raise AccountsError("Voucher not found.")
@@ -527,11 +735,13 @@ def cancel_voucher(company_id: int, voucher_id: int) -> None:
 def get_voucher(company_id: int, voucher_id: int) -> dict:
     with engine.connect() as conn:
         snap = _snapshot(conn, voucher_id)
-    if snap["company_id"] != company_id:
-        raise AccountsError("Voucher not found.")
-    names = ledger_map(company_id)
+        if snap["company_id"] != company_id:
+            raise AccountsError("Voucher not found.")
+        ids = {line["ledger_id"] for line in [*snap["lines"], *snap["metal_lines"]]}
+        names = dict(conn.execute(select(ledgers.c.id, ledgers.c.name).where(and_(
+            ledgers.c.company_id == company_id, ledgers.c.id.in_(ids)))).all()) if ids else {}
     for line in [*snap["lines"], *snap["metal_lines"]]:
-        line["ledger"] = names[line["ledger_id"]]["name"]
+        line["ledger"] = names[line["ledger_id"]]
     return snap
 
 
@@ -545,15 +755,7 @@ def list_vouchers(company_id: int, vtype: str | None, start: date | None, end: d
                   offset: int, limit: int) -> dict:
     v, l, m = vouchers, voucher_lines, metal_lines
     head = columns_of(v)
-    totals = select(l.c.voucher_id, func.sum(l.c.dr_paise).label("amount")).group_by(l.c.voucher_id).subquery()
-    # Each item's net weight is on its own stock line; the party or Sales line on the other side carries none.
-    fine = (select(m.c.voucher_id, func.sum(m.c.dr_mg).label("fine_mg"), func.sum(m.c.net_mg).label("item_net_mg"))
-            .group_by(m.c.voucher_id).subquery())
-    # Outer joins: metal-only vouchers have no rupee lines, and most vouchers have no metal.
-    query = (select(*head.values(), func.coalesce(totals.c.amount, 0).label("amount"), func.coalesce(fine.c.fine_mg, 0).label("fine_mg"),
-                    fine.c.item_net_mg)
-             .outerjoin(totals, totals.c.voucher_id == v.c.id).outerjoin(fine, fine.c.voucher_id == v.c.id)
-             .where(v.c.company_id == company_id))
+    query = select(*head.values()).where(v.c.company_id == company_id)
     if vtype:
         query = query.where(v.c.vtype == vtype)
     if start:
@@ -562,18 +764,32 @@ def list_vouchers(company_id: int, vtype: str | None, start: date | None, end: d
         query = query.where(v.c.date <= end)
     if search:
         like = f"%{search.strip()}%"
-        matching = select(l.c.voucher_id).join(ledgers, ledgers.c.id == l.c.ledger_id).where(ledgers.c.name.ilike(like))
-        matching_metal = select(m.c.voucher_id).join(ledgers, ledgers.c.id == m.c.ledger_id).where(
-            ledgers.c.name.ilike(like) | m.c.item.ilike(like) | m.c.tag_no.ilike(like))
+        named = and_(ledgers.c.company_id == company_id, ledgers.c.name.ilike(like))
+        matching = select(l.c.voucher_id).join(ledgers, ledgers.c.id == l.c.ledger_id).where(named)
+        matching_metal = select(m.c.voucher_id).join(ledgers, ledgers.c.id == m.c.ledger_id).where(and_(
+            ledgers.c.company_id == company_id, ledgers.c.name.ilike(like) | m.c.item.ilike(like) | m.c.tag_no.ilike(like)))
         query = query.where(v.c.number.ilike(like) | v.c.narration.ilike(like) | v.c.reference.ilike(like) | head["items_text"].ilike(like)
                             | v.c.id.in_(matching) | v.c.id.in_(matching_metal))
     with engine.connect() as conn:
+        # Counted and paged on the vouchers alone; the sums below are worked out for the page's vouchers only (summing
+        # every line of every company first and joining after is what Postgres would otherwise do).
         total = conn.execute(select(func.count()).select_from(query.subquery())).scalar_one()
         rows = conn.execute(query.order_by(v.c.date.desc(), v.c.id.desc()).offset(offset).limit(limit)).mappings().all()
         ids = [r["id"] for r in rows]
         parties: dict[int, list[str]] = {}
         items: dict[int, list[str]] = {}
+        amounts: dict[int, int] = {}
+        fine: dict[int, dict] = {}
         if ids:
+            amounts = {vid: int(amount) for vid, amount in conn.execute(
+                select(l.c.voucher_id, func.sum(l.c.dr_paise)).where(l.c.voucher_id.in_(ids)).group_by(l.c.voucher_id)).all()}
+            # Each item's net weight is on its own stock line; the party or Sales line on the other side carries none.
+            # The cards' summary of each bill: diamond carats, how many item lines, and the purities (codes and tunch).
+            fine = {r["voucher_id"]: r for r in conn.execute(
+                select(m.c.voucher_id, func.sum(m.c.dr_mg).label("fine_mg"), func.sum(m.c.net_mg).label("item_net_mg"),
+                       func.sum(m.c.dia_mct).label("dia_mct"), func.count(m.c.item).label("item_count"),
+                       array_agg(m.c.purity.distinct()).label("purities"), array_agg(m.c.tunch_bp.distinct()).label("tunch_bps"))
+                .where(m.c.voucher_id.in_(ids)).group_by(m.c.voucher_id)).mappings().all()}
             for table in (l, m):
                 for vid, name in conn.execute(
                     select(table.c.voucher_id, ledgers.c.name).join(ledgers, ledgers.c.id == table.c.ledger_id)
@@ -587,9 +803,19 @@ def list_vouchers(company_id: int, vtype: str | None, start: date | None, end: d
                 .group_by(m.c.voucher_id, m.c.item).order_by(func.min(m.c.position))
             ).all():
                 items.setdefault(vid, []).append(name)
+    def whole(value) -> int | None:  # SUM of a BIGINT is NUMERIC: a Decimal from the driver
+        return None if value is None else int(value)
+
     out = []
     for r in rows:
-        row = dict(r) | {"ledgers": parties.get(r["id"], [])}
+        # Outer-join meaning: metal-only vouchers have no rupee lines, and most vouchers have no metal.
+        f = fine.get(r["id"]) or {}
+        row = dict(r) | {"amount": amounts.get(r["id"], 0), "fine_mg": whole(f.get("fine_mg")) or 0,
+                         "item_net_mg": whole(f.get("item_net_mg")), "dia_mct": whole(f.get("dia_mct")),
+                         "item_count": f.get("item_count") or 0, "purities": f.get("purities"), "tunch_bps": f.get("tunch_bps"),
+                         "ledgers": parties.get(r["id"], [])}
+        row["purities"] = sorted({p for p in row["purities"] or [] if p and p.strip()})
+        row["tunch_bps"] = sorted({int(t) for t in row["tunch_bps"] or [] if t is not None})
         stored, item_net = row.pop("items_text"), row.pop("item_net_mg")
         if stored is None and row["net_mg"] is None:  # entered by hand: its metal lines describe the items, if any
             row |= {"items": items.get(r["id"], [])[:3], "net_mg": item_net}
@@ -677,6 +903,7 @@ def settlement_lines(conn, company_id: int, vtype: str, party_id: int, cash_bank
     allocated = sum(int(a["amount"]) for a in against)
     if allocated > amount + tds_paise:
         raise AccountsError("Bills allocated add up to more than the amount.")
+    lock_books(conn, company_id)  # two receipts cannot both settle what is pending on one bill
     open_bills = pending_by_bill(conn, party_id)
     for a in against:
         pending = abs(open_bills.get(a["bill_ref"], 0))

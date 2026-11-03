@@ -2,17 +2,18 @@
 
 When MONGODB_URI is set, every upload (file name, size, the register it is filed under, and each sheet's statistics,
 notes and report setup, plus the state of its Supabase copy) and every chat conversation is also kept in MongoDB, in the collections "uploads" and
-"chats" of MONGODB_DB (MongoDB Atlas or a server of your own). SQLite stays the main copy; the books, the vouchers and
-the sheets' rows are not copied. A change only marks the record in memory, and one background thread writes the
-record's state as it is then (or deletes it once it is gone), so MongoDB never slows a request down or makes it fail,
-and sending a record twice is harmless. Records still to send wait in the mongo_sync table: passing failures (MongoDB
-or the network down) keep them waiting and are retried after growing pauses, and a pass at startup and every 5 minutes
-compares every record with what MongoDB last confirmed (for the hosts and database set now) and with the ids MongoDB
-holds, so records made before MongoDB was set up, a change no hook reported, a new MONGODB_DB or cluster and a
-collection emptied in Atlas still get every record. Only problems that retrying cannot fix (wrong password, no
-permission, unusable address, a record MongoDB refuses) are marked failed; POST /api/mongo/retry, or a restart, tries
-those again. The connection string holds a password, so no message, row or log line ever contains it: messages name
-only the host.
+"chats" of MONGODB_DB (MongoDB Atlas or a server of your own). The database (PostgreSQL) stays the main copy; the books,
+the vouchers and the sheets' rows are not copied. A change only marks the record in memory, and one background thread
+writes the record's state as it is then (or deletes it once it is gone), so MongoDB never slows a request down or makes
+it fail, and sending a record twice is harmless. Records still to send wait in the mongo_sync table: passing failures
+(MongoDB or the network down) keep them waiting and are retried after growing pauses, and a pass at startup and every 5
+minutes compares every record with what MongoDB last confirmed (for the hosts and database set now) and with the ids
+MongoDB holds, so records made before MongoDB was set up, a change no hook reported, a new MONGODB_DB or cluster and a
+collection emptied in Atlas still get every record. With several backends on one database, that pass runs in one of
+them (a lock in the database); each one sends the records waiting. Only problems that retrying cannot fix (wrong
+password, no permission, unusable address, a record MongoDB refuses) are marked failed; POST /api/mongo/retry, or a
+restart, tries those again. The connection string holds a password, so no message, row or log line ever contains it:
+messages name only the host.
 """
 
 from __future__ import annotations
@@ -25,9 +26,7 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Integer, String, Table, Text, func, select, update
-from sqlalchemy.dialects.sqlite import insert as upsert
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import Column, DateTime, Integer, String, Table, Text, func, select, text, update
 
 from . import cloud, config, database, reports
 
@@ -55,6 +54,10 @@ _CLIENT_OPTIONS = {"serverSelectionTimeoutMS": 5000, "connectTimeoutMS": 5000, "
 # Server answers that pass: a primary stepping down or shutting down, a host unreachable, an operation timed out.
 _PASSING_CODES = {6, 7, 50, 89, 91, 189, 262, 9001, 10107, 11600, 11602, 13435, 13436}
 _COLLECTIONS = {"upload": "uploads", "chat": "chats"}
+# Part of every upload's fingerprint: bump it when the uploads' documents are built differently (a field added, the
+# setup derived another way), so every upload is sent again once.
+_UPLOAD_FORMAT = 2
+_SWEEP_LOCK = "accountsai-mongo-sync"  # the database lock of the backend that runs the pass over every record
 
 _marks_lock = threading.Lock()  # held only for a set operation: a request never waits on MongoDB
 _client_lock = threading.Lock()
@@ -63,6 +66,7 @@ _wake = threading.Event()  # a record was marked
 _hurry = threading.Event()  # failed records were queued again by hand: end a pause after a passing failure
 _client = None  # the pymongo client, made by the first write
 _worker: threading.Thread | None = None
+_sweep_conn = None  # the connection holding _SWEEP_LOCK while this process runs the pass over every record
 
 
 class SyncError(Exception):
@@ -153,7 +157,7 @@ def _database():
 
 
 def _upload_document(dataset_id: int) -> dict | None:
-    """The upload as copied to MongoDB, from SQLite as it is now; None once it is deleted."""
+    """The upload as copied to MongoDB, from the database as it is now; None once it is deleted."""
     dataset = database.get_dataset(dataset_id)
     if dataset is None:
         return None
@@ -179,11 +183,25 @@ def _target() -> str:
     return f"{config.mongodb_hosts(config.MONGODB_URI)}/{config.MONGODB_DB}"
 
 
-def _upload_fingerprint(document: dict | None) -> str:
-    if document is None:
-        return GONE
-    state = json.dumps([_target(), document], sort_keys=True, default=str, separators=(",", ":"))
-    return hashlib.sha256(state.encode()).hexdigest()
+def _upload_fingerprints(conn, dataset_ids: list[int] | None = None) -> dict[int, str]:
+    """Upload id -> the fingerprint of everything its document is made from (the upload's row, each sheet's name, size
+    and statistics, its Supabase copy's state), for these uploads or every one. Two small queries: the statistics are
+    compared by their md5, worked out in the database, so a pass over every upload never downloads them."""
+    d, s, c = database.datasets.c, database.dataset_sheets.c, cloud.cloud_files.c
+    uploads = (select(d.id, d.filename, d.size_bytes, d.uploaded_at, d.register, c.status, c.bucket, c.path, c.updated_at)
+               .select_from(database.datasets.outerjoin(cloud.cloud_files, c.dataset_id == d.id)))
+    sheets = select(s.dataset_id, s.position, s.sheet_name, s.table_name, s.row_count, func.md5(s.profile_json))
+    if dataset_ids is not None:
+        uploads, sheets = uploads.where(d.id.in_(dataset_ids)), sheets.where(s.dataset_id.in_(dataset_ids))
+    by_upload: dict[int, list] = {}
+    for dataset_id, *sheet in conn.execute(sheets):
+        by_upload.setdefault(dataset_id, []).append(sheet)
+    fingerprints = {}
+    for dataset_id, *upload in conn.execute(uploads):
+        state = json.dumps([_target(), _UPLOAD_FORMAT, upload, sorted(by_upload.get(dataset_id, []))], default=str,
+                           separators=(",", ":"))
+        fingerprints[dataset_id] = hashlib.sha256(state.encode()).hexdigest()
+    return fingerprints
 
 
 def _chat_fingerprint(updated: int | float | None, deleted: bool) -> str:
@@ -197,8 +215,12 @@ def _chat_fingerprint(updated: int | float | None, deleted: bool) -> str:
 def _record(kind: str, key: str) -> tuple[object, dict | None, str]:
     """(MongoDB _id, the document as it should be now or None to delete it, its fingerprint)."""
     if kind == "upload":
+        # The fingerprint first: a change made while the document is read leaves an older fingerprint, so the next pass
+        # sends the upload again (never the other way round, a newer fingerprint stored for an older document).
+        with database.engine.connect() as conn:
+            fingerprint = _upload_fingerprints(conn, [int(key)]).get(int(key), GONE)
         document = _upload_document(int(key))
-        return int(key), document, _upload_fingerprint(document)
+        return int(key), document, fingerprint if document is not None else GONE
     scope, _, chat_id = key.partition("/")
     with database.engine.connect() as conn:
         row = conn.execute(select(database.chats).where((database.chats.c.scope == scope)
@@ -230,18 +252,9 @@ def _send(kind: str, key: str) -> str:
 
 
 def _write(statement, rows: list[dict] | None = None) -> int:
-    """A write that waits out another writer (an upload storing a big sheet) instead of failing on 'database is locked'.
+    """A write that is tried again after a passing database error (a dropped connection, a deadlock) instead of failing.
     Returns the number of rows it changed."""
-    for pause in (0.5, 1, 2, 4, 8):
-        try:
-            with database.engine.begin() as conn:
-                return conn.execute(statement, rows).rowcount
-        except OperationalError as exc:
-            if "locked" not in str(exc).lower():
-                raise
-            time.sleep(pause)
-    with database.engine.begin() as conn:
-        return conn.execute(statement, rows).rowcount
+    return cloud.run_in_transaction(lambda conn: conn.execute(statement, rows).rowcount)
 
 
 def _set(kind: str, key: str, **values) -> None:
@@ -251,7 +264,7 @@ def _set(kind: str, key: str, **values) -> None:
 def _mark_pending(records: list[tuple[str, str]]) -> None:
     if not records:
         return
-    statement = upsert(mongo_sync)
+    statement = database.upsert(mongo_sync)
     statement = statement.on_conflict_do_update(
         index_elements=[mongo_sync.c.kind, mongo_sync.c.key],
         set_={"status": "pending", "attempts": 0, "error": None, "updated_at": statement.excluded.updated_at})
@@ -311,10 +324,10 @@ def reconcile(startup: bool = False) -> int:
     with database.engine.connect() as conn:
         synced = {(kind, key): (status, sent) for kind, key, status, sent in conn.execute(
             select(mongo_sync.c.kind, mongo_sync.c.key, mongo_sync.c.status, mongo_sync.c.synced_hash))}
-        upload_ids = conn.execute(select(database.datasets.c.id)).scalars().all()
+        uploads = _upload_fingerprints(conn)
         chats = conn.execute(select(database.chats.c.scope, database.chats.c.chat_id, database.chats.c.updated,
                                     database.chats.c.deleted)).all()
-    states = {("upload", str(dataset_id)): _upload_fingerprint(_upload_document(dataset_id)) for dataset_id in upload_ids}
+    states = {("upload", str(dataset_id)): fingerprint for dataset_id, fingerprint in uploads.items()}
     states.update({("chat", f"{scope}/{chat_id}"): _chat_fingerprint(updated, deleted)
                    for scope, chat_id, updated, deleted in chats})
     for record in synced:
@@ -372,16 +385,46 @@ def _pause(seconds: float, backing_off: bool) -> None:
             pass
 
 
+def _runs_sweep() -> bool:
+    """Whether this process runs the pass over every record. Several backends may share the database (more workers, or
+    an old and a new one during a deploy): only the one holding _SWEEP_LOCK does, on a connection it keeps for that. The
+    lock goes with that connection or process, and another backend takes the pass over."""
+    global _sweep_conn
+    if _sweep_conn is not None:
+        try:
+            _sweep_conn.execute(text("SELECT 1"))
+            _sweep_conn.commit()
+            return True
+        except Exception:  # noqa: BLE001 - the connection dropped, and the lock with it
+            _sweep_conn.invalidate()  # never back to the pool, in case it still holds the lock
+            _sweep_conn.close()
+            _sweep_conn = None
+    conn = database.engine.connect()
+    try:
+        held = conn.execute(text("SELECT pg_try_advisory_lock(hashtext(:lock), 0)"), {"lock": _SWEEP_LOCK}).scalar()
+        conn.commit()
+    except Exception:
+        conn.invalidate()
+        conn.close()
+        raise
+    if held:
+        _sweep_conn = conn
+        return True
+    conn.close()
+    return False
+
+
 def _run_forever() -> None:
     failures = 0
-    startup = True
+    startup = True  # until this process first runs the pass, which then tries failed records once more
     next_pass = 0.0  # the first pass over every record runs at once
     while True:
         try:
             _write_marks()
             if time.monotonic() >= next_pass:
-                reconcile(startup)
-                startup = False
+                if _runs_sweep():
+                    reconcile(startup)
+                    startup = False
                 next_pass = time.monotonic() + _SWEEP_SECONDS
             _send_pending()
             failures = 0
@@ -418,17 +461,12 @@ def retry_failed() -> int:
 
 def summary() -> dict:
     counts = {"pending": 0, "done": 0, "failed": 0}
-    last_error = None
-    try:
-        with database.engine.connect() as conn:
-            for status, count in conn.execute(select(mongo_sync.c.status, func.count()).group_by(mongo_sync.c.status)):
-                counts[status] = count
-            last_error = conn.execute(select(mongo_sync.c.error).where((mongo_sync.c.status != "done")
-                                                                         & mongo_sync.c.error.is_not(None))
-                                      .order_by(mongo_sync.c.updated_at.desc()).limit(1)).scalar()
-    except OperationalError as exc:
-        if "no such table" not in str(exc):  # not created at startup (a read-only data folder): nothing to report
-            raise
+    with database.engine.connect() as conn:
+        for status, count in conn.execute(select(mongo_sync.c.status, func.count()).group_by(mongo_sync.c.status)):
+            counts[status] = count
+        last_error = conn.execute(select(mongo_sync.c.error).where((mongo_sync.c.status != "done")
+                                                                     & mongo_sync.c.error.is_not(None))
+                                  .order_by(mongo_sync.c.updated_at.desc()).limit(1)).scalar()
     on = configured()
     return {"configured": on, "hosts": _hosts().split(", ") if on else [], "database": config.MONGODB_DB if on else None,
             **counts, "last_error": last_error}

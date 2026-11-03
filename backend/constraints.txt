@@ -2,7 +2,6 @@
 # so a server gets the same libraries as development. Regenerate with: pip freeze > constraints.txt
 annotated-doc==0.0.5
 annotated-types==0.8.0
-anthropic==2.1.0
 anyio==4.15.1
 click==8.5.0
 dnspython==2.9.0
@@ -20,6 +19,8 @@ openai==3.36.1
 openpyxl==3.1.5
 opentelemetry-api==1.45.1
 pandas==3.0.6
+psycopg==3.3.6
+psycopg-binary==3.3.6
 pydantic==2.14.1
 pydantic_core==2.50.1
 pymongo==4.19.0

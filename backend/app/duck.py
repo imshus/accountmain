@@ -10,9 +10,10 @@ switched off and whose configuration is locked at startup. A session's tables ar
 pandas frames registered on its own connection, so no other session can see them. Only single SELECT
 statements are accepted, and each query is interrupted after SQL_TIMEOUT_SECONDS.
 
-Preparing a sheet (reading it, cleaning types, finding each column's exact decimals) is done once and
-kept in memory until the sheet changes, so opening a session only registers ready-made tables and
-answers come back in milliseconds.
+Preparing a sheet (reading it from the database, cleaning types, finding each column's exact decimals)
+is done once and kept in memory until the sheet changes, so opening a session only registers ready-made
+tables and answers come back in milliseconds. The sheet's table itself is read once per version too, and
+shared by the reports, the books and the DuckDB tables (sheet_frame): each read is a trip over the network.
 """
 
 from __future__ import annotations
@@ -96,10 +97,13 @@ def _clean_error(exc: Exception) -> str:
 
 # --- prepared tables, kept between requests ---------------------------------------------------------
 
-Prepared = tuple[pd.DataFrame, list[str], list["Field"]]  # cleaned frame, view SELECT list, fields
+# Cleaned frame (a sheet's keeps its "_rowid" first, which the view leaves out), view SELECT list, fields.
+Prepared = tuple[pd.DataFrame, list[str], list["Field"]]
 _PREPARED: OrderedDict[tuple, Prepared] = OrderedDict()
-_PREPARED_MAX = 32
+# Each sheet takes two places (its table as read, and its prepared copy, which shares the table's memory).
+_PREPARED_MAX = 64
 _LOCK = threading.Lock()
+_BUILDING: dict[tuple, threading.Event] = {}  # keys being built, so a second caller waits instead of reading again
 
 
 def sheet_key(sheet: dict) -> tuple:
@@ -109,18 +113,37 @@ def sheet_key(sheet: dict) -> tuple:
 
 
 def cached(key: tuple, build: Callable[[], object]):
-    """Least-recently-used memory of prepared tables (and anything else keyed the same way)."""
-    with _LOCK:
-        if key in _PREPARED:
+    """Least-recently-used memory of prepared tables (and anything else keyed the same way). A caller asking for a
+    value another thread is building waits for it instead of building it again (each build reads the database)."""
+    while True:
+        with _LOCK:
+            if key in _PREPARED:
+                _PREPARED.move_to_end(key)
+                return _PREPARED[key]
+            building = _BUILDING.get(key)
+            if building is None:
+                _BUILDING[key] = threading.Event()
+                break
+        building.wait()  # then read it, or build it here if that build failed
+    try:
+        value = build()
+        with _LOCK:
+            _PREPARED[key] = value
             _PREPARED.move_to_end(key)
-            return _PREPARED[key]
-    value = build()
-    with _LOCK:
-        _PREPARED[key] = value
-        _PREPARED.move_to_end(key)
-        while len(_PREPARED) > _PREPARED_MAX:
-            _PREPARED.popitem(last=False)
-    return value
+            while len(_PREPARED) > _PREPARED_MAX:
+                _PREPARED.popitem(last=False)
+        return value
+    finally:
+        with _LOCK:
+            _BUILDING.pop(key).set()
+
+
+def sheet_frame(sheet: dict) -> pd.DataFrame:
+    """The sheet's table as editing.load_frame reads it ("_rowid" first, then its columns with their types restored),
+    read from the database once per version of the sheet: every edit rewrites the profile, so sheet_key changes and an
+    older frame is never used. Each caller gets a shallow copy (copy-on-write), so nothing it does can change the
+    remembered frame."""
+    return cached(("frame", sheet_key(sheet)), lambda: load_frame(sheet)).copy(deep=False)
 
 
 def _sheet_tables(key) -> set[str]:
@@ -141,7 +164,9 @@ def forget(table_names) -> None:
 
 
 def _prepare(frame: pd.DataFrame, kinds: dict[str, str], labels: dict[str, str]) -> Prepared:
-    frame = frame.copy()
+    # A shallow copy: columns that need no cleaning share the caller's memory, and copy-on-write keeps the
+    # caller's frame unchanged when a column is replaced here.
+    frame = frame.copy(deep=False)
     select, fields = [], []
     for col in frame.columns:
         kind = kinds.get(col) or ("number" if pd.api.types.is_numeric_dtype(frame[col]) else "text")
@@ -165,10 +190,15 @@ def _prepare(frame: pd.DataFrame, kinds: dict[str, str], labels: dict[str, str])
 
 
 def prepare_sheet(sheet: dict) -> Prepared:
+    """The sheet ready for DuckDB. Its frame keeps "_rowid" first (the entry numbers formula checks refer to, so they
+    need no second read), which the view leaves out, as it has no meaning in the person's or the AI's queries."""
     def build() -> Prepared:
         columns = sheet["profile"]["columns"]
-        return _prepare(load_frame(sheet).drop(columns=ROWID), {c["name"]: c["kind"] for c in columns},
-                        {c["name"]: c["label"] for c in columns})
+        table = sheet_frame(sheet)
+        frame, select, fields = _prepare(table.drop(columns=ROWID), {c["name"]: c["kind"] for c in columns},
+                                         {c["name"]: c["label"] for c in columns})
+        frame.insert(0, ROWID, table[ROWID].to_numpy())
+        return frame, select, fields
 
     return cached(sheet_key(sheet), build)
 
@@ -181,8 +211,10 @@ def _database() -> duckdb.DuckDBPyConnection:
     global _DATABASE
     with _LOCK:
         if _DATABASE is None:
-            # Use the machine's cores for big files (capped so one request cannot starve the others).
-            database = duckdb.connect(":memory:", config={"threads": max(2, min(8, os.cpu_count() or 2)), "memory_limit": "1GB"})
+            # Use the machine's cores for big files (capped so one request cannot starve the others). No temporary
+            # directory: a query past the memory limit fails instead of spilling files onto the server's disk.
+            database = duckdb.connect(":memory:", config={"threads": max(2, min(8, os.cpu_count() or 2)), "memory_limit": "1GB",
+                                                          "temp_directory": ""})
             # No query can ever touch files, the network, extensions or settings.
             database.execute("SET enable_external_access = false")
             database.execute("SET lock_configuration = true")

@@ -1,11 +1,11 @@
 # Run Accounts.ai on a server (e.g. a Hostinger VPS): docker compose up -d --build
-# Needs backend/.env with OPENAI_API_KEY (copy backend/.env.example). The site is then on port 80.
+# Needs backend/.env with DATABASE_URL and OPENAI_API_KEY (copy backend/.env.example). The site is then on port 80.
+# Nothing is kept on the server's disk: the books, uploads and chats are in the database DATABASE_URL points at (Supabase),
+# so there is no data volume, and a rebuild or a new server starts with everything there.
 services:
   backend:
     build: ./backend
     env_file: ./backend/.env
-    volumes:
-      - accounts-data:/data   # the books (SQLite); kept across restarts and rebuilds
     restart: unless-stopped
 
   web:
@@ -15,6 +15,3 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
-
-volumes:
-  accounts-data:

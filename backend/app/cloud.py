@@ -2,10 +2,11 @@
 
 When SUPABASE_URL and a secret key are set, each file a person uploads is also stored, byte for byte, in a
 private Supabase Storage bucket. The copy is made in the background after the upload is saved, so it never slows
-an upload down or makes it fail. Until Supabase confirms it, the file waits in a local outbox
-(DATA_DIR/cloud_outbox), so a lost connection or a restart cannot lose the copy: passing failures are retried
-(and again every 15 minutes while they last), copies left waiting are resumed when the backend starts, and only
-problems that retrying cannot fix (wrong key, refused file, public bucket) are marked failed.
+an upload down or makes it fail. Until Supabase confirms it, the file waits in the database (table cloud_outbox;
+nothing is kept on the server's disk), so a lost connection or a restart cannot lose the copy: passing failures are
+retried (and again every 15 minutes while they last), copies left waiting are resumed when the backend starts, and
+only problems that retrying cannot fix (wrong key, refused file, public bucket) are marked failed. Several backends
+may share the database: a copy is sent or moved by one of them at a time (a lock in the database).
 Copies are filed by register (uploads/sales/..., uploads/purchases/..., uploads/unsorted/...): at upload when the file
 is clearly one register, else unsorted; when a sheet of it is added to the books, the copy goes to that register's
 folder (moved within Supabase, never deleted and sent again; a failed move is retried like a copy).
@@ -26,11 +27,13 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import Column, DateTime, Integer, String, Table, Text, case, func, insert, select, update
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import (BigInteger, Column, DateTime, ForeignKey, Integer, LargeBinary, String, Table, Text, case, delete,
+                        func, select, text, update)
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 from . import config, database
 
@@ -38,11 +41,11 @@ from . import config, database
 cloud_files = Table(
     "cloud_files",
     database.metadata,
-    Column("dataset_id", Integer, primary_key=True),
-    Column("filename", String(255), nullable=False),
+    Column("dataset_id", Integer, primary_key=True, autoincrement=False),  # the upload's id
+    Column("filename", Text, nullable=False),  # as uploaded, any length (the object's name is cut short, see _safe_name)
     Column("bucket", String(100), nullable=False),
     Column("path", String(1024), nullable=False),  # where the copy is (done, or moving) or goes (waiting to be sent)
-    Column("size_bytes", Integer, nullable=False),
+    Column("size_bytes", BigInteger, nullable=False),
     Column("sha256", String(64), nullable=False),
     Column("status", String(20), nullable=False),  # pending | done | failed
     Column("attempts", Integer, nullable=False),
@@ -52,6 +55,16 @@ cloud_files = Table(
     # (pending, or failed). While the outbox still holds the file, the copy may be there or not (a send whose answer
     # was lost): it is moved if it is, else the file is sent to the new place.
     Column("move_to", String(1024)),
+)
+
+# The outbox: the file of each copy Supabase does not have yet, until it does (then the row goes, in the transaction
+# that records the copy as sent). Its own table, so reading a copy's state never reads the file.
+cloud_outbox = Table(
+    "cloud_outbox",
+    database.metadata,
+    Column("dataset_id", Integer, ForeignKey("cloud_files.dataset_id", ondelete="CASCADE"), primary_key=True,
+           autoincrement=False),
+    Column("content", LargeBinary, nullable=False),
 )
 
 REGISTER_FOLDERS = ("sales", "purchases", "unsorted")
@@ -73,6 +86,7 @@ _MIME = {
 # Two copies at a time, on daemon threads: a copy waiting to retry must never hold up a restart (pm2, --reload);
 # the outbox keeps the file, so an interrupted copy is simply sent again on the next start.
 _slots = threading.BoundedSemaphore(2)
+_LOCKS = "accountsai-cloud"  # the database locks of the copies being sent: (hashtext of this, the upload id)
 _lock = threading.Lock()
 _active: set[int] = set()  # copies being sent now (never start a second send of the same file)
 _again: set[int] = set()  # filed under a register while being sent: run once more when that send ends
@@ -104,10 +118,6 @@ def configured() -> bool:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _outbox() -> Path:
-    return config.DATA_DIR / "cloud_outbox"
 
 
 def _safe_name(filename: str) -> str:
@@ -246,28 +256,45 @@ class _Missing(CloudError):
     """A move found the object at neither place."""
 
 
-def _transaction(work):
-    """``work(conn)`` in one transaction that waits out another writer (an upload storing a big sheet) instead of failing
-    on 'database is locked'. Returns what it returns."""
+# Database errors that a moment later may not happen again: a deadlock or serialization failure, too many connections,
+# the server shutting down or restarting (and every connection error, class 08).
+_PASSING_STATES = {"40001", "40P01", "53300", "57P01", "57P02", "57P03"}
+
+
+def passing(exc: Exception) -> bool:
+    """Whether a database error passes (the connection dropped: the pooler, the network or the server restarting; or a
+    state in _PASSING_STATES), so the whole transaction can simply run again."""
+    if not isinstance(exc, DBAPIError):
+        return False
+    state = getattr(exc.orig, "sqlstate", None) or ""
+    return (exc.connection_invalidated or state in _PASSING_STATES or state.startswith("08")
+            or (isinstance(exc, OperationalError) and not state))  # no state: the connection could not be made
+
+
+def run_in_transaction(work):
+    """``work(conn)`` in one transaction, run again after a passing database error (see passing) with growing pauses
+    instead of failing. Returns what it returns. Every caller's work may run twice (a reply lost after the commit)."""
     for pause in (0.5, 1, 2, 4, 8):
         try:
             with database.engine.begin() as conn:
                 return work(conn)
-        except OperationalError as exc:
-            if "locked" not in str(exc).lower():
+        except DBAPIError as exc:
+            if not passing(exc):
                 raise
             time.sleep(pause)
     with database.engine.begin() as conn:
         return work(conn)
 
 
-def _write(statement) -> int:
-    """One write, as _transaction; returns the number of rows it changed."""
-    return _transaction(lambda conn: conn.execute(statement).rowcount)
+def _set(dataset_id: int, *, sent: bool = False, **values) -> None:
+    """Record a copy's state. ``sent``: Supabase has the file, so it leaves the outbox in the same transaction (a copy
+    recorded as sent never keeps its file, and one still waiting never loses it)."""
+    def work(conn):
+        conn.execute(update(cloud_files).where(cloud_files.c.dataset_id == dataset_id).values(updated_at=_now(), **values))
+        if sent:
+            conn.execute(delete(cloud_outbox).where(cloud_outbox.c.dataset_id == dataset_id))
 
-
-def _set(dataset_id: int, **values) -> None:
-    _write(update(cloud_files).where(cloud_files.c.dataset_id == dataset_id).values(updated_at=_now(), **values))
+    run_in_transaction(work)
     from .mongo_sync import touch  # mongo_sync imports this module
 
     touch("upload", dataset_id)  # MongoDB's copy of the upload shows the copy's new state (never raises)
@@ -279,6 +306,39 @@ def _row(dataset_id: int):
                             .where(cloud_files.c.dataset_id == dataset_id)).mappings().first()
 
 
+def _waiting(dataset_id: int) -> bytes | None:
+    """The file waiting in the outbox, or None when there is none."""
+    with database.engine.connect() as conn:
+        return conn.execute(select(cloud_outbox.c.content).where(cloud_outbox.c.dataset_id == dataset_id)).scalar()
+
+
+def _in_outbox(dataset_id: int) -> bool:
+    with database.engine.connect() as conn:
+        return conn.execute(select(cloud_outbox.c.dataset_id).where(cloud_outbox.c.dataset_id == dataset_id)).first() is not None
+
+
+@contextmanager
+def _claimed(dataset_id: int):
+    """Yields whether this process may send or move the copy now. Several backends can share the database (more workers,
+    or an old and a new one during a deploy): only the one holding the copy's lock in the database works on it. The lock
+    is held by a connection kept for the run, and goes with it, or with the process."""
+    key = {"space": _LOCKS, "id": dataset_id}
+    conn = database.engine.connect()
+    held = False
+    try:
+        held = bool(conn.execute(text("SELECT pg_try_advisory_lock(hashtext(:space), CAST(:id AS integer))"), key).scalar())
+        conn.commit()
+        yield held
+    finally:
+        try:
+            if held:
+                conn.execute(text("SELECT pg_advisory_unlock(hashtext(:space), CAST(:id AS integer))"), key)
+                conn.commit()
+        except Exception:  # noqa: BLE001 - the connection is gone: the server dropped its lock with it
+            conn.invalidate()  # never back to the pool still holding a lock
+        conn.close()
+
+
 def _wait(tried: int) -> None:
     if tried < ATTEMPTS_PER_RUN:
         time.sleep(_RETRY_DELAYS[min(tried - 1, len(_RETRY_DELAYS) - 1)])
@@ -286,11 +346,10 @@ def _wait(tried: int) -> None:
 
 def _send(dataset_id: int, row) -> bool:
     """Copy one outbox file to Supabase, retrying passing failures, and record the outcome; True once it is stored."""
-    local = _outbox() / f"{dataset_id}"
-    if not local.exists():
+    content = _waiting(dataset_id)
+    if content is None:
         _set(dataset_id, status="failed", error="The local copy waiting to be sent is missing; upload the file again.")
         return False
-    content = local.read_bytes()
     if hashlib.sha256(content).hexdigest() != row["sha256"]:
         _set(dataset_id, status="failed", error="The local copy waiting to be sent is damaged; upload the file again.")
         return False
@@ -311,10 +370,10 @@ def _send(dataset_id: int, row) -> bool:
             _set(dataset_id, status="pending", attempts=attempts, error=str(exc), **where)
             _wait(tried)
             continue
-        # Stored where it was sent: done, unless it is to move to its register's folder next.
-        _set(dataset_id, attempts=attempts, error=None, status=case(((c.path == sent) & c.move_to.is_(None), "done"),
-                                                                   else_="pending"), **where)
-        local.unlink(missing_ok=True)
+        # Stored where it was sent: done, unless it is to move to its register's folder next. Either way the file
+        # leaves the outbox: Supabase has it.
+        _set(dataset_id, sent=True, attempts=attempts, error=None,
+             status=case(((c.path == sent) & c.move_to.is_(None), "done"), else_="pending"), **where)
         return True
     return False
 
@@ -325,13 +384,12 @@ def _move(dataset_id: int, row) -> bool:
     have arrived without an answer: a copy there is moved, and when there is none, True: the file is to be sent to the
     new place instead."""
     source, target, attempts = row["path"], row["move_to"], row["attempts"]
-    local = _outbox() / f"{dataset_id}"
     for tried in range(1, ATTEMPTS_PER_RUN + 1):
         attempts += 1
         try:
             _move_object(row["bucket"], source, target)
         except CloudError as exc:
-            if isinstance(exc, _Missing) and local.exists():
+            if isinstance(exc, _Missing) and _in_outbox(dataset_id):
                 _set(dataset_id, status="pending", attempts=attempts, error=None, path=target, move_to=None)
                 return True
             error = f"Not yet moved to {target}: {exc}"
@@ -341,8 +399,8 @@ def _move(dataset_id: int, row) -> bool:
             _set(dataset_id, status="pending", attempts=attempts, error=error)
             _wait(tried)
             continue
-        _set(dataset_id, status="done", attempts=attempts, error=None, path=target, move_to=None)
-        local.unlink(missing_ok=True)  # a send whose answer was lost did arrive
+        # A send whose answer was lost did arrive: its file leaves the outbox.
+        _set(dataset_id, sent=True, status="done", attempts=attempts, error=None, path=target, move_to=None)
         return False
     return False
 
@@ -376,8 +434,11 @@ def _submit(dataset_id: int, again: bool = False) -> bool:
 
     def work():
         try:
-            with _slots:
-                _run(dataset_id)
+            # Another backend sending or moving this copy now: it re-reads the row as it goes, and the sweep takes up
+            # whatever is still waiting.
+            with _slots, _claimed(dataset_id) as ours:
+                if ours:
+                    _run(dataset_id)
         except Exception as exc:  # noqa: BLE001 - a background copy must never take the server down
             try:
                 # Left pending (not failed) so the next sweep tries again; no raw text, which could hold SQL or a key.
@@ -406,20 +467,19 @@ def enqueue(dataset_id: int, filename: str, content: bytes, register: str = "uns
     row = {"dataset_id": dataset_id, "filename": filename, "bucket": config.SUPABASE_BUCKET,
            "path": object_path(dataset_id, filename, when, sha, register), "size_bytes": len(content), "sha256": sha,
            "status": "pending", "attempts": 0, "error": None, "updated_at": when, "move_to": None}
-    # The file reaches the disk in full before the row that points at it exists (a power cut cannot leave a
-    # truncated file marked as waiting).
-    _outbox().mkdir(parents=True, exist_ok=True)
-    temp, final = _outbox() / f"{dataset_id}.part", _outbox() / f"{dataset_id}"
-    with open(temp, "wb") as fh:
-        fh.write(content)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(temp, final)
-    try:
-        _write(insert(cloud_files).prefix_with("OR REPLACE").values(**row))
-    except Exception:
-        final.unlink(missing_ok=True)
-        raise
+    copy = database.upsert(cloud_files).values(**row)
+    copy = copy.on_conflict_do_update(index_elements=[cloud_files.c.dataset_id],
+                                      set_={name: copy.excluded[name] for name in row if name != "dataset_id"})
+    waiting = database.upsert(cloud_outbox).values(dataset_id=dataset_id, content=content)
+    waiting = waiting.on_conflict_do_update(index_elements=[cloud_outbox.c.dataset_id],
+                                            set_={"content": waiting.excluded.content})
+
+    def work(conn):
+        # The row and its whole file are stored together (one transaction): a copy marked as waiting always has its file.
+        conn.execute(copy)
+        conn.execute(waiting)
+
+    run_in_transaction(work)
     _submit(dataset_id)
 
 
@@ -430,12 +490,7 @@ def _refile(conn, dataset_id: int, register: str) -> bool | None:
     if not conn.execute(update(database.datasets).where((d.id == dataset_id) & d.register_added.is_not(True))
                         .values(register=register, register_added=True)).rowcount:
         return None
-    try:
-        row = conn.execute(select(c.filename, c.path, c.sha256).where(c.dataset_id == dataset_id)).first()
-    except OperationalError as exc:
-        if _table_missing(exc):
-            return False
-        raise
+    row = conn.execute(select(c.filename, c.path, c.sha256).where(c.dataset_id == dataset_id)).first()
     if row is None:
         return False
     target = object_path(dataset_id, row.filename, _month(row.path), row.sha256, register)
@@ -455,7 +510,7 @@ def set_register(dataset_id: int, register: str) -> None:
     copy to that register's folder: one still waiting simply goes there, one already in Supabase is moved, in the
     background. Never raises: the import has succeeded either way."""
     try:
-        move = _transaction(lambda conn: _refile(conn, dataset_id, register))
+        move = run_in_transaction(lambda conn: _refile(conn, dataset_id, register))
         if move is None:
             return
         from .mongo_sync import touch  # mongo_sync imports this module
@@ -476,11 +531,6 @@ def _sweep_forever() -> None:
             pass
 
 
-def _table_missing(exc: OperationalError) -> bool:
-    """The table could not be created at startup (a read-only data folder): there are no copies to report."""
-    return "no such table" in str(exc)
-
-
 def resume() -> int:
     """Send copies still waiting (at startup, and every 15 minutes while any wait); returns how many started."""
     global _sweeper_started
@@ -490,13 +540,8 @@ def resume() -> int:
         if not _sweeper_started:
             _sweeper_started = True
             threading.Thread(target=_sweep_forever, name="cloud-sweeper", daemon=True).start()
-    try:
-        with database.engine.connect() as conn:
-            ids = conn.execute(select(cloud_files.c.dataset_id).where(cloud_files.c.status == "pending")).scalars().all()
-    except OperationalError as exc:
-        if _table_missing(exc):
-            return 0
-        raise
+    with database.engine.connect() as conn:
+        ids = conn.execute(select(cloud_files.c.dataset_id).where(cloud_files.c.status == "pending")).scalars().all()
     return sum(_submit(dataset_id) for dataset_id in ids)
 
 
@@ -504,41 +549,26 @@ def retry_failed() -> int:
     """Send every failed copy again (e.g. after fixing the key or making the bucket private)."""
     if not configured():
         return 0
-    with database.engine.connect() as conn:
-        ids = conn.execute(select(cloud_files.c.dataset_id).where(cloud_files.c.status == "failed")).scalars().all()
-    if ids:
-        _write(update(cloud_files).where(cloud_files.c.dataset_id.in_(ids)).values(status="pending", attempts=0, updated_at=_now()))
+    ids = run_in_transaction(lambda conn: conn.execute(
+        update(cloud_files).where(cloud_files.c.status == "failed").values(status="pending", attempts=0, updated_at=_now())
+        .returning(cloud_files.c.dataset_id)).scalars().all())
     with _lock:
         _checked_buckets.clear()
     return sum(_submit(dataset_id) for dataset_id in ids)
 
 
-def _utc(when: datetime | None) -> datetime | None:
-    """SQLite drops the time zone; the values were written in UTC."""
-    return when.replace(tzinfo=timezone.utc) if when is not None and when.tzinfo is None else when
-
-
 def status_of(dataset_id: int) -> dict | None:
-    try:
-        row = _row(dataset_id)
-    except OperationalError as exc:
-        if _table_missing(exc):
-            return None
-        raise
+    row = _row(dataset_id)
     if row is None:
         return None
     return {"status": row["status"], "bucket": row["bucket"], "path": row["path"], "error": row["error"],
-            "updated_at": _utc(row["updated_at"])}
+            "updated_at": row["updated_at"]}
 
 
 def summary() -> dict:
     counts = {"pending": 0, "done": 0, "failed": 0}
-    try:
-        with database.engine.connect() as conn:
-            for status, count in conn.execute(select(cloud_files.c.status, func.count()).group_by(cloud_files.c.status)):
-                counts[status] = count
-    except OperationalError as exc:
-        if not _table_missing(exc):
-            raise
+    with database.engine.connect() as conn:
+        for status, count in conn.execute(select(cloud_files.c.status, func.count()).group_by(cloud_files.c.status)):
+            counts[status] = count
     return {"configured": configured(), "provider": "supabase" if configured() else None,
             "bucket": config.SUPABASE_BUCKET if configured() else None, **counts}

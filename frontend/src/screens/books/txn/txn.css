@@ -270,3 +270,47 @@
   text-align: right;
   overflow-wrap: anywhere;
 }
+
+/* The whole bill in its details sheet: each item (name and tag, then its figures), then the money lines. */
+.txn-bill {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.txn-bill__title {
+  margin: 4px 0 0;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--soft);
+}
+
+.txn-item {
+  padding: 10px 12px 2px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--raised);
+}
+
+.txn-item__name {
+  margin: 0 0 4px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 14px;
+}
+
+.txn-item__name strong {
+  overflow-wrap: anywhere;
+}
+
+.txn-item__tag {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--gold);
+}

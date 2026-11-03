@@ -9,8 +9,10 @@ numpy>=2.0
 openpyxl>=3.1
 xlrd>=2.0
 SQLAlchemy>=2.0
-anthropic>=0.118
-typing_extensions>=4.6  # TypedDicts for the Claude tool schemas (Python < 3.12)
+# The database driver (PostgreSQL, e.g. Supabase): the binary wheels bring their own libpq, so neither a slim Docker
+# image nor Windows needs a compiler. psycopg 3.3 needs Python 3.10+.
+psycopg[binary]>=3.3; python_version >= "3.10"
+psycopg[binary]>=3.2,<3.3; python_version < "3.10"
 openai>=3.36; python_version >= "3.10"
 openai>=2.0,<3; python_version < "3.10"
 # duckdb 2.x has wheels for Python 3.11+ only.

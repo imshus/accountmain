@@ -16,11 +16,11 @@ from sqlalchemy import and_, func, select
 
 from .. import gst
 from ..compat import to_datetime
-from ..database import engine
 from ..formatting import indian
 from ..reports import AGEING_BUCKETS, _col, _report, gst_net_payable
 from . import chart, service
 from .db import bank_lines, bill_allocations, ledgers, voucher_lines, vouchers
+from .service import connect, one_view, remembered
 
 
 def _r(paise) -> float:
@@ -42,9 +42,12 @@ def _period(company: dict, start: date | None, end: date | None) -> tuple[date, 
 
 
 def _latest_voucher_date(company_id: int) -> date | None:
-    with engine.connect() as conn:
-        return conn.execute(select(func.max(vouchers.c.date)).where(and_(
-            vouchers.c.company_id == company_id, vouchers.c.cancelled.is_(False)))).scalar()
+    def load() -> date | None:
+        with connect() as conn:
+            return conn.execute(select(func.max(vouchers.c.date)).where(and_(
+                vouchers.c.company_id == company_id, vouchers.c.cancelled.is_(False)))).scalar()
+
+    return remembered(("latest_date", company_id), load)
 
 
 def _year_start(company: dict, day: date) -> date:
@@ -68,7 +71,8 @@ def _period_text(start: date, end: date) -> str:
 
 
 def entries(company_id: int, until: date | None = None) -> pd.DataFrame:
-    """Every line of every live voucher, with its voucher's details."""
+    """Every line of every live voucher, with its voucher's details. Read once per service.reading(): a report that
+    needs it in several places (balances, then the lines themselves) does not send it over the network again."""
     v, l = vouchers, voucher_lines
     query = (
         select(v.c.id.label("voucher_id"), v.c.vtype, v.c.number, v.c.date, v.c.narration, v.c.reference,
@@ -78,12 +82,16 @@ def entries(company_id: int, until: date | None = None) -> pd.DataFrame:
     )
     if until:
         query = query.where(v.c.date <= until)
-    with engine.connect() as conn:
-        frame = pd.read_sql(query, conn)
-    frame["date"] = to_datetime(frame["date"]).dt.date
-    for col in ("dr", "cr"):
-        frame[col] = frame[col].astype("int64")
-    return frame
+
+    def load() -> pd.DataFrame:
+        with connect() as conn:
+            frame = pd.read_sql(query, conn)
+        frame["date"] = to_datetime(frame["date"]).dt.date
+        for col in ("dr", "cr"):
+            frame[col] = frame[col].astype("int64")
+        return frame
+
+    return remembered(("entries", company_id, until), load)
 
 
 def ledger_frame(company_id: int) -> pd.DataFrame:
@@ -141,6 +149,7 @@ def balances(company: dict, start: date, end: date, extra_brought_forward: int =
 # --- Day book and ledgers ---------------------------------------------------------------------------
 
 
+@one_view
 def day_book(company: dict, start: date | None, end: date | None, vtype: str | None = None) -> dict:
     start, end = _period(company, start, end)
     lines = entries(company["id"], end)
@@ -174,6 +183,7 @@ def day_book(company: dict, start: date | None, end: date | None, vtype: str | N
     return report
 
 
+@one_view
 def ledger_report(company: dict, ledger_id: int | None, start: date | None, end: date | None, cash_bank_only: bool = False) -> dict:
     asked_start, asked_end = start, end
     start, end = _period(company, start, end)
@@ -240,6 +250,7 @@ def ledger_report(company: dict, ledger_id: int | None, start: date | None, end:
 # --- Trial balance, P&L, balance sheet ----------------------------------------------------------------
 
 
+@one_view
 def trial_balance(company: dict, start: date | None, end: date | None) -> dict:
     start, end = _fy_period(company, start, end)
     bal = balances(company, start, end)
@@ -327,6 +338,7 @@ def _opening_stock_check(company: dict, start: date, opening_stock: int | None, 
             f"Enter the previous period's closing stock in Opening stock; until then {effect}."}
 
 
+@one_view
 def profit_and_loss(company: dict, start: date | None, end: date | None, opening_stock: float | None, closing_stock: float) -> dict:
     start, end = _fy_period(company, start, end)
     bal = balances(company, start, end)
@@ -379,6 +391,7 @@ _BS_LIAB = ["Capital Account", "Loans (Liability)", "Current Liabilities", "Bran
 _BS_ASSET = ["Fixed Assets", "Investments", "Current Assets", "Misc. Expenses (ASSET)"]
 
 
+@one_view
 def balance_sheet(company: dict, end: date | None, opening_stock: float | None, closing_stock: float) -> dict:
     # Current-year profit from the start of the financial year containing the balance sheet date; earlier
     # years' profit comes in through the "Profit & Loss A/c" row of balances().
@@ -443,6 +456,7 @@ def balance_sheet(company: dict, end: date | None, opening_stock: float | None, 
 # --- Bill-wise outstanding ---------------------------------------------------------------------------
 
 
+@one_view
 def outstanding(company: dict, kind: str, as_of: date | None) -> dict:
     """Receivables (kind='receivable', Sundry Debtors) or payables ('payable', Sundry Creditors), bill by bill."""
     as_of = as_of or date.today()
@@ -451,7 +465,7 @@ def outstanding(company: dict, kind: str, as_of: date | None) -> dict:
     led = ledger_frame(company["id"])
     parties = led[led.group_name == group]
     b, l, v = bill_allocations, voucher_lines, vouchers
-    with engine.connect() as conn:
+    with connect() as conn:
         bills = pd.read_sql(
             select(b.c.ledger_id, b.c.kind, b.c.bill_ref, b.c.amount_paise.label("amount"), b.c.bill_date, b.c.due_date, v.c.vtype, v.c.number)
             .join(l, l.c.id == b.c.line_id).join(v, v.c.id == l.c.voucher_id)
@@ -554,6 +568,7 @@ def _gst_invoices(company: dict, start: date, end: date) -> pd.DataFrame:
     return frame
 
 
+@one_view
 def gstr1(company: dict, start: date | None, end: date | None) -> dict:
     start, end = _fy_period(company, start, end)
     inv = _gst_invoices(company, start, end)
@@ -613,6 +628,7 @@ def gstr1(company: dict, start: date | None, end: date | None) -> dict:
     return report
 
 
+@one_view
 def gstr3b(company: dict, start: date | None, end: date | None) -> dict:
     start, end = _fy_period(company, start, end)
     inv = _gst_invoices(company, start, end)
@@ -661,6 +677,7 @@ def gstr3b(company: dict, start: date | None, end: date | None) -> dict:
 MATCH_BEFORE_DAYS, MATCH_AFTER_DAYS = 3, 10  # bank date may be up to 3 days before / 10 days after the book date
 
 
+@one_view
 def bank_reconciliation(company: dict, bank_ledger_id: int | None, as_of: date | None) -> dict:
     led = ledger_frame(company["id"])
     banks = led[led.group_name.isin(["Bank Accounts", "Bank OD A/c"])]
@@ -669,7 +686,7 @@ def bank_reconciliation(company: dict, bank_ledger_id: int | None, as_of: date |
         report = _report("Bank reconciliation", {}, options=options)
         report["checks"].append({"level": "info", "message": "Choose a bank ledger, then upload its statement under Import."})
         return report
-    with engine.connect() as conn:
+    with connect() as conn:
         stmt = pd.read_sql(select(bank_lines).where(and_(bank_lines.c.company_id == company["id"], bank_lines.c.bank_ledger_id == bank_ledger_id)), conn)
     if stmt.empty:
         raise service.AccountsError("No bank statement imported for this ledger yet (Import → Bank statement).")
@@ -759,6 +776,7 @@ def bank_reconciliation(company: dict, bank_ledger_id: int | None, as_of: date |
 # --- Dashboard ----------------------------------------------------------------------------------------
 
 
+@one_view
 def dashboard(company: dict) -> dict:
     # Positions are closing balances; sales, purchases and profit are for the latest financial year.
     start, end = _fy_period(company, None, None)

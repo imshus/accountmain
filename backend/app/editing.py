@@ -31,7 +31,7 @@ def load_frame(sheet: dict) -> pd.DataFrame:
     """The sheet's current table with column types restored (dates as datetimes) and its rowids."""
     table = quote_ident(sheet["table_name"])
     with engine.connect() as conn:
-        frame = pd.read_sql_query(f"SELECT rowid AS {ROWID}, * FROM {table} ORDER BY rowid", conn)
+        frame = pd.read_sql_query(f"SELECT * FROM {table} ORDER BY {quote_ident(ROWID)}", conn)
     kinds = {c["name"]: c["kind"] for c in sheet["profile"]["columns"]}
     for col in frame.columns.drop(ROWID):
         kind = kinds.get(col, "number" if pd.api.types.is_numeric_dtype(frame[col]) else "text")
@@ -114,12 +114,14 @@ def list_rows(sheet: dict, offset: int, limit: int, search: str | None) -> dict:
     columns = [c["name"] for c in sheet["profile"]["columns"]]
     where, params = "", {}
     if search:
-        where = " WHERE " + " OR ".join(f"CAST({quote_ident(c)} AS TEXT) LIKE :q" for c in columns)
-        params["q"] = f"%{search.strip()}%"
+        # Case-insensitive as before; a % or _ typed in the search is matched as itself.
+        where = " WHERE " + " OR ".join(f"CAST({quote_ident(c)} AS TEXT) ILIKE :q ESCAPE '!'" for c in columns)
+        typed = search.strip().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+        params["q"] = f"%{typed}%"
     with engine.connect() as conn:
         total = conn.execute(text(f"SELECT COUNT(*) FROM {table}{where}"), params).scalar_one()
         result = conn.execute(
-            text(f"SELECT rowid AS {ROWID}, * FROM {table}{where} ORDER BY rowid LIMIT :limit OFFSET :offset"),
+            text(f"SELECT * FROM {table}{where} ORDER BY {quote_ident(ROWID)} LIMIT :limit OFFSET :offset"),
             params | {"limit": limit, "offset": offset},
         )
         names = list(result.keys())
@@ -130,6 +132,8 @@ def list_rows(sheet: dict, offset: int, limit: int, search: str | None) -> dict:
 def _cell(value):
     if isinstance(value, float):
         return round(value, 8) if math.isfinite(value) else None
+    if hasattr(value, "is_finite") and hasattr(value, "as_tuple"):  # Decimal
+        return float(value) if value.is_finite() else None
     return value
 
 
@@ -159,6 +163,17 @@ def add_row(sheet: dict, values: dict[str, str | float | None]) -> None:
     names = list(record)
     placeholders = ", ".join(f":p{i}" for i in range(len(names)))
     with engine.begin() as conn:
+        # A column made from whole numbers is BIGINT: a value like 1.5 first turns it into DOUBLE PRECISION, so the
+        # value is kept as typed instead of being rounded.
+        fractional = [n for n in names if isinstance(record[n], float) and not record[n].is_integer()]
+        if fractional:
+            types = dict(conn.execute(text(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = :t"), {"t": sheet["table_name"]}).all())
+            for name in fractional:
+                if types.get(name) in ("bigint", "integer", "smallint"):
+                    conn.exec_driver_sql(f"ALTER TABLE {quote_ident(sheet['table_name'])} ALTER COLUMN {quote_ident(name)} "
+                                         "TYPE DOUBLE PRECISION")
         conn.execute(
             text(f"INSERT INTO {quote_ident(sheet['table_name'])} ({', '.join(map(quote_ident, names))}) VALUES ({placeholders})"),
             {f"p{i}": record[name] for i, name in enumerate(names)},
@@ -168,7 +183,7 @@ def add_row(sheet: dict, values: dict[str, str | float | None]) -> None:
 def delete_row(sheet: dict, rowid: int) -> None:
     with engine.begin() as conn:
         deleted = conn.execute(
-            text(f"DELETE FROM {quote_ident(sheet['table_name'])} WHERE rowid = :r"), {"r": rowid}
+            text(f"DELETE FROM {quote_ident(sheet['table_name'])} WHERE {quote_ident(ROWID)} = :r"), {"r": rowid}
         ).rowcount
     if not deleted:
         raise EditError("That entry no longer exists.")
@@ -241,9 +256,12 @@ def save_column(sheet: dict, label: str, result: pd.Series, frame: pd.DataFrame)
         name, n = f"{base}_{n}", n + 1
     table = quote_ident(sheet["table_name"])
     with engine.begin() as conn:
-        conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {quote_ident(name)} REAL")
+        conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {quote_ident(name)} DOUBLE PRECISION")
+        # One statement for every row (one round trip to the database, not one per row).
         conn.execute(
-            text(f"UPDATE {table} SET {quote_ident(name)} = :v WHERE rowid = :r"),
-            [{"v": None if pd.isna(v) else float(v), "r": int(r)} for v, r in zip(result, frame[ROWID])],
+            text(f"UPDATE {table} AS t SET {quote_ident(name)} = v.val "
+                 f"FROM unnest(CAST(:ids AS bigint[]), CAST(:vals AS double precision[])) AS v(id, val) "
+                 f"WHERE t.{quote_ident(ROWID)} = v.id"),
+            {"ids": [int(r) for r in frame[ROWID]], "vals": [None if pd.isna(v) else float(v) for v in result]},
         )
     return name

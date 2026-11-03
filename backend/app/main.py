@@ -14,15 +14,17 @@ from concurrent.futures import TimeoutError as FutureTimeout  # the builtin Time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy.exc import OperationalError
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeout
+from starlette.formparsers import MultiPartParser
 
 from datetime import date
 
-from . import analysis, books, classify, cloud, config, database, detect, editing, llm, mongo_sync, reports
+from . import analysis, books, classify, cloud, config, database, detect, editing, llm, mongo_sync, reports, voice
 from .accounts import api as accounts_api
 from .accounts import db as _accounts_tables  # noqa: F401  (registers the books tables before create_all)
 from .accounts import imports as accounts_imports
@@ -32,7 +34,8 @@ from .calc import CalcError, evaluate_number, format_decimal
 from .duck import Session, cached, sheet_key
 from .excel_loader import UploadError, read_workbook
 from .llm import followups
-from .llm.common import describe_tables, says_register, warm_tables
+from .llm.books_data import books_tables
+from .llm.common import describe_tables, warm_tables
 from .schemas import (
     AddRowRequest,
     AnalysisRequest,
@@ -74,6 +77,45 @@ from .schemas import (
 
 # Older turns beyond this are dropped; the table context is resent every turn anyway.
 MAX_CHAT_MESSAGES = 20
+# Nothing is written to the server's disk: an uploaded file stays in memory up to the upload limit (Starlette would put
+# anything over 1 MB in a temporary file). Only a body over the limit, which is refused, can still reach one.
+MultiPartParser.spool_max_size = (config.MAX_UPLOAD_MB + 1) * 1024 * 1024
+_DATABASE_RETRY_SECONDS = 30  # how often making the tables is tried again while the database does not answer
+
+
+def _database_error(exc: Exception) -> str | None:
+    """What to tell the app about a database error, never its SQL, values, address or password; None for another error."""
+    if isinstance(exc, PoolTimeout):
+        return "The server is busy: every connection to its database is in use. Try again in a moment."
+    if not isinstance(exc, DBAPIError):
+        return None
+    state = getattr(exc.orig, "sqlstate", None) or ""
+    if state == "25006":  # a read-only transaction: Supabase turns the database read-only when its disk is full
+        return database.storage_problem() or "The server cannot save: its database is read-only for the backend's user."
+    if cloud.passing(exc) or state.startswith("28"):  # unreachable, restarting, or the password refused
+        return database.storage_problem() or "The server lost its connection to the database; try again in a moment."
+    if state == "42501":
+        return "The server cannot do this: its database user lacks a permission it needs (use the database's owner)."
+    return f"The server hit an error: {type(exc).__name__}: {database._safe_reason(exc)}"[:330]
+
+
+def _init_database(report: bool) -> bool:
+    """Make the tables, columns and triggers this version needs (init_db); False while the database cannot be reached
+    or refuses, with the reason printed when ``report``."""
+    try:
+        database.init_db()
+        return True
+    except DBAPIError as exc:
+        if report:
+            print(f"The database's tables are not ready yet: {_database_error(exc)}")
+        return False
+
+
+def _init_database_later() -> None:
+    """The database did not answer at startup (not up yet, paused, the network down): make its tables once it does."""
+    while not _init_database(report=False):
+        time.sleep(_DATABASE_RETRY_SECONDS)
+    print("The database answers now: its tables are ready.")
 
 
 @asynccontextmanager
@@ -81,15 +123,14 @@ async def lifespan(_app: FastAPI):
     problem = database.storage_problem()
     if problem:
         print(problem)
+    if config.DATABASE_URL and not _init_database(report=not problem):
+        # Still start, so /api/health and every request can say what is wrong (the books can be read from a read-only
+        # database); the tables are made as soon as the database answers.
+        threading.Thread(target=_init_database_later, name="database-init", daemon=True).start()
     try:
-        database.init_db()
-    except OperationalError as exc:
-        # A read-only data folder: still start, so the books can be read and every save explains how to fix it.
-        if "readonly database" not in str(exc):
-            raise
-        if not problem:
-            print(f"The database is read-only, so nothing can be saved until that is fixed: {exc}")
-    cloud.resume()  # copies to Supabase that were still waiting when the backend stopped
+        cloud.resume()  # copies to Supabase that were still waiting when the backend stopped
+    except Exception as exc:  # noqa: BLE001 - its sweep tries again every 15 minutes
+        print(f"Supabase copies still waiting are not resumed yet ({type(exc).__name__}); they are tried again later.")
     mongo_sync.start()  # the live copy of the records in MongoDB, when set up
     if config.openai_configured():
         threading.Thread(target=llm.gpt.warm_up, daemon=True).start()  # the first question skips the handshake
@@ -119,10 +160,9 @@ class _ErrorsAsJson:
             logging.getLogger("uvicorn.error").exception("%s %s failed", scope.get("method"), scope.get("path"))
             if started:  # part of the answer is already out (a streamed chat): nothing else can be sent
                 raise
-            if "readonly database" in str(exc):
-                detail = database.storage_problem() or "The server cannot save: its database is read-only for the backend's user."
-            else:
-                detail = f"The server hit an error: {type(exc).__name__}: {exc}"[:330]
+            # On a thread: telling why the database fails may wait for it (up to its connect timeout).
+            detail = await asyncio.to_thread(_database_error, exc)
+            detail = detail or f"The server hit an error: {type(exc).__name__}: {exc}"[:330]
             await JSONResponse({"detail": detail}, status_code=500)(scope, receive, send)
 
 
@@ -152,8 +192,46 @@ class _ChatBodyLimit:
         await self.app(scope, counted, send)
 
 
+_COMPANY_PATH = re.compile(r"/api/companies/(\d+)(?=/|$)")
+_COMPANY_SEEN_SECONDS = 60  # a company seen this recently is not looked up again
+_companies_seen: dict[int, float] = {}  # company id -> when it was last seen to exist
+
+
+def _company_for(company_id: int | None) -> int:
+    """The company a request is served by: the one asked for when it exists, else the default one
+    (accounts_service.company_or_default). Asked for on 2026-10-28: a missing company is bypassed, not an error."""
+    seen = _companies_seen.get(company_id) if company_id is not None else None
+    if seen is not None and time.monotonic() - seen < _COMPANY_SEEN_SECONDS:
+        return company_id
+    found = accounts_service.company_or_default(company_id)
+    _companies_seen[found] = time.monotonic()
+    return found
+
+
+class _MissingCompany:
+    """A request for a company that no longer exists (the app still holds one a fresh start deleted) is served by the
+    default company: the path's company id is replaced before routing, so every books route answers instead of failing
+    with "Company not found."."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        found = _COMPANY_PATH.match(scope["path"]) if scope["type"] == "http" else None
+        if found and config.DATABASE_URL:
+            wanted = int(found.group(1))
+            served = await asyncio.to_thread(_company_for, wanted)  # a database lookup: off the event loop
+            if served != wanted:
+                prefix = f"/api/companies/{wanted}"
+                raw = scope.get("raw_path") or scope["path"].encode()
+                scope = dict(scope, path=f"/api/companies/{served}{scope['path'][len(prefix):]}",
+                             raw_path=f"/api/companies/{served}".encode() + raw[len(prefix.encode()):])
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="Accounts.ai API", version="0.1.0", lifespan=lifespan)
-app.add_middleware(_ErrorsAsJson)  # added first, so it runs inside CORSMiddleware
+app.add_middleware(_MissingCompany)  # innermost, so a database error while it looks up the company is a JSON 500 too
+app.add_middleware(_ErrorsAsJson)  # added before CORSMiddleware, so it runs inside it
 app.add_middleware(_ChatBodyLimit)  # inside CORSMiddleware too, so the app can read its 413
 app.add_middleware(
     CORSMiddleware,
@@ -200,15 +278,46 @@ def _detail(dataset: dict) -> dict:
             "cloud": cloud.status_of(dataset["id"])}
 
 
+# /api/health answers within this many seconds even when the database does not (the app's own check waits 5); one check
+# of the database runs at a time, and requests meanwhile share its answer.
+_HEALTH_WAIT = 4
+_health_lock = threading.Lock()
+_health_check: Future | None = None
+_HEALTH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="health")
+
+
+def _database_health() -> tuple[str | None, dict | None, dict | None]:
+    """(what stops the backend reading or saving, or None; the Supabase copies' counts; the MongoDB copy's counts). The
+    counts are None while the database cannot be read."""
+    problem = database.storage_problem()
+    if problem:
+        return problem, None, None
+    try:
+        return None, cloud.summary(), mongo_sync.summary()
+    except (DBAPIError, PoolTimeout) as exc:
+        return _database_error(exc), None, None
+
+
 @app.get("/api/health", response_model=Health)
 def health():
+    global _health_check
+    with _health_lock:
+        if _health_check is None or _health_check.done():
+            _health_check = _HEALTH_POOL.submit(_database_health)
+        check = _health_check
+    try:
+        problem, copies, records = check.result(timeout=_HEALTH_WAIT)
+    except FutureTimeout:
+        problem, copies, records = (f"The backend cannot reach its database at {config.database_host()}: no answer within "
+                                    f"{_HEALTH_WAIT} seconds."), None, None
     return {"status": "ok", "providers": llm.provider_status(), "default_provider": llm.default_provider(),
-            "cloud": cloud.summary(), "mongo": mongo_sync.summary(), "storage_problem": database.storage_problem()}
+            "cloud": copies, "mongo": records, "storage_problem": problem}
 
 
 @app.post("/api/upload", response_model=DatasetDetail, status_code=201)
 def upload(file: UploadFile = File(...)):
-    filename = Path(file.filename or "upload").name
+    # Without NUL characters, which the database cannot store in text (a crafted name could hold them).
+    filename = Path((file.filename or "upload").replace("\x00", "")).name or "upload"
     if Path(filename).suffix.lower() not in config.ALLOWED_EXTENSIONS:
         allowed = ", ".join(sorted(config.ALLOWED_EXTENSIONS))
         raise HTTPException(status_code=400, detail=f"Unsupported file type. Upload one of: {allowed}.")
@@ -544,6 +653,19 @@ def warm_ai():
         threading.Thread(target=llm.gpt.warm_up, daemon=True).start()
 
 
+@app.post("/api/voice/call")
+async def voice_call(request: Request):
+    """The voice agent: the app's WebRTC offer (SDP text) in, OpenAI's SDP answer out (voice.answer)."""
+    body = await request.body()
+    if len(body) > voice.MAX_SDP_BYTES:
+        raise HTTPException(status_code=413, detail="That voice call offer is too large.")
+    try:
+        sdp = await asyncio.to_thread(voice.answer, body.decode("utf-8", "replace"))
+    except voice.VoiceError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from None
+    return Response(content=sdp, media_type="application/sdp")
+
+
 # A sheet counts as a register (stacked into "registers" and compared) only when detected with confidence:
 # a low-confidence guess, such as an invoice sheet inside a ledger workbook, would change every total.
 _CONFIDENT = ("high", "medium")
@@ -619,7 +741,7 @@ def _prefetch(sheets: list[dict], registers: list[dict]) -> None:
     jobs = _register_jobs(registers) if registers else None
 
     def warm():
-        describe_tables(sheets)  # mostly SQLite queries, which overlap well with the comparison
+        describe_tables(sheets)  # mostly database queries, which overlap well with the comparison
         stacked = jobs[0].result() if jobs else None
         if jobs:
             jobs[1].result()
@@ -657,24 +779,19 @@ def documents(body: DocumentsRequest):
 
 
 def _books_company(company_id: int | None, sheets: list[dict]) -> int | None:
-    """The company whose books the chat may add a shared sheet to: one that exists, and only when files are shared.
-    A company deleted meanwhile is not an error: the chat still answers, without that tool."""
-    if company_id is None or not sheets:
+    """The company whose books the chat may add a shared sheet to, only when files are shared: the one the app chose,
+    or the default company when that one is gone (or none was sent), as for every books route (_MissingCompany)."""
+    if not sheets:
         return None
-    try:
-        accounts_service.get_company(company_id)
-    except accounts_service.AccountsError:
-        return None
-    return company_id
+    return _company_for(company_id)
 
 
-def _pending_registers(found: list[dict], company_id: int | None, messages: list[dict]) -> list[dict]:
+def _pending_registers(found: list[dict], company_id: int | None) -> list[dict]:
     """Shared sheets that are (or may be) a sales or purchase register and are not in the company's books yet (nor
-    imported as a register already, whatever that import posted), while the person's latest message does not say which
-    register: the answer asks, and the app shows a button for each register. Only with a company. The suggestion is the
-    detected register when it is fairly sure and nothing points the other way."""
-    previous = messages[-2]["content"] if len(messages) > 1 and messages[-2]["role"] == "assistant" else ""
-    if company_id is None or says_register(messages[-1]["content"], llm.strip_context(previous)):
+    imported as a register already, whatever that import posted): unless the answer adds them (the person asked, as the
+    intent check reads), it offers to, and the app shows a button for each register. Only with a company. The suggestion
+    is the detected register when it is fairly sure and nothing points the other way."""
+    if company_id is None:
         return []
     candidates = [f for f in found if f["kind"] in books.REGISTERS]
     tables = [f["table_name"] for f in candidates]
@@ -689,20 +806,24 @@ def files_chat_stream(body: FilesChatRequest):
     sheets, registers, documents_text, found = _shared_files(body.dataset_ids)
     messages = _chat_messages(body)
     company_id = _books_company(body.company_id, sheets)
-    pending = _pending_registers(found, company_id, messages)
+    # The company's books are readable in every chat, with or without files shared.
+    books_company = _books_company(body.company_id, [{}])
 
     def answer(emit, cancel):
+        pending = _pending_registers(found, company_id)
+        books = books_tables(books_company) if books_company is not None else {}
         if not registers:
-            return llm.chat(body.provider, messages, sheets, emit=emit, fresh=body.fresh, documents=documents_text,
-                            cancel=cancel, company_id=company_id, pending=pending)
+            return llm.chat(body.provider, messages, sheets, books or None, emit=emit, fresh=body.fresh,
+                            documents=documents_text, cancel=cancel, company_id=company_id, pending=pending,
+                            bill_company_id=books_company, files=found)
         table, comparison = _register_jobs(registers)
         wait = _waiter(emit, cancel)
         stacked = wait(table)
-        extra = {"registers": stacked} if stacked else {}
+        extra = {**books, **({"registers": stacked} if stacked else {})}
         # The app's exact comparison of the two registers, read only when the answer is not remembered.
         return llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh, documents=documents_text,
                         combined=(lambda: wait(comparison)) if stacked else None, cancel=cancel, company_id=company_id,
-                        pending=pending)
+                        pending=pending, bill_company_id=books_company, files=found)
 
     return _stream_chat(answer)
 

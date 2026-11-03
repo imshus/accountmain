@@ -47,8 +47,10 @@ type RunOptions = {
 
 /** Delta text not yet shown: flushed to the store at most once per animation frame. */
 type StreamBuffer = { turnId: number; text: string; frame: number };
+/** What came of a question: the checked result, or why there is none (busy, not connected, stopped, failed). */
+export type AskOutcome = { result?: ChatResult; error?: string };
 
-/** The steps worth keeping after the answer: what was done, not "Reading the question…". */
+/** The steps worth keeping after the answer: what was done, not "Reading your entries…". */
 function keptSteps(steps: string[]): string[] {
   const done = steps.map((s) => s.replace(/…$/, "")).filter((s) => !/^(Reading|Uploading|Thinking)\b/.test(s));
   return [...new Set(done)].slice(-12);
@@ -175,7 +177,7 @@ export function useChatEngine({ scope, health, stream, activeId, onStarted, atta
     if (chatId === latest.current.activeId && !sendingRef.current) announce(`Suggested questions: ${followups.join("; ")}`);
   }
 
-  async function run(chatId: string, turnId: number, options: RunOptions) {
+  async function run(chatId: string, turnId: number, options: RunOptions): Promise<AskOutcome> {
     sendingRef.current = true;
     setSendingId(chatId);
     setNotice(null);
@@ -250,7 +252,7 @@ export function useChatEngine({ scope, health, stream, activeId, onStarted, atta
             updateTurn(chatId, turnId, (t) => ({ ...t, shared: true, live: undefined }));
             announce("Uploaded. Ask a question about it.");
             if (both && brings) setNotice(blocked());
-            return;
+            return {};
           }
           prompt = COMPARE_PROMPT;
           updateTurn(chatId, turnId, (t) => ({ ...t, prompt }));
@@ -291,11 +293,13 @@ export function useChatEngine({ scope, health, stream, activeId, onStarted, atta
       updateTurn(chatId, turnId, (t) => ({ ...t, result, steps: keptSteps(steps), live: undefined }));
       announce(readyText(result));
       void suggest(chatId, turnId, result, selected.id);
+      return { result };
     } catch (error) {
       const rest = takeBuffer();
       if ((error as Error).name === "AbortError") {
         updateTurn(chatId, turnId, (t) => ({ ...t, stopped: true, partial: (t.live?.text ?? "") + rest, live: undefined }));
         announce("Stopped.");
+        return { error: "Stopped." };
       } else {
         let message = (error as Error).message;
         // A shared file was deleted from the library: drop it from the conversation instead of failing on every question.
@@ -324,6 +328,7 @@ export function useChatEngine({ scope, health, stream, activeId, onStarted, atta
         }
         updateTurn(chatId, turnId, (t) => ({ ...t, error: message, live: undefined }));
         announce(message);
+        return { error: message };
       }
     } finally {
       finished = true;
@@ -334,25 +339,37 @@ export function useChatEngine({ scope, health, stream, activeId, onStarted, atta
     }
   }
 
-  /** Ask a question in the conversation on screen (a new one when there is none). `prompt` replaces what is sent. */
-  function ask(text: string, prompt?: string): boolean {
+  /** Start a question in the conversation on screen (a new one when there is none); when it cannot be asked now, the
+   * reason (also shown as the notice, except for an empty question). */
+  function begin(text: string, prompt?: string): Promise<AskOutcome> | string {
     const question = text.trim();
-    if (!question) return false;
+    if (!question) return "Nothing was asked.";
     if (sendingRef.current) {
       setNotice(BUSY);
-      return false;
+      return BUSY;
     }
     const problem = blocked();
     if (problem) {
       setNotice(problem);
-      return false;
+      return problem;
     }
     const chatId = active?.id ?? startChat(question);
     const before = active?.turns ?? [];
     const id = Date.now();
     addTurn(chatId, { id, question, prompt: prompt && prompt !== question ? prompt : undefined, live: { steps: [], text: "" } });
-    void run(chatId, id, { prompt: prompt ?? question, before });
-    return true;
+    return run(chatId, id, { prompt: prompt ?? question, before });
+  }
+
+  /** Ask a question in the conversation on screen (a new one when there is none). `prompt` replaces what is sent. */
+  function ask(text: string, prompt?: string): boolean {
+    return typeof begin(text, prompt) !== "string";
+  }
+
+  /** Ask as ask() does, for the voice agent: resolves once the answer is written, with the checked result, or with
+   * why there is none (busy, not connected, stopped, failed). The question and answer show in the conversation too. */
+  function askAndWait(text: string): Promise<AskOutcome> {
+    const started = begin(text);
+    return typeof started === "string" ? Promise.resolve({ error: started }) : started;
   }
 
   /** Share Excel / CSV files: they upload into the conversation on screen (a new one when there is none). */
@@ -450,6 +467,7 @@ export function useChatEngine({ scope, health, stream, activeId, onStarted, atta
     turns,
     ready,
     sending,
+    askAndWait,
     /** The conversation whose answer is being written (may be another than the one on screen). */
     sendingId,
     uploading,
