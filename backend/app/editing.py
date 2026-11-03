@@ -49,7 +49,7 @@ def refresh_profile(sheet: dict, change: dict, extra_labels: dict[str, str] | No
     old = sheet["profile"]
     frame = load_frame(sheet).drop(columns=ROWID)
     labels = {c["name"]: c["label"] for c in old["columns"]} | (extra_labels or {})
-    edits = {"added": 0, "deleted": 0, "columns": 0} | old.get("edits", {})
+    edits = {"added": 0, "deleted": 0, "columns": 0, "details": 0} | old.get("edits", {})
     for key, count in change.items():
         edits[key] += count
 
@@ -59,6 +59,7 @@ def refresh_profile(sheet: dict, change: dict, extra_labels: dict[str, str] | No
             (edits["added"], "entry added", "entries added"),
             (edits["deleted"], "entry deleted", "entries deleted"),
             (edits["columns"], "calculated column added", "calculated columns added"),
+            (edits["details"], "date or party filled in from the chat", "dates or parties filled in from the chat"),
         )
         if count
     )
