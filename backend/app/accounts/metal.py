@@ -173,7 +173,7 @@ def purity_unknown_invoice(conn, company: dict, vtype: str, party_id: int, metal
     """A Sales / Purchase of items whose purity was not given (a tag typed in the chat): each item keeps its weights,
     diamonds, tag and grading on a stock line with no fine weight, so the bill list and the stock by item count its net
     weight, while the fine gold is left out rather than guessed. A zero line on the party names it on the bill. Labour,
-    diamond and stone amounts, when given, are billed as on any bill (no GST)."""
+    diamond and stone amounts, and the metal's value when the bill has a price, are billed as on any bill (no GST)."""
     if vtype not in ("Sales", "Purchase"):
         raise AccountsError("Choose Sales or Purchase.")
     if not items:
@@ -190,8 +190,10 @@ def purity_unknown_invoice(conn, company: dict, vtype: str, party_id: int, metal
         labour = to_paise(item.get("labour_value"), "Labour") if item.get("labour_value") not in (None, "") else \
             half_up((details["net_mg"] or 0) * to_paise(item.get("labour_rate"), "Labour rate"), 1000)
         diamond_value, stone_value = to_paise(item.get("diamond_value"), "Diamond value"), to_paise(item.get("stone_value"), "Stone value")
-        taxable += diamond_value + stone_value + labour
-        details.update(labour_paise=labour or None, dia_paise=diamond_value or None, stn_paise=stone_value or None, metal_paise=None)
+        metal_value = to_paise(item.get("metal_value"), "Metal value") if item.get("metal_value") not in (None, "") else 0
+        taxable += metal_value + diamond_value + stone_value + labour
+        details.update(labour_paise=labour or None, dia_paise=diamond_value or None, stn_paise=stone_value or None,
+                       metal_paise=metal_value or None)
         metal_out.append(MetalLine(stock, metal, dr=0, cr=0, details=details))
     metal_out.append(MetalLine(party_id, metal, dr=0, cr=0))
     lines, summary = ([], {"taxable": 0, "total": 0})
