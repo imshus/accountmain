@@ -18,7 +18,9 @@ from .. import analysis, cloud, detect
 from ..accounts import imports as books_imports
 from ..accounts.service import AccountsError
 from ..calc import CalcError, evaluate_number, format_decimal
+from ..accounts.db import ledgers as books_ledgers
 from ..accounts.db import metal_lines as books_metal_lines
+from ..accounts.db import voucher_lines as books_voucher_lines
 from ..accounts.db import vouchers as books_vouchers
 from ..database import QueryError, engine, get_dataset, quote_ident, read_preview
 from ..duck import Session, prepare_sheet, sheet_frame, sheet_key
@@ -650,8 +652,10 @@ BILL_TOOL_DESCRIPTION = (
     "Save one bill the person typed in the chat (\"Input by chat\") to the chosen company's books, as a sale or a purchase, "
     "exactly as the app's Sales / Purchase entry form does: a jewellery bill by weight, labour + diamond amounts, no GST. "
     "Call it once per bill as soon as the person asks, without asking them anything first; never guess a weight, purity "
-    "or rate they did not give (null when not given: a bill without purity is saved without fine gold). Returns the bill "
-    "number and amounts."
+    "or rate they did not give (null when not given: a bill without purity is saved without fine gold). A price the "
+    "person gives is the bill's amount; a bill with a price needs no weight (an item that is not jewellery). Called "
+    "again for the same bill with a price or purity given later, it updates that bill. Returns the bill number and "
+    "amounts."
 )
 _BILL_FIELDS = {  # name -> (JSON type, description)
     "register": ("string", "sales for a bill to a customer, purchases for a bill from a supplier: as the person said, else "
@@ -668,6 +672,11 @@ _BILL_FIELDS = {  # name -> (JSON type, description)
     "diamond_ct": ("number|null", "Diamond weight in carats (\"d. wt\", \"dia wt\"); null when none."),
     "diamond_rate": ("number|null", "Diamond rate in rupees per carat; null when none."),
     "labour_rate": ("number|null", "Labour rate in rupees per gram of net weight; null when none."),
+    "amount": ("number|null", "The bill's total price in rupees when the person gives one, in any wording: \"price 600000\", "
+                              "\"60000 me becha\", \"for ₹1,200\", \"1200 rupees\", \"total 1,00,000\", \"taxable value "
+                              "100000\" (an amount given earlier in the conversation for this bill counts). It is the whole "
+                              "bill, labour and diamonds included; never turn it into a rate. null when none."),
+    "pieces": ("integer|null", "How many pieces or units (\"2 units\", \"3 pcs\"); null when not given."),
     "date": ("string|null", "Bill date as YYYY-MM-DD; null for today."),
     "bill_no": ("string|null", "Bill number when the person gave one; null to number it automatically."),
     "tag_no": ("string|null", "The item's tag number, e.g. DGR266; null when not given."),
@@ -755,9 +764,13 @@ class Toolbox:
     def add_bill(self, register: str, party: str, item: str, gross_g: float | None = None, purity_pct: float | None = None,
                  net_g: float | None = None, diamond_ct: float | None = None, diamond_rate: float | None = None,
                  labour_rate: float | None = None, date: str | None = None, bill_no: str | None = None,
-                 tag_no: str | None = None, huid: str | None = None, color: str | None = None, clarity: str | None = None) -> str:
+                 tag_no: str | None = None, huid: str | None = None, color: str | None = None, clarity: str | None = None,
+                 amount: float | None = None, pieces: int | None = None) -> str:
         """Save one typed bill as the entry form does (POST /companies/{id}/vouchers/jewellery, gold, by weight, no GST);
-        return its number and amounts as JSON for the model. Raises EditError/AccountsError on failure."""
+        return its number and amounts as JSON for the model. With ``amount`` (the price the person typed) the bill is
+        for that many rupees: the item is settled in rupees (its metal at the amount less labour and diamonds), or, with
+        no weight (an item that is not jewellery), the bill is that amount alone. The same bill typed again with a price
+        or purity it lacked is updated, not saved twice. Raises EditError/AccountsError on failure."""
         from datetime import date as _date
 
         from ..accounts import metal as books_metal
@@ -770,6 +783,15 @@ class Toolbox:
         register = self.bill_register or register  # the register the intent check read in the person's words wins
         if register not in BOOKS_REGISTERS:
             raise EditError(f"Unknown register {register!r}; use sales or purchases.")
+        known = self._chat_bill((bill_no or "").strip(), "Sales" if register == "sales" else "Purchase")
+        if known:  # a bill saved from the chat, named by its number: what the person does not repeat stays as it was
+            party, item, date = party or known["party"], item or known["item"], date or known["date"]
+            gross_g = gross_g if gross_g is not None else known["gross_g"]
+            net_g = net_g if net_g is not None else known["net_g"]
+            diamond_ct = diamond_ct if diamond_ct is not None else known["diamond_ct"]
+            purity_pct = purity_pct if purity_pct is not None else known["purity_pct"]
+            tag_no, huid = tag_no or known["tag_no"], huid or known["huid"]
+            color, clarity = color or known["color"], clarity or known["clarity"]
         party, item = (party or "").strip(), (item or "").strip()
         # Typed all in lower case on a phone ("hukum chand jewellers"): saved as a name is written. Other casing is kept.
         party, item = (party.title() if party.islower() else party), (item.title() if item.islower() else item)
@@ -782,11 +804,15 @@ class Toolbox:
         if len((bill_no or "").strip()) > 40:
             raise EditError("Not saved: the bill number is longer than 40 characters. Ask for the bill number as printed "
                             "on the bill.")
-        if not (gross_g and gross_g > 0) and not (net_g and net_g > 0):
-            raise EditError("Not saved: the bill needs the net or gross weight in grams. Ask for it.")
+        if amount is not None and amount < 0:
+            raise EditError("Not saved: the amount cannot be below zero. Ask for the bill's amount.")
+        priced = bool(amount)
+        weighed = bool(gross_g and gross_g > 0) or bool(net_g and net_g > 0)
+        if not weighed and not priced:
+            raise EditError("Not saved: the bill needs the net or gross weight in grams, or its amount in rupees. Ask for it.")
         if purity_pct is not None and not 0 < purity_pct <= 100:
             raise EditError("Not saved: purity must be a percent above 0 and at most 100 (e.g. 91.6 for 22K). Ask for it.")
-        purity_given = bool(purity_pct)
+        purity_given = bool(purity_pct) and weighed
         try:
             day = _date.fromisoformat(date) if date else _date.today()
         except ValueError as exc:
@@ -805,7 +831,16 @@ class Toolbox:
             gross=str(gross_g) if gross_g else None, net=str(net_g) if net_g else None, tag_no=(tag_no or "").strip().upper() or None, diamond_ct=str(diamond_ct) if diamond_ct else None,
             diamond_value=f"{float(diamond_ct) * float(diamond_rate):.2f}" if diamond_ct and diamond_rate else None,
             labour_rate=str(labour_rate) if labour_rate else None, settle="Wt", huid=huid or None, colour=color or None,
-            clarity=clarity or None).model_dump()
+            clarity=clarity or None, pieces=int(pieces) if pieces and pieces > 0 else None).model_dump()
+        amount_paise = books_service.to_paise(amount, "Amount") if priced else 0
+        if priced and weighed:  # sold or bought for that price: the metal is what is left after labour and diamonds
+            net_mg = books_metal.item_weights({**line, "tunch": None, "fine": None}, fine_optional=True)["net_mg"] or 0
+            parts = books_service.half_up(net_mg * books_service.to_paise(line["labour_rate"], "Labour rate"), 1000) \
+                + books_service.to_paise(line["diamond_value"], "Diamond value")
+            if parts > amount_paise:
+                raise EditError(f"Not saved: the amount {amount_paise / 100:,.2f} is less than the labour and diamonds "
+                                f"({parts / 100:,.2f}). Ask which figure is right.")
+            line.update(settle="Rs", metal_value=f"{(amount_paise - parts) / 100:.2f}")
         with _BOOKS_LOCK:  # one at a time, and a repeated call in this answer gets the first one's reply
             if key in self._book_replies:
                 return self._book_replies[key]
@@ -819,11 +854,20 @@ class Toolbox:
                 found = conn.execute(select(books_vouchers.c.id, books_vouchers.c.number).where(
                     books_vouchers.c.company_id == self.bill_company_id, books_vouchers.c.source == source,
                     books_vouchers.c.cancelled.is_(False))).first()
+                if found is None and (bill_no or "").strip():  # a bill saved from the chat, named by its number ("iska
+                    # price 120000 tha" after INV/26-27/0003 was saved): that bill gets what was given now
+                    found = conn.execute(select(books_vouchers.c.id, books_vouchers.c.number).where(
+                        books_vouchers.c.company_id == self.bill_company_id, books_vouchers.c.vtype == vtype,
+                        books_vouchers.c.number == bill_no.strip(), books_vouchers.c.source.startswith("chat:"),
+                        books_vouchers.c.cancelled.is_(False))).first()
                 fine_known = bool(found) and bool(conn.execute(select(func.sum(books_metal_lines.c.dr_mg + books_metal_lines.c.cr_mg)).where(
                     books_metal_lines.c.voucher_id == found.id)).scalar())
+                # Saved earlier without its price (or with another): this price is what the person says it is now.
+                billed = int(conn.execute(select(func.coalesce(func.sum(books_voucher_lines.c.dr_paise), 0)).where(
+                    books_voucher_lines.c.voucher_id == found.id)).scalar()) if found else 0
                 books_moved = None
-                if found and (fine_known or not purity_given):  # already in the books as asked: nothing saved again
-                    vid, outcome = found.id, "already"
+                if found and (fine_known or not purity_given) and not (priced and billed != amount_paise):
+                    vid, outcome = found.id, "already"  # already in the books as asked: nothing saved again
                 else:
                     # A bill dated before the books begin moves the start back, in this same transaction.
                     books_moved = books_imports.fit_books_start(conn, company, [day])
@@ -831,15 +875,25 @@ class Toolbox:
                         company = books_service.get_company(self.bill_company_id, conn)
                     party_id = books_service.ensure_ledger(conn, self.bill_company_id, party,
                                                            "Sundry Debtors" if sales else "Sundry Creditors")
-                    if purity_given:
-                        lines, moved, summary = books_metal.jewellery_invoice(conn, company, vtype, party_id, "gold", [line], 0, True, None)
+                    items_text = None
+                    if not weighed:  # an item that is not jewellery: the bill is its amount, with no metal
+                        main = books_service.ensure_ledger(conn, self.bill_company_id, "Sales" if sales else "Purchase",
+                                                           "Sales Accounts" if sales else "Purchase Accounts")
+                        lines, _summary = books_service.gst_invoice_lines(
+                            conn, company, vtype, party_id, [{"ledger_id": main, "taxable": amount_paise, "rate": 0}], False)
+                        moved = []
+                        items_text = (item or "Item") + (f" × {int(pieces)}" if pieces and pieces > 1 else "")
+                    elif purity_given:
+                        lines, moved, summary = books_metal.jewellery_invoice(conn, company, vtype, party_id, "gold", [line], 0,
+                                                                              not priced, None)  # a price is kept to the paisa
                     else:  # no purity: weights, diamonds and tag kept, fine gold left out (not guessed)
                         lines, moved, summary = books_metal.purity_unknown_invoice(conn, company, vtype, party_id, "gold", [line])
                     self.check_cancelled()  # stopped before the commit: nothing is saved
-                    # Saved earlier without purity and now given it: the same bill gets its fine gold (no second bill).
+                    # Saved earlier without purity or price and now given it: the same bill is updated (no second bill).
                     vid = books_service.save_voucher(
                         self.bill_company_id, vtype, day, lines, number=found.number if found else (bill_no or "").strip() or None,
-                        narration="Added from the chat", source=source, voucher_id=found.id if found else None, conn=conn, metal=moved)
+                        narration="Added from the chat", source=source, voucher_id=found.id if found else None, conn=conn,
+                        metal=moved, items_text=items_text)
                     outcome = "updated" if found else "saved"
             saved = books_service.get_voucher(self.bill_company_id, vid)
             total_paise = max(sum(l["dr_paise"] for l in saved["lines"]), sum(l["cr_paise"] for l in saved["lines"]))
@@ -853,14 +907,16 @@ class Toolbox:
                                (stock.get("dr_mg") or stock.get("cr_mg") or 0) / 1000, (stock.get("dia_mct") or 0) / 1000])
             note = {
                 "saved": "No GST is charged (the app's bill form has none). Tell the person the bill number and total.",
-                "updated": "This bill was saved earlier without purity; it now has its purity and fine gold (same bill number, "
-                           "nothing saved twice). Say so in one line.",
+                "updated": "This bill was saved earlier without its purity or price; it now has what the person gave (same bill "
+                           "number, nothing saved twice). Say so in one line.",
                 "already": "This exact bill is already in the books (same party, item, weights, tag and date), so it was not "
                            "saved again. Say so; if it really is a second, separate bill, ask for its bill number or tag.",
             }[outcome]
-            if not purity_given and outcome != "already":
+            if not purity_given and weighed and outcome != "already":
                 note += (" Purity was not given, so the bill has no fine gold weight (its net weight and diamonds are counted "
                          "in stock); say so in one line.")
+            if priced and outcome != "already":
+                note += f" The bill is for the amount the person gave, {amount_paise / 100:,.2f}."
             if books_moved:
                 note += " " + _books_start_note(books_moved)
             reply = self._book_replies[key] = json.dumps({
@@ -868,6 +924,34 @@ class Toolbox:
                 "date": str(day), "party": party, "item": item, "total_rupees": total_paise / 100, "note": note,
             }, ensure_ascii=False, default=str)
         return reply
+
+    def _chat_bill(self, number: str, vtype: str) -> dict | None:
+        """A bill add_bill saved, by its number: its party, date and item as saved, for an update that names only the
+        bill and the figure it lacked. None when there is no such bill."""
+        if not number or not self.can_add_bill:
+            return None
+        with engine.connect() as conn:
+            vid = conn.execute(select(books_vouchers.c.id).where(
+                books_vouchers.c.company_id == self.bill_company_id, books_vouchers.c.vtype == vtype,
+                books_vouchers.c.number == number, books_vouchers.c.source.startswith("chat:"),
+                books_vouchers.c.cancelled.is_(False))).scalar()
+            if vid is None:
+                return None
+            ledger_ids = {r.ledger_id for r in conn.execute(select(books_voucher_lines.c.ledger_id).where(
+                books_voucher_lines.c.voucher_id == vid))} | {r.ledger_id for r in conn.execute(
+                select(books_metal_lines.c.ledger_id).where(books_metal_lines.c.voucher_id == vid))}
+            party = conn.execute(select(books_ledgers.c.name).where(
+                books_ledgers.c.id.in_(ledger_ids), books_ledgers.c.group_name.in_(("Sundry Debtors", "Sundry Creditors")))).scalar()
+        from ..accounts import service as books_service
+
+        saved = books_service.get_voucher(self.bill_company_id, vid)
+        stock = next((m for m in saved["metal_lines"] if m.get("net_mg") or m.get("gross_mg")), {})
+        grams = lambda mg: mg / 1000 if mg else None  # noqa: E731
+        return {"party": party or "", "date": str(saved["date"]), "item": stock.get("item") or (saved.get("items_text") or "").split(" × ")[0],
+                "gross_g": grams(stock.get("gross_mg")), "net_g": grams(stock.get("net_mg")),
+                "diamond_ct": stock["dia_mct"] / 1000 if stock.get("dia_mct") else None,
+                "purity_pct": stock["tunch_bp"] / 100 if stock.get("tunch_bp") else None,
+                "tag_no": stock.get("tag_no"), "huid": stock.get("huid"), "color": stock.get("colour"), "clarity": stock.get("clarity")}
 
     @property
     def cache_key(self) -> str:
