@@ -1,10 +1,13 @@
-import { Card, Field, FieldRow, Input, Select } from "../../ui";
+import { Card, Field, FieldRow, Input } from "../../ui";
 import { itemKey, KARATS, type EntryItem, type FieldKey, type ItemField, type LabourBasis } from "./form";
+import type { AddRequest } from "./AddNameSheet";
 import { gramsText } from "./money";
+import { Picker } from "./Picker";
 import type { useEntry } from "./useEntry";
 
 type Props = {
   entry: ReturnType<typeof useEntry>;
+  ask: (request: AddRequest) => void;
   item: EntryItem;
   index: number;
   /** id of the <datalist> of item names. */
@@ -18,8 +21,8 @@ type Figure = "gross" | "purity" | "diaCt" | "diaRate" | "stnCt" | "stnRate" | "
 const rupeesText = (paise: number) => (paise / 100).toFixed(paise % 100 ? 2 : 0);
 
 /** One item of the bill: the design's Item, Gold, Diamond, Color Stone and Labour cards. */
-export function ItemCards({ entry, item, index, itemList }: Props) {
-  const { setItem, removeItem, errors, idOf, figures, form } = entry;
+export function ItemCards({ entry, ask, item, index, itemList }: Props) {
+  const { setItem, removeItem, errors, idOf, figures, form, books } = entry;
   const f = figures.items[index];
   const many = form.items.length > 1;
   const set = (patch: Partial<EntryItem>) => setItem(item.id, patch);
@@ -82,6 +85,9 @@ export function ItemCards({ entry, item, index, itemList }: Props) {
     );
   };
 
+  // The design's karats, then the shop's own, then a karat this item has that neither lists (a draft).
+  const karats = [...KARATS.map(([k]) => k), ...(books.masters.karat ?? []), item.karat].filter((k, i, all) => k && all.indexOf(k) === i);
+
   /** Choosing a karat fills the purity while it is empty, or still the last karat's own purity. */
   const chooseKarat = (karat: string) => {
     const before = KARATS.find(([k]) => k === item.karat)?.[1];
@@ -131,14 +137,27 @@ export function ItemCards({ entry, item, index, itemList }: Props) {
         <FieldRow>
           {figure("purity", "Purity %")}
           <Field label="Karat" htmlFor={id("karat")}>
-            <Select id={id("karat")} value={item.karat} onChange={(event) => chooseKarat(event.target.value)}>
-              <option value="">Select</option>
-              {KARATS.map(([karat]) => (
-                <option key={karat} value={karat}>
-                  {karat}
-                </option>
-              ))}
-            </Select>
+            <Picker
+              id={id("karat")}
+              value={item.karat}
+              options={karats.map((karat) => ({ value: karat, label: karat }))}
+              onSelect={chooseKarat}
+              placeholder="Select"
+              onAdd={(typed) =>
+                ask({
+                  title: "New karat",
+                  label: "Karat",
+                  initial: typed,
+                  description: "For example 20K or 9K. Kept on this device.",
+                  submit: (name) => {
+                    const karat = name.trim().toUpperCase().replace(/^(\d+)$/, "$1K");
+                    if (!karat) throw new Error("Enter the karat.");
+                    books.addMaster("karat", karat);
+                    chooseKarat(karat);
+                  },
+                })
+              }
+            />
           </Field>
         </FieldRow>
       </Card>
@@ -150,15 +169,13 @@ export function ItemCards({ entry, item, index, itemList }: Props) {
         <FieldRow>
           {figure("labourRate", "Labour rate")}
           <Field label="Per" htmlFor={id("labourBasis")}>
-            <Select
+            <Picker
               id={id("labourBasis")}
               value={item.labourBasis}
-              onChange={(event) => set({ labourBasis: event.target.value as LabourBasis })}
-            >
-              <option value="">Select</option>
-              <option value="gross">Gr. Wt</option>
-              <option value="net">Nt. Wt.</option>
-            </Select>
+              options={[{ value: "gross", label: "Gr. Wt" }, { value: "net", label: "Nt. Wt." }]}
+              onSelect={(basis) => set({ labourBasis: basis as LabourBasis })}
+              placeholder="Select"
+            />
           </Field>
         </FieldRow>
         {worked("labourValue", "Labour value", f.autoLabour ? rupeesText(f.autoLabour) : "")}

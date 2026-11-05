@@ -12,8 +12,8 @@ type Props = {
   options: PickerOption[];
   onSelect: (value: string) => void;
   placeholder: string;
-  /** "Add new" was tapped; gets what was typed in the search box, if anything. */
-  onAdd: (typed: string) => void;
+  /** "Add new" was tapped; gets what was typed in the search box, if anything. Left out: a fixed list (Karat, Per). */
+  onAdd?: (typed: string) => void;
   invalid?: boolean;
   describedBy?: string;
   loading?: boolean;
@@ -167,6 +167,7 @@ export function Picker({ id, value, options, onSelect, placeholder, onAdd, inval
               </li>
             ) : null}
           </ul>
+          {onAdd ? (
           <button
             type="button"
             className="entry-picker__add"
@@ -180,6 +181,7 @@ export function Picker({ id, value, options, onSelect, placeholder, onAdd, inval
             <Icon name="addc" size={18} />
             {q ? `Add “${query.trim()}”` : "Add new"}
           </button>
+          ) : null}
         </div>
       ) : null}
     </div>
