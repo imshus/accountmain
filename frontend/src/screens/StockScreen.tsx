@@ -19,6 +19,40 @@ const carats = (mct: number | null | undefined) => (mct ? `${(mct / 1000).toFixe
 const rupees = (paise: number | null | undefined) => (paise ? money(paise) : null);
 const TYPE: Record<string, string> = { Sales: "Sales", Purchase: "Purchase", "Credit Note": "Sales return", "Debit Note": "Purchase return" };
 
+/** What is typed in a date box, with the slashes put in as the digits come: "05112026" -> "05/11/2026". */
+function typedDate(text: string): string {
+  const digits = text.replace(/\D/g, "").slice(0, 8);
+  return [digits.slice(0, 2), digits.slice(2, 4), digits.slice(4)].filter(Boolean).join("/");
+}
+
+/** "05/11/2026" -> "2026-11-05"; "" while it is blank or not yet a whole, real date. */
+function isoOf(text: string): string {
+  const hit = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(text);
+  if (!hit) return "";
+  const [, d, m, y] = hit;
+  const day = new Date(Number(y), Number(m) - 1, Number(d));
+  return day.getFullYear() === Number(y) && day.getMonth() === Number(m) - 1 && day.getDate() === Number(d) ? `${y}-${m}-${d}` : "";
+}
+
+/** A date typed by hand (DD/MM/YYYY), without the calendar (the owner's wish, 2026-11-05). */
+function DateBox({ id, label, value, onChange }: { id: string; label: string; value: string; onChange: (text: string) => void }) {
+  const wrong = value.length === 10 && !isoOf(value);
+  return (
+    <Field label={label} htmlFor={id} error={wrong ? "Not a real date." : undefined}>
+      <Input
+        id={id}
+        inputMode="numeric"
+        autoComplete="off"
+        placeholder="DD/MM/YYYY"
+        maxLength={10}
+        value={value}
+        onChange={(event) => onChange(typedDate(event.target.value))}
+        aria-invalid={wrong || undefined}
+      />
+    </Field>
+  );
+}
+
 /** Rows of a detail card: [label, value]; a value left out shows "—", as in the design. */
 function Rows({ rows }: { rows: [string, string | null | undefined][] }) {
   return (
@@ -74,8 +108,11 @@ function ItemSheet({ item, onClose }: { item: StockItem | null; onClose: () => v
 export default function StockScreen(_props: StockScreenProps) {
   const company = useCompany();
   const { version } = useBooks();
-  const [from, setFrom] = useState("");
-  const [to, setTo] = useState("");
+  // As typed (DD/MM/YYYY); the list follows a date once it is whole and real.
+  const [fromText, setFrom] = useState("");
+  const [toText, setTo] = useState("");
+  const from = isoOf(fromText);
+  const to = isoOf(toText);
   const [rows, setRows] = useState<StockItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -120,12 +157,8 @@ export default function StockScreen(_props: StockScreenProps) {
 
         <Card>
           <FieldRow>
-            <Field label="From" htmlFor="stock-from">
-              <Input id="stock-from" type="date" value={from} max={to || undefined} onChange={(e) => setFrom(e.target.value)} />
-            </Field>
-            <Field label="To" htmlFor="stock-to">
-              <Input id="stock-to" type="date" value={to} min={from || undefined} onChange={(e) => setTo(e.target.value)} />
-            </Field>
+            <DateBox id="stock-from" label="From" value={fromText} onChange={setFrom} />
+            <DateBox id="stock-to" label="To" value={toText} onChange={setTo} />
           </FieldRow>
         </Card>
 
