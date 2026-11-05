@@ -1,7 +1,6 @@
 import { Card, Field, FieldRow, Input } from "../../ui";
 import { itemKey, KARATS, type EntryItem, type FieldKey, type ItemField, type LabourBasis } from "./form";
 import type { AddRequest } from "./AddNameSheet";
-import { gramsText } from "./money";
 import { Picker } from "./Picker";
 import type { useEntry } from "./useEntry";
 
@@ -14,9 +13,9 @@ type Props = {
   itemList: string;
 };
 
-type Worked = "net" | "diaValue" | "stnValue" | "labourValue";
+type Worked = "diaValue" | "stnValue" | "labourValue";
 type Words = "name" | "code" | "design" | "diaShape" | "diaColour" | "diaClarity" | "stnShape" | "stnColour" | "stnClarity";
-type Figure = "gross" | "purity" | "diaCt" | "diaRate" | "stnCt" | "stnRate" | "labourRate";
+type Figure = "gross" | "net" | "purity" | "diaCt" | "diaRate" | "stnCt" | "stnRate" | "labourRate";
 
 const rupeesText = (paise: number) => (paise / 100).toFixed(paise % 100 ? 2 : 0);
 
@@ -56,7 +55,7 @@ export function ItemCards({ entry, ask, item, index, itemList }: Props) {
         enterKeyHint="next"
         autoComplete="off"
         placeholder="0"
-        value={item[field]}
+        value={item[field] ?? ""}
         onChange={(event) => set({ [field]: event.target.value })}
         aria-invalid={Boolean(error(field)) || undefined}
       />
@@ -132,7 +131,7 @@ export function ItemCards({ entry, ask, item, index, itemList }: Props) {
       <Card title="Gold">
         <FieldRow>
           {figure("gross", "Gross weight")}
-          {worked("net", "Net weight", f.autoNetMg > 0 ? gramsText(f.autoNetMg) : "")}
+          {figure("net", "Net weight")}
         </FieldRow>
         <FieldRow>
           {figure("purity", "Purity %")}

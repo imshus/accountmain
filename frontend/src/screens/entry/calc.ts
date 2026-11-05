@@ -12,7 +12,6 @@ export type ItemPreview = {
   grossMg: number;
   diaMct: number;
   stnMct: number;
-  autoNetMg: number; // gross − (diamond + stone ct) × 0.2 g
   netMg: number;
   tunchBp: number;
   fineMg: number;
@@ -65,8 +64,8 @@ export function previewItem(item: EntryItem): ItemPreview {
   const grossMg = mg(item.gross);
   const diaMct = mct(item.diaCt);
   const stnMct = mct(item.stnCt);
-  const autoNetMg = grossMg ? grossMg - halfUp((diaMct + stnMct) * 2, 10) : 0;
-  const netMg = typed(item.net) ? mg(item.net) : autoNetMg;
+  // The net weight is typed by the person, never worked out from the gross (the owner's wish, 2026-11-05).
+  const netMg = typed(item.net) ? mg(item.net) : 0;
   const tunchBp = bp(item.purity);
   const fineMg = fineOf(netMg, tunchBp);
   const autoDiamond = halfUp(diaMct * paise(item.diaRate), 1000);
@@ -74,7 +73,7 @@ export function previewItem(item: EntryItem): ItemPreview {
   const basisMg = item.labourBasis === "gross" ? grossMg : netMg;
   const autoLabour = halfUp((basisMg || 0) * paise(item.labourRate), 1000);
   return {
-    grossMg, diaMct, stnMct, autoNetMg, netMg, tunchBp, fineMg,
+    grossMg, diaMct, stnMct, netMg, tunchBp, fineMg,
     autoDiamond, diamond: typed(item.diaValue) ? paise(item.diaValue) : autoDiamond,
     autoStone, stone: typed(item.stnValue) ? paise(item.stnValue) : autoStone,
     autoLabour, labour: typed(item.labourValue) ? paise(item.labourValue) : autoLabour,
@@ -158,8 +157,8 @@ export function check(form: EntryForm, p: Preview, kind: EntryKind, company: Com
     const f = p.items[i];
     const key = (field: ItemField) => itemKey(item, field);
     if (!item.name.trim()) set(key("name"), "Enter the item name.");
-    if (item.net === null && f.grossMg > 0 && f.autoNetMg <= 0) set(key("net"), "Diamonds and stones weigh more than the gross weight.");
-    if (f.netMg <= 0) set(key(f.grossMg || item.net !== null ? "net" : "gross"), "Enter the weight.");
+    if (f.netMg <= 0) set(key("net"), "Enter the net weight.");
+    else if (f.grossMg && f.netMg > f.grossMg) set(key("net"), "More than the gross weight.");
     if (f.tunchBp <= 0 || f.tunchBp > 10000) set(key("purity"), "Purity must be more than 0 and at most 100%.");
     if (f.netMg > 0 && f.tunchBp > 0 && f.fineMg <= 0) set(key("net"), "The fine weight works out to 0 g.");
   });
