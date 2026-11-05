@@ -460,7 +460,8 @@ class Line:
 
 
 METAL_DETAILS = ("item", "purity", "tunch_bp", "gross_mg", "net_mg", "dia_mct", "stn_mct", "pieces", "tag_no",
-                 "labour_paise", "dia_paise", "stn_paise", "metal_paise", "huid", "colour", "clarity")
+                 "labour_paise", "dia_paise", "stn_paise", "metal_paise", "huid", "colour", "clarity",
+                 "design_no", "dia_shape", "stn_shape", "stn_colour", "stn_clarity")
 
 
 @dataclass

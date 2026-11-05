@@ -1,90 +1,145 @@
-import { useEffect, useMemo } from "react";
-import { navigate, type StockMetal } from "../router";
+import { useEffect, useMemo, useState } from "react";
+import { api } from "../api";
+import { useBooks } from "../books";
+import { formatDMY, formatMg, formatPaise } from "../format";
+import type { StockMetal } from "../router";
+import { navigate } from "../router";
 import { useCompany } from "../session";
-import type { Report } from "../types";
-import { Button, EmptyState, Notice, Page, Segmented, Skeleton } from "../ui";
-import { cardValue } from "./books/figures";
-import { ItemCard, StockTotal, stockItems } from "./books/stock/StockParts";
-import { useBooksReport } from "./books/useBooksReport";
+import type { StockItem } from "../types";
+import { Box, Button, Card, EmptyState, Field, FieldRow, Input, Notice, Page, Sheet, Skeleton } from "../ui";
+import { purityText } from "./books/txn/billDetails";
+import "./entry/entry.css";
+import "./StockScreen.css";
 
 export type StockScreenProps = { metal: StockMetal };
 
-const METALS: StockMetal[] = ["gold", "silver"];
-const LABEL: Record<StockMetal, string> = { gold: "Gold", silver: "Silver" };
+const money = (paise: number) => formatPaise(paise, paise % 100 ? 2 : 0);
+const grams = (mg: number | null | undefined) => (mg ? formatMg(mg) : null);
+const carats = (mct: number | null | undefined) => (mct ? `${(mct / 1000).toFixed(3)} ct` : null);
+const rupees = (paise: number | null | undefined) => (paise ? money(paise) : null);
+const TYPE: Record<string, string> = { Sales: "Sales", Purchase: "Purchase", "Credit Note": "Sales return", "Debit Note": "Purchase return" };
 
-const metalsOf = (report: Report) => METALS.filter((m) => report.options.metals?.includes(m));
+/** Rows of a detail card: [label, value]; a value left out shows "—", as in the design. */
+function Rows({ rows }: { rows: [string, string | null | undefined][] }) {
+  return (
+    <dl className="entry-totals">
+      {rows.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value || "—"}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
 
-// Switching metal opens the screen afresh (a new address): the metals last seen keep the switch in place meanwhile.
-let seen: { companyId: number; metals: StockMetal[] } | null = null;
+/** One item opened: the design's Entry, Item, Gold, Diamond, Color Stone, Labour and Total cards. */
+function ItemSheet({ item, onClose }: { item: StockItem | null; onClose: () => void }) {
+  return (
+    <Sheet open={item !== null} onClose={onClose} title={item?.item || "Item"} description={item ? `${item.number} · ${formatDMY(item.date)}` : undefined}>
+      {item ? (
+        <div className="stock-detail">
+          <Card title="Entry">
+            <Rows rows={[["Type", TYPE[item.vtype] ?? item.vtype], ["Date", formatDMY(item.date)], ["Invoice", item.number], ["Party", item.party]]} />
+          </Card>
+          <Card title="Item">
+            <Rows rows={[["Item name", item.item], ["Jewell code", item.tag_no], ["Design no.", item.design_no]]} />
+          </Card>
+          <Card title="Gold">
+            <Rows rows={[["Gross weight", grams(item.gross_mg)], ["Net weight", grams(item.net_mg)],
+              ["Purity %", item.tunch_bp ? purityText(null, item.tunch_bp) : null], ["Karat", item.purity], ["Fine weight", grams(item.fine_mg)]]} />
+          </Card>
+          <Card title="Diamond">
+            <Rows rows={[["Shape", item.dia_shape], ["Value", rupees(item.dia_paise)], ["Color", item.colour], ["Clarity", item.clarity],
+              ["Weight", carats(item.dia_mct)]]} />
+          </Card>
+          <Card title="Color Stone">
+            <Rows rows={[["Shape", item.stn_shape], ["Value", rupees(item.stn_paise)], ["Color", item.stn_colour], ["Clarity", item.stn_clarity],
+              ["Weight", carats(item.stn_mct)]]} />
+          </Card>
+          <Card title="Labour">
+            <Rows rows={[["Labour value", rupees(item.labour_paise)]]} />
+          </Card>
+          <Card title="Total">
+            <Rows rows={[["Total Amount", item.amount_paise ? money(item.amount_paise) : null]]} />
+          </Card>
+        </div>
+      ) : null}
+    </Sheet>
+  );
+}
 
-/** Metal stock in grams from the books (the owner's picture): the total fine stock, then each item's net weight. */
-export default function StockScreen({ metal }: StockScreenProps) {
+/** Stock (design: accounts-ai-design-mockup, Stock): the totals of the items in the period, the From / To dates, and every
+ * item of the Sales and Purchase bills; tap one for all its details. */
+export default function StockScreen(_props: StockScreenProps) {
   const company = useCompany();
-  const { report, loading, error, reload } = useBooksReport("stock_grams", { metal });
-  const items = useMemo(() => stockItems(report), [report]);
-  // Stock warnings ("Gold 22K: −4.350 g fine …") are shown in the bell's notifications only, not here (the owner's wish).
-  // No entries at all, not only none by item (opening stock has no items; an older server lists only items that went out).
-  const noStock = report !== null && ["Opening", "Came in", "Closing"].every((label) => Math.abs(cardValue(report, label)) < 0.0005);
+  const { version } = useBooks();
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [rows, setRows] = useState<StockItem[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const [open, setOpen] = useState<StockItem | null>(null);
+
   useEffect(() => {
-    if (report) seen = { companyId: company.id, metals: metalsOf(report) };
-  }, [report, company.id]);
-  const inUse = report ? metalsOf(report) : seen?.companyId === company.id ? seen.metals : [];
-  // The switch shows only when the books hold more than one metal (or this one is not among them).
-  const metals = METALS.filter((m) => m === metal || inUse.includes(m));
+    let live = true;
+    setError(null);
+    api
+      .stockItems(company.id, from, to)
+      .then((answer) => live && setRows(answer.rows))
+      .catch((e: Error) => live && setError(e.message));
+    return () => {
+      live = false;
+    };
+  }, [company.id, from, to, version, attempt]);
+
+  const totals = useMemo(() => {
+    const sum = (pick: (r: StockItem) => number | null | undefined) => (rows ?? []).reduce((n, r) => n + (pick(r) ?? 0), 0);
+    return [
+      ["Total Gross Weight", grams(sum((r) => r.gross_mg))],
+      ["Total Net Weight", grams(sum((r) => r.net_mg))],
+      ["Total Diamond Weight", carats(sum((r) => r.dia_mct))],
+      ["Total Diamond Value", rupees(sum((r) => r.dia_paise))],
+      ["Total Labour Amount", rupees(sum((r) => r.labour_paise))],
+      ["Total Amount", rupees(sum((r) => r.amount_paise))],
+    ] as [string, string | null][];
+  }, [rows]);
 
   return (
-    <Page
-      title="Stock"
-      right={
-        metals.length > 1 ? (
-          <span className="stock-metal">
-            <Segmented
-              variant="metal"
-              label="Metal"
-              value={metal}
-              onChange={(next) => navigate({ name: "stock", metal: next }, { replace: true })}
-              options={metals.map((m) => ({ value: m, label: LABEL[m] }))}
-            />
-          </span>
-        ) : undefined
-      }
-    >
-      <div className="stock-screen" aria-busy={loading}>
+    <Page title="Stock">
+      <div className="entry stock-page" aria-busy={rows === null && !error}>
         {error ? (
-          <Notice
-            tone="error"
-            action={
-              <Button size="sm" variant="soft" onClick={reload}>
-                Retry
-              </Button>
-            }
-          >
+          <Notice tone="error" action={<Button size="sm" variant="soft" onClick={() => setAttempt((n) => n + 1)}>Retry</Button>}>
             Could not load the stock: {error}
           </Notice>
         ) : null}
 
-        {report ? (
-          <StockTotal fine={cardValue(report, "Closing")} />
-        ) : !error ? (
-          <div className="stock-skeleton" role="status" aria-label="Loading stock">
-            <Skeleton height={96} radius={18} />
-            <Skeleton height={72} radius={14} />
-            <Skeleton height={72} radius={14} />
+        <Card title="Total">
+          <Rows rows={totals} />
+        </Card>
+
+        <Card>
+          <FieldRow>
+            <Field label="From" htmlFor="stock-from">
+              <Input id="stock-from" type="date" value={from} max={to || undefined} onChange={(e) => setFrom(e.target.value)} />
+            </Field>
+            <Field label="To" htmlFor="stock-to">
+              <Input id="stock-to" type="date" value={to} min={from || undefined} onChange={(e) => setTo(e.target.value)} />
+            </Field>
+          </FieldRow>
+        </Card>
+
+        {rows === null && !error ? (
+          <div className="stock-page__list" role="status" aria-label="Loading stock">
+            <Skeleton height={70} radius={18} />
+            <Skeleton height={70} radius={18} />
           </div>
         ) : null}
 
-        {report && items.length === 0 && !noStock ? (
-          <Notice>
-            {report.tables[2]
-              ? "Only the opening stock so far — items show here once this year's bills are entered."
-              : "Item-wise stock needs the latest server: this one lists only the items that went out, and none have yet."}
-          </Notice>
-        ) : null}
-
-        {noStock && items.length === 0 ? (
+        {rows && rows.length === 0 ? (
           <EmptyState
             icon="cube"
-            title={`No ${metal} entries yet`}
+            title={from || to ? "No items in these dates" : "No items yet"}
             action={
               <>
                 <Button variant="soft" icon="cart" onClick={() => navigate({ name: "entry", kind: "purchase" })}>
@@ -96,18 +151,27 @@ export default function StockScreen({ metal }: StockScreenProps) {
               </>
             }
           >
-            Pehle Sales ya Purchase entries daalo — stock yahan apne aap calculate hoga.
+            Sales ya Purchase entries daalo — har item yahan dikhega.
           </EmptyState>
         ) : null}
 
-        {items.length > 0 ? (
-          <section className="stock-list" aria-label="Stock by item">
-            {items.map((row, i) => (
-              <ItemCard key={`${row.item}-${i}`} row={row} />
+        {rows && rows.length ? (
+          <ul className="stock-page__list" aria-label="Items">
+            {rows.map((row, i) => (
+              <Box as="li" key={`${row.voucher_id}-${i}`} className="stock-row">
+                <button type="button" className="stock-row__btn" onClick={() => setOpen(row)}>
+                  <span className="stock-row__top">
+                    <b>{row.item || row.tag_no || "Item"}</b>
+                    <b className="stock-row__amt">{row.amount_paise ? money(row.amount_paise) : grams(row.net_mg) ?? "—"}</b>
+                  </span>
+                  <small>{row.party || "—"}</small>
+                </button>
+              </Box>
             ))}
-          </section>
+          </ul>
         ) : null}
       </div>
+      <ItemSheet item={open} onClose={() => setOpen(null)} />
     </Page>
   );
 }

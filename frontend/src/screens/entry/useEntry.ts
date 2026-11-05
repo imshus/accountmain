@@ -6,8 +6,11 @@ import type { EntryKind } from "../../router";
 import { useCompany } from "../../session";
 import type { Ledger } from "../../types";
 import { check, nextNumber, payload, preview } from "./calc";
-import { fieldOf } from "./errors";
-import { FIELD_ORDER, clearDraft, emptyForm, loadDraft, nextForm, saveDraft, type EntryForm, type FieldErrors, type FieldKey } from "./form";
+import { fieldOf, isHeadKey } from "./errors";
+import {
+  clearDraft, emptyForm, emptyItem, fieldOrder, itemKey, loadDraft, nextForm, saveDraft, type EntryForm, type EntryItem, type FieldErrors,
+  type FieldKey,
+} from "./form";
 import type { SavedBill } from "./SavedSheet";
 
 export const PARTY_GROUP: Record<EntryKind, string> = { sale: "Sundry Debtors", purchase: "Sundry Creditors" };
@@ -17,11 +20,11 @@ export const sameName = (a: string, b: string) => a.trim().toLowerCase() === b.t
 function initialForm(companyId: number, kind: EntryKind): EntryForm {
   const draft = loadDraft(companyId);
   if (!draft) return emptyForm();
-  // The party and salesman lists differ between Sale and Purchase.
-  return draft.kind === kind ? draft.form : { ...draft.form, party: "", agent: "" };
+  // The customer and supplier lists differ between Sale and Purchase.
+  return draft.kind === kind ? draft.form : { ...draft.form, party: "" };
 }
 
-/** State, live figures and saving of the Sale / Purchase screen. */
+/** State, live figures and saving of the Sale / Purchase screen: one bill of one or more items. */
 export function useEntry(kind: EntryKind) {
   const company = useCompany();
   const books = useBooks();
@@ -34,10 +37,10 @@ export function useEntry(kind: EntryKind) {
   const [saved, setSaved] = useState<SavedBill | null>(null);
   const [saving, guard] = useSaving();
 
-  // Switching Sale <-> Purchase keeps the weights and clears who the bill is with.
+  // Switching Sale <-> Purchase keeps the items and clears who the bill is with.
   if (formKind !== kind) {
     setFormKind(kind);
-    setForm((f) => ({ ...f, party: "", agent: "" }));
+    setForm((f) => ({ ...f, party: "" }));
     setTried(false);
     setServerErrors({});
     setGeneral(null);
@@ -50,8 +53,10 @@ export function useEntry(kind: EntryKind) {
   const problems = useMemo(() => check(form, figures, kind, company), [form, figures, kind, company]);
   const errors: FieldErrors = { ...(tried ? problems.all : problems.typing), ...serverErrors };
   const autoNumber = nextNumber(books.vouchers, books.vouchers.length >= books.voucherTotal, kind, form.date);
+  // The design's Save stays muted until the bill has its customer / supplier and every item its name.
+  const ready = Boolean(form.party.trim()) && form.items.every((item) => item.name.trim());
 
-  const idOf = (key: FieldKey) => `${base}${key}`;
+  const idOf = (key: FieldKey) => `${base}${key.replace(":", "-")}`;
 
   const focusField = (key: FieldKey) => {
     const node = document.getElementById(idOf(key));
@@ -62,12 +67,30 @@ export function useEntry(kind: EntryKind) {
     (node ?? target)?.scrollIntoView({ block: "center", behavior: "smooth" });
   };
 
-  /** Change some fields. A server message was about the old values, so it goes. */
-  const set = (patch: Partial<EntryForm>) => {
+  /** Change the bill's own fields. A server message was about the old values, so it goes. */
+  const set = (patch: Partial<Omit<EntryForm, "items">>) => {
     setForm((f) => ({ ...f, ...patch }));
     setServerErrors({});
     setGeneral(null);
   };
+
+  /** Change one item's fields. */
+  const setItem = (id: string, patch: Partial<EntryItem>) => {
+    setForm((f) => ({ ...f, items: f.items.map((item) => (item.id === id ? { ...item, ...patch } : item)) }));
+    setServerErrors({});
+    setGeneral(null);
+  };
+
+  /** "Add more item": a new item under the others, with the last one's purity, karat and labour (they usually repeat). */
+  const addItem = (): string => {
+    const last = form.items[form.items.length - 1];
+    const item = { ...emptyItem(), purity: last?.purity ?? "", karat: last?.karat ?? "", labourRate: last?.labourRate ?? "",
+      labourBasis: last?.labourBasis ?? "" };
+    setForm((f) => ({ ...f, items: [...f.items, item] }));
+    return item.id;
+  };
+
+  const removeItem = (id: string) => setForm((f) => (f.items.length > 1 ? { ...f, items: f.items.filter((item) => item.id !== id) } : f));
 
   const ensureParty = async (name: string): Promise<Ledger> => {
     const known = books.ledgers.find((l) => sameName(l.name, name));
@@ -95,7 +118,7 @@ export function useEntry(kind: EntryKind) {
     guard(async () => {
       setTried(true);
       setGeneral(null);
-      const first = FIELD_ORDER.find((key) => problems.all[key]);
+      const first = fieldOrder(form).find((key) => problems.all[key]);
       if (first) {
         focusField(first);
         return;
@@ -105,8 +128,7 @@ export function useEntry(kind: EntryKind) {
       try {
         const party = await ensureParty(bill.party);
         const voucher = await api.createJewellery(company.id, payload(bill, figures, kind, party.id));
-        if (bill.item.trim()) books.addMaster("item", bill.item);
-        if (bill.agent.trim()) books.addMaster(kind === "sale" ? "salesman" : "purchaser", bill.agent);
+        for (const item of bill.items) if (item.name.trim()) books.addMaster("item", item.name);
         clearDraft();
         setSaved({ voucher, party: party.name, metal: bill.metal, settle: bill.settle, shown });
         setForm(nextForm(bill));
@@ -115,12 +137,17 @@ export function useEntry(kind: EntryKind) {
       } catch (e) {
         const message = (e as Error).message;
         const field = fieldOf(message);
-        if (field) {
-          setServerErrors({ [field]: message });
-          focusField(field);
+        // An item's message does not say which item: it goes under the field of a bill's only item, else at the bottom.
+        const key = field && (isHeadKey(field) ? field : bill.items.length === 1 ? itemKey(bill.items[0], field) : null);
+        if (key) {
+          setServerErrors({ [key]: message });
+          focusField(key);
         } else setGeneral(message);
       }
     });
 
-  return { company, books, form, set, figures, errors, general, saving, save, saved, setSaved, idOf, autoNumber, addParty, partyLedger };
+  return {
+    company, books, form, set, setItem, addItem, removeItem, figures, errors, general, saving, save, saved, setSaved, idOf,
+    autoNumber, addParty, partyLedger, ready,
+  };
 }

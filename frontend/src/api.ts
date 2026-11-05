@@ -10,6 +10,7 @@ import type {
   Ledger,
   Metal,
   RegisterType,
+  StockItem,
   VoucherDetail,
   VoucherRow,
   ChatEvent,
@@ -351,6 +352,8 @@ export const api = {
   vouchers: (id: number, params: Record<string, string>) =>
     request<{ total: number; rows: VoucherRow[] }>(`/api/companies/${id}/vouchers?${new URLSearchParams(Object.entries(params).filter(([, v]) => v !== ""))}`),
   voucher: (id: number, voucherId: number) => request<VoucherDetail>(`/api/companies/${id}/vouchers/${voucherId}`),
+  stockItems: (id: number, start: string, end: string) =>
+    request<{ rows: StockItem[] }>(`/api/companies/${id}/stock/items?${new URLSearchParams(Object.entries({ start, end }).filter(([, v]) => v))}`),
   createVoucher: (id: number, body: unknown) => postJson<VoucherDetail>(`/api/companies/${id}/vouchers`, body),
   createInvoice: (id: number, body: unknown) => postJson<VoucherDetail>(`/api/companies/${id}/vouchers/invoice`, body),
   createSettlement: (id: number, body: unknown) => postJson<VoucherDetail>(`/api/companies/${id}/vouchers/settlement`, body),

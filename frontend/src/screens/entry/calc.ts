@@ -2,41 +2,55 @@ import { purityCode } from "../../books";
 import { fineOf, halfUp, readAmount, toUnits, unreadable } from "../../components/accounts/shared";
 import type { EntryKind } from "../../router";
 import type { Company, Ledger, VoucherRow } from "../../types";
-import type { EntryForm, FieldErrors, FieldKey } from "./form";
+import { itemKey, type EntryForm, type EntryItem, type FieldErrors, type ItemField } from "./form";
 
 /**
- * The bill as the backend will post it, in whole mg / 0.001 ct / 0.01 % / paise with its half-up steps
- * (metal.item_weights, metal.jewellery_invoice, service.gst_invoice_lines), so the preview is the saved bill.
+ * One item as the backend will post it, in whole mg / 0.001 ct / 0.01 % / paise with its half-up steps
+ * (metal.item_weights, metal.jewellery_invoice), so the preview is the saved bill.
  */
-export type Preview = {
+export type ItemPreview = {
   grossMg: number;
-  carats: number; // diamond + stone, thousandths of a carat
+  diaMct: number;
+  stnMct: number;
   autoNetMg: number; // gross − (diamond + stone ct) × 0.2 g
   netMg: number;
   tunchBp: number;
   fineMg: number;
-  labour: number; // paise
+  autoDiamond: number; // paise: carats × rate
+  diamond: number; // the value typed, else the worked-out one
+  autoStone: number;
+  stone: number;
+  autoLabour: number; // rate × the basis weight
+  labour: number;
+};
+
+/** The bill: its items, their sums, and the total as service.gst_invoice_lines rounds it. */
+export type Preview = {
+  items: ItemPreview[];
+  grossMg: number;
+  netMg: number;
+  fineMg: number;
+  diaMct: number;
   diamond: number;
   stone: number;
+  labour: number;
   metalValue: number; // fine × metal rate, only when settled in rupees
   taxable: number;
   tax: number;
-  cgst: number;
-  sgst: number;
-  igst: number;
   interState: boolean;
   roundOff: number;
   total: number;
 };
 
-const num = (text: string) => {
-  const value = readAmount(text);
+const num = (text: string | null) => {
+  const value = readAmount(text ?? "");
   return Number.isFinite(value) ? value : 0;
 };
-const mg = (text: string) => toUnits(num(text), 3);
-const mct = (text: string) => toUnits(num(text), 3);
-const paise = (text: string) => toUnits(num(text), 2);
-const bp = (text: string) => toUnits(num(text), 2);
+const mg = (text: string | null) => toUnits(num(text), 3);
+const mct = (text: string | null) => toUnits(num(text), 3);
+const paise = (text: string | null) => toUnits(num(text), 2);
+const bp = (text: string | null) => toUnits(num(text), 2);
+const typed = (text: string | null) => text !== null && text.trim() !== "";
 
 const GSTIN_STATE = /^(\d{2})[0-9A-Z]{13}$/;
 
@@ -47,41 +61,54 @@ function stateOf(party: Ledger | undefined): string | null {
   return hit ? hit[1] : party?.state_code || null;
 }
 
-export function preview(form: EntryForm, company: Company, party: Ledger | undefined): Preview {
-  const grossMg = mg(form.gross);
-  const carats = mct(form.diamondCt) + mct(form.stoneCt);
-  const autoNetMg = grossMg ? grossMg - halfUp(carats * 2, 10) : 0;
-  const netMg = form.net !== null && form.net.trim() ? mg(form.net) : autoNetMg;
-  const tunchBp = bp(form.purity);
+export function previewItem(item: EntryItem): ItemPreview {
+  const grossMg = mg(item.gross);
+  const diaMct = mct(item.diaCt);
+  const stnMct = mct(item.stnCt);
+  const autoNetMg = grossMg ? grossMg - halfUp((diaMct + stnMct) * 2, 10) : 0;
+  const netMg = typed(item.net) ? mg(item.net) : autoNetMg;
+  const tunchBp = bp(item.purity);
   const fineMg = fineOf(netMg, tunchBp);
-  const labour = halfUp((netMg || 0) * paise(form.labourRate), 1000);
-  const diamond = halfUp(mct(form.diamondCt) * paise(form.diamondRate), 1000);
-  const stone = halfUp(mct(form.stoneCt) * paise(form.stoneRate), 1000);
-  const metalValue = form.settle === "Rs" ? halfUp(fineMg * paise(form.metalRate), 1000) : 0;
-  const taxable = metalValue + diamond + stone + labour;
+  const autoDiamond = halfUp(diaMct * paise(item.diaRate), 1000);
+  const autoStone = halfUp(stnMct * paise(item.stnRate), 1000);
+  const basisMg = item.labourBasis === "gross" ? grossMg : netMg;
+  const autoLabour = halfUp((basisMg || 0) * paise(item.labourRate), 1000);
+  return {
+    grossMg, diaMct, stnMct, autoNetMg, netMg, tunchBp, fineMg,
+    autoDiamond, diamond: typed(item.diaValue) ? paise(item.diaValue) : autoDiamond,
+    autoStone, stone: typed(item.stnValue) ? paise(item.stnValue) : autoStone,
+    autoLabour, labour: typed(item.labourValue) ? paise(item.labourValue) : autoLabour,
+  };
+}
+
+export function preview(form: EntryForm, company: Company, party: Ledger | undefined): Preview {
+  const items = form.items.map(previewItem);
+  const sum = (key: keyof ItemPreview) => items.reduce((n, p) => n + p[key], 0);
+  const metalValue = form.settle === "Rs" ? halfUp(sum("fineMg") * paise(form.metalRate), 1000) : 0;
+  const taxable = metalValue + sum("diamond") + sum("stone") + sum("labour");
   const tax = taxable > 0 ? halfUp(taxable * bp(form.gst), 10000) : 0;
   const pos = stateOf(party);
   const interState = Boolean(pos && company.state_code && pos !== company.state_code);
-  const cgst = interState ? 0 : Math.floor(tax / 2);
-  const sgst = interState ? 0 : tax - cgst; // the odd paisa goes to SGST, as the books do
-  const igst = interState ? tax : 0;
   const gross = taxable + tax;
   const total = taxable > 0 ? halfUp(gross, 100) * 100 : 0;
-  return { grossMg, carats, autoNetMg, netMg, tunchBp, fineMg, labour, diamond, stone, metalValue, taxable, tax, cgst, sgst, igst,
-    interState, roundOff: total - gross, total };
+  return {
+    items, grossMg: sum("grossMg"), netMg: sum("netMg"), fineMg: sum("fineMg"), diaMct: sum("diaMct"), diamond: sum("diamond"),
+    stone: sum("stone"), labour: sum("labour"), metalValue, taxable, tax, interState, roundOff: total - gross, total,
+  };
 }
 
-const NUMBER_FIELDS: [FieldKey, (f: EntryForm) => string | null][] = [
-  ["gross", (f) => f.gross],
-  ["net", (f) => f.net],
-  ["purity", (f) => f.purity],
-  ["diamondCt", (f) => f.diamondCt],
-  ["diamondRate", (f) => f.diamondRate],
-  ["stoneCt", (f) => f.stoneCt],
-  ["stoneRate", (f) => f.stoneRate],
-  ["labourRate", (f) => f.labourRate],
-  ["metalRate", (f) => f.metalRate],
-  ["gst", (f) => f.gst],
+const NUMBER_FIELDS: [ItemField, (item: EntryItem) => string | null][] = [
+  ["gross", (i) => i.gross],
+  ["net", (i) => i.net],
+  ["purity", (i) => i.purity],
+  ["diaCt", (i) => i.diaCt],
+  ["diaRate", (i) => i.diaRate],
+  ["diaValue", (i) => i.diaValue],
+  ["stnCt", (i) => i.stnCt],
+  ["stnRate", (i) => i.stnRate],
+  ["stnValue", (i) => i.stnValue],
+  ["labourRate", (i) => i.labourRate],
+  ["labourValue", (i) => i.labourValue],
 ];
 
 const addDays = (iso: string, days: number) => {
@@ -103,13 +130,16 @@ export function firstOpenDate(company: Company): string {
  */
 export function check(form: EntryForm, p: Preview, kind: EntryKind, company: Company): { typing: FieldErrors; all: FieldErrors } {
   const typing: FieldErrors = {};
-  for (const [key, get] of NUMBER_FIELDS) {
-    const text = get(form);
-    if (unreadable(text)) typing[key] = `"${text}" is not a number.`;
-    else if (text && readAmount(text) < 0) typing[key] = "Cannot be negative.";
-  }
+  form.items.forEach((item) => {
+    for (const [field, get] of NUMBER_FIELDS) {
+      const text = get(item);
+      const key = itemKey(item, field);
+      if (unreadable(text)) typing[key] = `"${text}" is not a number.`;
+      else if (text && readAmount(text) < 0) typing[key] = "Cannot be negative.";
+    }
+  });
   const all: FieldErrors = { ...typing };
-  const set = (key: FieldKey, message: string) => {
+  const set = (key: keyof FieldErrors, message: string) => {
     if (!all[key]) all[key] = message;
   };
   const opens = firstOpenDate(company);
@@ -124,24 +154,25 @@ export function check(form: EntryForm, p: Preview, kind: EntryKind, company: Com
     else if (!/^[A-Za-z0-9/-]+$/.test(number)) set("invoiceNo", "Only letters, digits, / and - (GST Rule 46).");
   } else if (number.length > 40) set("invoiceNo", "At most 40 characters.");
   if (!form.party.trim()) set("party", kind === "sale" ? "Choose the customer." : "Choose the supplier.");
-  if (!form.item.trim()) set("item", "Choose the item.");
-  if (form.net === null && p.grossMg > 0 && p.autoNetMg <= 0) set("net", "Diamonds and stones weigh more than the gross weight.");
-  if (p.netMg <= 0) set(p.grossMg || form.net !== null ? "net" : "gross", "Enter the weight.");
-  if (p.tunchBp <= 0 || p.tunchBp > 10000) set("purity", "Purity must be more than 0 and at most 100%.");
-  if (p.netMg > 0 && p.tunchBp > 0 && p.fineMg <= 0) set("net", "The fine weight works out to 0 g.");
-  if (form.settle === "Rs" && toUnits(num(form.metalRate), 2) <= 0) set("metalRate", "Give the rate per gram of fine metal.");
-  if (num(form.gst) > 100) set("gst", "GST is at most 100%.");
+  form.items.forEach((item, i) => {
+    const f = p.items[i];
+    const key = (field: ItemField) => itemKey(item, field);
+    if (!item.name.trim()) set(key("name"), "Enter the item name.");
+    if (item.net === null && f.grossMg > 0 && f.autoNetMg <= 0) set(key("net"), "Diamonds and stones weigh more than the gross weight.");
+    if (f.netMg <= 0) set(key(f.grossMg || item.net !== null ? "net" : "gross"), "Enter the weight.");
+    if (f.tunchBp <= 0 || f.tunchBp > 10000) set(key("purity"), "Purity must be more than 0 and at most 100%.");
+    if (f.netMg > 0 && f.tunchBp > 0 && f.fineMg <= 0) set(key("net"), "The fine weight works out to 0 g.");
+  });
   return { typing, all };
 }
 
 const text = (value: number) => String(value);
 const rupees = (p: number) => (p ? (p / 100).toFixed(2) : null);
+const words = (value: string) => value.trim() || null;
 
-/** The body for POST /companies/{id}/vouchers/jewellery. Amounts we worked out go as exact rupees. */
+/** The body for POST /companies/{id}/vouchers/jewellery: one line per item. Amounts we worked out go as exact rupees. */
 export function payload(form: EntryForm, p: Preview, kind: EntryKind, partyId: number) {
   const sale = kind === "sale";
-  const tunch = num(form.purity);
-  const agent = form.agent.trim();
   return {
     vtype: sale ? "Sales" : "Purchase",
     date: form.date,
@@ -151,22 +182,34 @@ export function payload(form: EntryForm, p: Preview, kind: EntryKind, partyId: n
     gst_rate: num(form.gst),
     metal_rate: form.settle === "Rs" ? text(num(form.metalRate)) : null,
     round_off: true,
-    narration: agent ? `${sale ? "Salesman" : "Purchaser"}: ${agent}` : "",
-    items: [
-      {
-        item: form.item.trim() || null,
-        purity: form.metal === "gold" ? purityCode(tunch) : `${tunch}`,
+    narration: "",
+    items: form.items.map((item, i) => {
+      const f = p.items[i];
+      const tunch = num(item.purity);
+      return {
+        item: words(item.name),
+        tag_no: words(item.code),
+        design_no: words(item.design),
+        purity: form.metal === "gold" ? item.karat || purityCode(tunch) : `${tunch}`,
         tunch,
-        gross: p.grossMg ? text(num(form.gross)) : null,
-        diamond_ct: num(form.diamondCt) ? text(num(form.diamondCt)) : null,
-        stone_ct: num(form.stoneCt) ? text(num(form.stoneCt)) : null,
-        net: form.net !== null && form.net.trim() ? text(num(form.net)) : null,
-        diamond_value: rupees(p.diamond),
-        stone_value: rupees(p.stone),
-        labour_rate: num(form.labourRate) ? text(num(form.labourRate)) : null,
+        gross: f.grossMg ? text(num(item.gross)) : null,
+        net: typed(item.net) ? text(num(item.net)) : null,
+        diamond_ct: f.diaMct ? text(num(item.diaCt)) : null,
+        diamond_value: rupees(f.diamond),
+        diamond_shape: words(item.diaShape),
+        colour: words(item.diaColour),
+        clarity: words(item.diaClarity),
+        stone_ct: f.stnMct ? text(num(item.stnCt)) : null,
+        stone_value: rupees(f.stone),
+        stone_shape: words(item.stnShape),
+        stone_colour: words(item.stnColour),
+        stone_clarity: words(item.stnClarity),
+        // The books charge labour per gram of net weight: a typed value, or labour on the gross weight, goes as the amount.
+        labour_rate: num(item.labourRate) && item.labourBasis !== "gross" && !typed(item.labourValue) ? text(num(item.labourRate)) : null,
+        labour_value: typed(item.labourValue) || item.labourBasis === "gross" ? rupees(f.labour) ?? "0" : null,
         settle: form.settle,
-      },
-    ],
+      };
+    }),
   };
 }
 
