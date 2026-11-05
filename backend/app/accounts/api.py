@@ -305,6 +305,11 @@ class JewelItemIn(BaseModel):
     huid: str | None = Field(default=None, max_length=40)  # hallmark id
     colour: str | None = Field(default=None, max_length=20)  # diamond colour, e.g. GH
     clarity: str | None = Field(default=None, max_length=20)  # diamond clarity, e.g. SI
+    design_no: str | None = Field(default=None, max_length=40)
+    diamond_shape: str | None = Field(default=None, max_length=20)  # e.g. Round, Pear
+    stone_shape: str | None = Field(default=None, max_length=20)
+    stone_colour: str | None = Field(default=None, max_length=20)
+    stone_clarity: str | None = Field(default=None, max_length=20)
 
 
 class JewelleryInvoiceIn(BaseModel):
@@ -513,6 +518,13 @@ REPORT_KINDS = {
     "metal_ledger": "Gold ledger",
     "stock_grams": "Stock in grams",
 }
+
+
+@router.get("/companies/{company_id}/stock/items")
+def stock_items(company_id: int, start: date | None = None, end: date | None = None):
+    """Every item of the Sales and Purchase bills in the period, with its bill and details (the Stock screen's list)."""
+    _company(company_id)
+    return {"rows": metal.stock_items(company_id, start, end)}
 
 
 @router.get("/companies/{company_id}/reports")

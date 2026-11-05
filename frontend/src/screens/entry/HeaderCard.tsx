@@ -1,9 +1,8 @@
 import type { EntryKind } from "../../router";
 import type { Ledger, Metal } from "../../types";
-import { Card, DatePill, Field, Input, Overline } from "../../ui";
+import { Card, DatePill, Field, Overline } from "../../ui";
 import type { AddRequest } from "./AddNameSheet";
 import { firstOpenDate } from "./calc";
-import { DEFAULT_ITEMS } from "./form";
 import { money, grams } from "./money";
 import { Picker, type PickerOption } from "./Picker";
 import { sameName, type useEntry } from "./useEntry";
@@ -11,9 +10,9 @@ import { sameName, type useEntry } from "./useEntry";
 type Props = { entry: ReturnType<typeof useEntry>; kind: EntryKind; ask: (request: AddRequest) => void };
 
 /** Names in a list, plus the chosen one if it is not there (a draft, or just added), without repeats. */
-function namesWith(names: string[], current: string, extra: string[] = []): PickerOption[] {
+function namesWith(names: string[], current: string): PickerOption[] {
   const all: string[] = [];
-  for (const name of [...names, ...extra, current]) {
+  for (const name of [...names, current]) {
     if (name.trim() && !all.some((n) => sameName(n, name))) all.push(name.trim());
   }
   return all.map((name) => ({ value: name, label: name }));
@@ -29,24 +28,21 @@ function balanceOf(ledger: Ledger, metal: Metal): string {
   return parts.length ? `Balance: ${parts.join(" · ")}` : "No balance yet";
 }
 
-/** Date, invoice number and who the bill is with, as on the design's first card. */
-export function DetailsCard({ entry, kind, ask }: Props) {
+/** The design's first card: the date and invoice chips, and who the bill is with. */
+export function HeaderCard({ entry, kind, ask }: Props) {
   const { form, set, errors, idOf, books, company, autoNumber, partyLedger, figures, addParty } = entry;
   const sale = kind === "sale";
-  const partyKind = sale ? "customer" : "supplier";
-  const agentKind = sale ? "salesman" : "purchaser";
-  const parties = namesWith(books.masters[partyKind], form.party).sort((a, b) => a.label.localeCompare(b.label));
-  const agents = namesWith(books.masters[agentKind], form.agent);
-  const items = namesWith(books.masters.item, form.item, DEFAULT_ITEMS);
+  const parties = namesWith(books.masters[sale ? "customer" : "supplier"], form.party).sort((a, b) => a.label.localeCompare(b.label));
   const partyHint = !form.party
     ? undefined
     : partyLedger
       ? `${balanceOf(partyLedger, form.metal)}${figures.interState ? " · other state: IGST" : ""}`
       : "New: added to the books when you save";
+  const shownNumber = form.invoiceNo || autoNumber || "Auto";
 
   return (
     <Card>
-      <div className="entry-date" id={idOf("date")}>
+      <div className="entry-chiprow" id={idOf("date")}>
         <Overline>Date</Overline>
         <DatePill value={form.date} onChange={(date) => set({ date })} min={firstOpenDate(company)} label="Bill date" />
       </div>
@@ -56,20 +52,32 @@ export function DetailsCard({ entry, kind, ask }: Props) {
         </p>
       ) : null}
 
-      <Field label="Invoice no" htmlFor={idOf("invoiceNo")} error={errors.invoiceNo}>
-        <Input
+      <div className="entry-chiprow">
+        <label className="ui-overline" htmlFor={idOf("invoiceNo")}>
+          Invoice
+        </label>
+        {/* The number the books will give, in the design's chip; typing over it keeps the bill's own number. */}
+        <input
           id={idOf("invoiceNo")}
+          className="entry-chip"
           value={form.invoiceNo}
           onChange={(event) => set({ invoiceNo: event.target.value })}
-          placeholder={autoNumber ? `Auto (${autoNumber})` : "Auto (e.g. INV-001)"}
+          placeholder={autoNumber ?? "Auto"}
+          size={Math.max(6, shownNumber.length)}
           autoCapitalize="characters"
           autoComplete="off"
           spellCheck={false}
           maxLength={40}
           enterKeyHint="next"
+          aria-label="Invoice number (blank: numbered by the books)"
           aria-invalid={Boolean(errors.invoiceNo) || undefined}
         />
-      </Field>
+      </div>
+      {errors.invoiceNo ? (
+        <p className="entry-err" role="alert">
+          {errors.invoiceNo}
+        </p>
+      ) : null}
 
       <Field label={sale ? "Customer name" : "Supplier name"} htmlFor={idOf("party")} error={errors.party} hint={partyHint}>
         <Picker
@@ -77,7 +85,7 @@ export function DetailsCard({ entry, kind, ask }: Props) {
           value={form.party}
           options={parties}
           onSelect={(party) => set({ party })}
-          placeholder={sale ? "Choose customer" : "Choose supplier"}
+          placeholder="Select"
           invalid={Boolean(errors.party)}
           loading={books.loading && !books.ledgers.length}
           onAdd={(typed) =>
@@ -88,51 +96,6 @@ export function DetailsCard({ entry, kind, ask }: Props) {
               withGstin: true,
               description: `Added to the books under ${sale ? "Sundry Debtors" : "Sundry Creditors"}.`,
               submit: addParty,
-            })
-          }
-        />
-      </Field>
-
-      <Field label={sale ? "Sales man" : "Purchaser"} htmlFor={idOf("agent")} error={errors.agent}>
-        <Picker
-          id={idOf("agent")}
-          value={form.agent}
-          options={form.agent ? [...agents, { value: "", label: "None" }] : agents}
-          onSelect={(agent) => set({ agent })}
-          placeholder="Optional"
-          onAdd={(typed) =>
-            ask({
-              title: sale ? "New sales man" : "New purchaser",
-              label: "Name",
-              initial: typed,
-              description: "Kept on this device for quick entry.",
-              submit: (name) => {
-                books.addMaster(agentKind, name);
-                set({ agent: name });
-              },
-            })
-          }
-        />
-      </Field>
-
-      <Field label="Item" htmlFor={idOf("item")} error={errors.item}>
-        <Picker
-          id={idOf("item")}
-          value={form.item}
-          options={items}
-          onSelect={(item) => set({ item })}
-          placeholder="Choose item"
-          invalid={Boolean(errors.item)}
-          onAdd={(typed) =>
-            ask({
-              title: "New item",
-              label: "Item name",
-              initial: typed,
-              description: "Kept on this device for quick entry.",
-              submit: (name) => {
-                books.addMaster("item", name);
-                set({ item: name });
-              },
             })
           }
         />

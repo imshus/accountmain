@@ -109,6 +109,9 @@ def item_weights(item: dict, fine_optional: bool = False) -> dict:
         "pieces": int(pieces) if pieces not in (None, "") else None, "tag_no": (item.get("tag_no") or "").strip()[:40] or None,
         "huid": (text("huid", 40) or "").upper() or None, "colour": (text("colour", 20) or "").upper() or None,
         "clarity": (text("clarity", 20) or "").upper() or None,
+        "design_no": text("design_no", 40), "dia_shape": text("diamond_shape", 20), "stn_shape": text("stone_shape", 20),
+        "stn_colour": (text("stone_colour", 20) or "").upper() or None,
+        "stn_clarity": (text("stone_clarity", 20) or "").upper() or None,
         "fine_mg": fine,
     }
 
@@ -673,6 +676,44 @@ def metal_entries(company_id: int, metal: str, until: date | None = None) -> pd.
         return frame
 
     return remembered(("metal_entries", company_id, metal, until), load)
+
+
+_BILL_TYPES = ("Sales", "Purchase", "Credit Note", "Debit Note")
+
+
+def stock_items(company_id: int, start: date | None = None, end: date | None = None) -> list[dict]:
+    """Every item on a live Sales / Purchase bill (and their returns) in the period, newest first: the bill (type, date,
+    number, party) and the item's own details as entered, with its fine weight and billed value (labour + diamonds +
+    stones + metal, paise). The Stock screen's list (design: accounts-ai-design-mockup, Stock)."""
+    from .db import voucher_lines
+
+    m, v = metal_lines, vouchers
+    details = columns_of(m)
+    query = (select(v.c.id.label("voucher_id"), v.c.vtype, v.c.number, v.c.date, m.c.metal, m.c.dr_mg, m.c.cr_mg,
+                    *(details[k] for k in service.METAL_DETAILS))
+             .join(v, v.c.id == m.c.voucher_id)
+             .where(and_(v.c.company_id == company_id, v.c.cancelled.is_(False), v.c.vtype.in_(_BILL_TYPES),
+                         m.c.item.isnot(None) | m.c.net_mg.isnot(None) | m.c.gross_mg.isnot(None) | m.c.tag_no.isnot(None)))
+             .order_by(v.c.date.desc(), v.c.id.desc(), m.c.position))
+    if start:
+        query = query.where(v.c.date >= start)
+    if end:
+        query = query.where(v.c.date <= end)
+    with engine.connect() as conn:
+        rows = [dict(r) for r in conn.execute(query).mappings()]
+        ids = sorted({r["voucher_id"] for r in rows})
+        parties: dict[int, str] = {}
+        if ids:  # each bill's customer or supplier: the party ledger among its rupee or metal lines
+            for line in (voucher_lines, metal_lines):
+                for vid, name in conn.execute(select(line.c.voucher_id, ledgers.c.name).join(ledgers, ledgers.c.id == line.c.ledger_id)
+                                              .where(line.c.voucher_id.in_(ids), ledgers.c.group_name.in_(chart.PARTY_GROUPS))):
+                    parties.setdefault(vid, name)
+    for r in rows:
+        r["party"] = parties.get(r["voucher_id"])
+        r["fine_mg"] = int(r.pop("dr_mg") or 0) + int(r.pop("cr_mg") or 0)
+        r["amount_paise"] = sum(int(r.get(k) or 0) for k in ("labour_paise", "dia_paise", "stn_paise", "metal_paise"))
+        r["date"] = str(r["date"])
+    return rows
 
 
 def item_key(name: str) -> str:

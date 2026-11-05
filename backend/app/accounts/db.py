@@ -142,6 +142,12 @@ metal_lines = Table(
     Column("huid", String(40)),
     Column("colour", String(20)),
     Column("clarity", String(20)),
+    # The entry form's design no. and the diamonds' shape, and the colour stones' shape and grading (2026-11-05).
+    Column("design_no", String(40)),
+    Column("dia_shape", String(20)),
+    Column("stn_shape", String(20)),
+    Column("stn_colour", String(20)),
+    Column("stn_clarity", String(20)),
 )
 
 metal_openings = Table(

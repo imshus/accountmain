@@ -370,6 +370,23 @@ export type MetalLineDetail = {
   huid?: string | null;
   colour?: string | null;
   clarity?: string | null;
+  /** The entry form's design no., the diamonds' shape and the colour stones' shape and grading (absent before 2026-11-05). */
+  design_no?: string | null;
+  dia_shape?: string | null;
+  stn_shape?: string | null;
+  stn_colour?: string | null;
+  stn_clarity?: string | null;
+};
+
+/** One item of a Sales / Purchase bill, with its bill: the Stock screen's list (GET /companies/{id}/stock/items). */
+export type StockItem = Omit<MetalLineDetail, "id" | "ledger_id" | "ledger" | "dr_mg" | "cr_mg"> & {
+  voucher_id: number;
+  vtype: string;
+  number: string;
+  date: string; // YYYY-MM-DD
+  party: string | null;
+  fine_mg: number;
+  amount_paise: number; // labour + diamonds + stones + metal
 };
 
 export type VoucherDetail = Omit<VoucherRow, "amount" | "ledgers" | "fine_mg" | "items" | "net_mg"> & {

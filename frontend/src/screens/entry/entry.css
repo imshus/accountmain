@@ -1,4 +1,4 @@
-/* Sale / Purchase entry (design-html/sales.html, purchase.html). */
+/* Sale / Purchase entry (accounts-ai-design-mockup: "Sales report" / "Purchase report"). */
 
 .entry {
   display: flex;
@@ -6,103 +6,142 @@
   gap: 18px;
 }
 
-.entry__form {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-}
-
-.entry-date {
+/* DATE and INVOICE with their violet chips on the right. */
+.entry-chiprow {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 6px;
+}
+
+/* The invoice number in the date chip's style; typed over, it is the bill's own number. */
+.entry .entry-chip {
+  min-width: 0;
+  max-width: 62%;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--brand-tint-mid);
+  font: 700 15px var(--display);
+  color: var(--brand-light);
+  text-align: center;
+  outline: none;
+}
+
+.entry .entry-chip::placeholder {
+  color: var(--brand-light);
+  opacity: 1;
+}
+
+.entry-chip:focus-visible {
+  outline: 2px solid var(--brand-light);
+  outline-offset: 2px;
+}
+
+.entry-chip[aria-invalid="true"] {
+  box-shadow: inset 0 0 0 1.5px var(--rose);
 }
 
 .entry-err {
-  margin: -14px 0 0;
+  margin: -8px 0 0;
   text-align: right;
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--rose);
 }
 
-.entry-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+/* Item name suggests the shop's items as it is typed, without the browser's dropdown arrow (the design's plain box). */
+.entry input[list]::-webkit-calendar-picker-indicator {
+  display: none !important;
 }
 
-.entry-head__title {
-  margin: 0;
-  font: 700 17px var(--display);
-  letter-spacing: -0.2px;
-}
-
-/* Net weight while it is worked out from the gross: shown, but reads as computed until typed over. */
+/* A worked-out value (net from gross, weight × rate): shown, but reads as computed until typed over. */
 .entry-auto-input.entry-auto-input {
   color: var(--soft);
   border-style: dashed;
   border-color: var(--border-dash);
 }
 
-.entry-labelrow {
+/* "ITEM 2 ... Remove" above the second and later items. */
+.entry-itemhead {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  margin: 4px 4px -8px;
 }
 
-.entry-link {
-  padding: 0;
+.entry-itemhead b {
+  font: 800 12px var(--body);
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--brand-light);
+}
+
+.entry-itemhead__rm {
+  padding: 4px 0;
   border: 0;
   background: none;
-  color: var(--brand-light);
-  font: 700 11.5px var(--body);
-  letter-spacing: 0;
-  text-transform: none;
+  font: 700 13px var(--body);
+  color: var(--rose);
   cursor: pointer;
 }
 
-.entry-link:hover {
+.entry-itemhead__rm:hover {
   text-decoration: underline;
 }
 
-.entry-total {
-  margin-top: 4px;
-  padding: 18px;
-  border-radius: 20px;
-  background: var(--brand-text);
-  box-shadow: var(--shadow-glow);
-  color: var(--on-brand);
-}
-
-.entry-total p {
+/* The Total card's rows: label left, figure right, a hairline between. */
+.entry-totals {
+  display: grid;
   margin: 0;
 }
 
-.entry-total__label {
-  font: 700 10.5px var(--body);
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  color: var(--on-brand-soft);
+.entry-totals > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border);
 }
 
-.entry-total .entry-total__amount {
-  margin-top: 4px;
-  font: 700 34px/1.15 var(--display);
-  letter-spacing: -1px;
+.entry-totals dt {
+  font-size: 13px;
+  color: var(--soft);
+}
+
+.entry-totals dd {
+  margin: 0;
+  font: 700 14px var(--display);
+  color: var(--ink);
+  text-align: right;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
 
-.entry-total .entry-total__line {
-  margin-top: 6px;
-  font-size: 11.5px;
-  line-height: 1.45;
-  color: var(--on-brand-soft);
+.entry-totals .is-grand dt {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.entry-totals .is-grand dd {
+  font-size: 17px;
+  color: var(--brand-light);
+}
+
+/* Add more item | Save, side by side. */
+.entry-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+/* Save before the bill has its party and item names: muted, as in the design; a tap still says what is missing. */
+.entry-actions .ui-btn.is-idle {
+  background: var(--elevated);
+  color: var(--faint);
+  box-shadow: none;
 }
 
 .entry-note {
