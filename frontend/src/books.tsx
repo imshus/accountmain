@@ -10,7 +10,7 @@ import type { Ledger, Metal, Report, VoucherDetail, VoucherRow } from "./types";
  */
 
 export type EntryType = "sales" | "purchase";
-export type MasterKind = "customer" | "supplier" | "salesman" | "purchaser" | "item" | "purity";
+export type MasterKind = "customer" | "supplier" | "salesman" | "purchaser" | "item" | "purity" | "karat";
 
 /** One jewellery line as typed on the Sale / Purchase screen. Weights in grams, rates in rupees. */
 export type NewEntry = {
@@ -59,9 +59,10 @@ const VOUCHER_LIMIT = 200;
 const PARTY_GROUP: Record<EntryType, string> = { sales: "Sundry Debtors", purchase: "Sundry Creditors" };
 
 // Customers and suppliers are ledgers in the books; the other name lists are only for quick entry, kept on the device.
-type LocalMasters = Record<"salesman" | "purchaser" | "item" | "purity", string[]>;
+type LocalMasters = Record<"salesman" | "purchaser" | "item" | "purity" | "karat", string[]>;
 const MASTERS_KEY = "accountsai.masters";
-const INITIAL_MASTERS: LocalMasters = { salesman: [], purchaser: [], item: [], purity: ["99.9", "91.6", "75", "58.5"] };
+// Karats the shop added with "Add new" (20K, 9K...), after the design's 24K / 22K / 18K / 14K.
+const INITIAL_MASTERS: LocalMasters = { salesman: [], purchaser: [], item: [], purity: ["99.9", "91.6", "75", "58.5"], karat: [] };
 
 /** Tunch % -> karat code, so the stock report groups by karat (91.6 -> "22K"). */
 const KARATS: [number, string][] = [

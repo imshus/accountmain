@@ -52,7 +52,7 @@ export default function EntryScreen({ kind }: EntryScreenProps) {
       <form className="entry entry__form" onSubmit={submit} onKeyDown={enterMovesOn} noValidate aria-busy={entry.saving || undefined}>
         <HeaderCard entry={entry} kind={kind} ask={setRequest} />
         {entry.form.items.map((item, index) => (
-          <ItemCards key={item.id} entry={entry} item={item} index={index} itemList={itemList} />
+          <ItemCards key={item.id} entry={entry} ask={setRequest} item={item} index={index} itemList={itemList} />
         ))}
         <datalist id={itemList}>
           {names.map((name) => (
