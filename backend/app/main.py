@@ -801,6 +801,96 @@ def _pending_registers(found: list[dict], company_id: int | None) -> list[dict]:
             for f in candidates if f["table_name"] not in in_books]
 
 
+# The newest sheets already added to a company's books that every chat may read, with all their columns: enough for the
+# recent files, few enough that the tables' description stays a reasonable size.
+ADDED_SHEETS_READ = 8
+_ADDED_FRAMES: OrderedDict[tuple, tuple] = OrderedDict()
+
+
+def _section_labels(columns: list[dict]) -> dict[str, str]:
+    """Column labels for the chat. A supplier's packing list heads its diamond and stone columns "Diamond" / "Stone" in a
+    row above the header, which the upload does not keep (Shape, Size, Pcs, Wt, Rate, Amt, then Code_2, Pcs_2, Wt_2...):
+    from Shape on they are the diamonds', from the next Code the stones' (as accounts.metal reads their carats)."""
+    labels = {c["name"]: c["label"] for c in columns}
+    names = [c["name"] for c in columns]
+    if "shape" not in names:
+        return labels
+    section = None
+    for name in names[names.index("shape"):]:
+        if section == "Diamond" and re.match(r"^code(_\d+)?$", name):
+            section = "Stone"
+        section = section or "Diamond"
+        labels[name] = f"{section} {labels[name]}"
+    return labels
+
+
+def _added_frame(sheet: dict) -> tuple:
+    """A sheet added to the books as a chat table: every column, less the rows that only add up those above them
+    (subtotals, totals), which the books left out too, so a sum over it is the books' figure. Kept per version of it."""
+    key = sheet_key(sheet)
+    if key in _ADDED_FRAMES:
+        _ADDED_FRAMES.move_to_end(key)
+        return _ADDED_FRAMES[key]
+    loose = accounts_imports.loose_sheet(sheet)
+    frame = editing.load_frame(sheet)
+    totals = set(accounts_imports.total_rows(loose, frame, reports.effective_mapping(loose["profile"])))
+    frame = frame[~frame[editing.ROWID].isin(totals)].drop(columns=editing.ROWID).reset_index(drop=True)
+    columns = [c for c in sheet["profile"]["columns"] if c["name"] in frame.columns]
+    frame.attrs["cache_key"] = ("added", *key)
+    entry = (frame, {c["name"]: c["kind"] for c in columns}, _section_labels(columns)), len(totals)
+    _ADDED_FRAMES[key] = entry
+    while len(_ADDED_FRAMES) > 3 * ADDED_SHEETS_READ:
+        _ADDED_FRAMES.popitem(last=False)
+    return entry
+
+
+def _added_tables(company_id: int | None, shared: list[dict]) -> tuple[dict, str]:
+    """The newest sheets added to the company's books (not shared in this chat) as chat tables "added_<table>", with
+    every column of the file as uploaded, and the note that says what each is: so a detail the books do not keep (an
+    item or design code such as LR110232, a stone quality such as RDVSSI, any other column) is still answered (asked
+    for on 2026-11-07). ({}, "") when none or when they cannot be read: the answer then comes from the books."""
+    if company_id is None:
+        return {}, ""
+    from sqlalchemy import select
+
+    imports, sheets_table = _accounts_tables.register_imports, database.dataset_sheets
+    skip = {s["table_name"] for s in shared}
+    try:
+        with database.engine.connect() as conn:
+            rows = conn.execute(select(sheets_table.c.dataset_id, imports.c.table_name, imports.c.register, imports.c.at)
+                                .join(sheets_table, sheets_table.c.table_name == imports.c.table_name)
+                                .where(imports.c.company_id == company_id)
+                                .order_by(imports.c.at.desc()).limit(ADDED_SHEETS_READ)).all()
+        tables, lines = {}, []
+        for dataset_id, table_name, register, at in rows:
+            if table_name in skip:
+                continue
+            dataset = database.get_dataset(dataset_id)
+            sheet = next((s for s in (dataset or {}).get("sheets", []) if s["table_name"] == table_name), None)
+            if not sheet:
+                continue
+            table, left_out = _added_frame(sheet)
+            name = f"added_{table_name}"
+            tables[name] = table
+            columns = ", ".join(f'{c} ("{label}")' if label != c else c for c, label in table[2].items())
+            lines.append(f'- Table "{name}": file "{dataset["filename"]}", sheet "{sheet["sheet_name"]}", added to {register} on '
+                         f'{at:%d/%m/%Y}; {len(table[0])} rows' + (f" ({left_out} subtotal / total rows left out, as in the books)"
+                                                                     if left_out else "") + f"; columns: {columns}.")
+        if not lines:
+            return {}, ""
+        note = ("<added_sheets>\nThe files most recently added to the books, as uploaded, with every column (they are in "
+                "the books already: never offer to add them again). The book tables keep only the bill and item details; "
+                "for anything else, or a code (item, tag, design no., stone or quality code) not found in book_items, search "
+                "every text column of these tables (not only the code columns: a diamond quality or shape code such as RDVSSI or RDFGSI "
+                "is in a Shape column, a design no. may be in an Item No. column) with one query that ORs lower(col) LIKE "
+                "'%...%' over all of them, before saying it is not there. Their subtotal and "
+                "total rows are left out, so a sum over them is the books' figure.\n" + "\n".join(lines) + "\n</added_sheets>")
+        return tables, note
+    except Exception:  # noqa: BLE001 - optional context
+        logging.getLogger("uvicorn.error").exception("added sheets")
+        return {}, ""
+
+
 @app.post("/api/chat/stream")
 def files_chat_stream(body: FilesChatRequest):
     sheets, registers, documents_text, found = _shared_files(body.dataset_ids)
@@ -812,16 +902,19 @@ def files_chat_stream(body: FilesChatRequest):
     def answer(emit, cancel):
         pending = _pending_registers(found, company_id)
         books = books_tables(books_company) if books_company is not None else {}
+        added, added_note = _added_tables(books_company, sheets)
+        books = {**books, **added}
+        documents = "\n\n".join(part for part in (documents_text, added_note) if part) or None
         if not registers:
             return llm.chat(body.provider, messages, sheets, books or None, emit=emit, fresh=body.fresh,
-                            documents=documents_text, cancel=cancel, company_id=company_id, pending=pending,
+                            documents=documents, cancel=cancel, company_id=company_id, pending=pending,
                             bill_company_id=books_company, files=found)
         table, comparison = _register_jobs(registers)
         wait = _waiter(emit, cancel)
         stacked = wait(table)
         extra = {**books, **({"registers": stacked} if stacked else {})}
         # The app's exact comparison of the two registers, read only when the answer is not remembered.
-        return llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh, documents=documents_text,
+        return llm.chat(body.provider, messages, sheets, extra, emit=emit, fresh=body.fresh, documents=documents,
                         combined=(lambda: wait(comparison)) if stacked else None, cancel=cancel, company_id=company_id,
                         pending=pending, bill_company_id=books_company, files=found)
 
